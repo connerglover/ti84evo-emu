@@ -11,6 +11,7 @@ evo-core = { path = "../../crates/evo-core" }
 evo-image = { path = "../../crates/evo-image" }
 clap.workspace = true
 env_logger.workspace = true
+png = "0.17"
 
 [dev-dependencies]
 assert_cmd = "2.2"

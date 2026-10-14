@@ -19,6 +19,8 @@ struct Cli {
     command: Command,
 }
 
+// Parsed once per process; boxing the `run` options would only add noise.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Show a .84b2 bundle's metadata, images, and the vector tables and
@@ -79,6 +81,31 @@ enum Command {
         /// the run ends. A failed write-back exits 1.
         #[arg(long, value_name = "PATH")]
         flash_file: Option<PathBuf>,
+        /// Write the LCD image (320x240) to FILE.png as an RGB8 PNG when the run stops, or at
+        /// --after. While the LCD is off, prints `screenshot: display is off` on stderr and
+        /// writes nothing; the exit status is unchanged.
+        #[arg(long, value_name = "FILE.png", conflicts_with = "gdb")]
+        screenshot: Option<PathBuf>,
+        /// Take the screenshot at cycle N of the run (counted from its start) instead of when
+        /// it stops. Needs --screenshot.
+        #[arg(
+            long,
+            value_name = "N",
+            requires = "screenshot",
+            value_parser = run::parse_count
+        )]
+        after: Option<u64>,
+        /// Press keys as the run goes: a key script of tokens separated by whitespace or `;`.
+        /// `KEY` taps it (50 ms hold, 50 ms gap), `+KEY` presses, `-KEY` releases, `wait=MS`
+        /// moves on. KEY is a TI-84 key name (`enter`, `alpha`, `2nd`, `on`, digits, arrows,
+        /// ...) or `r<R>c<C>`. Times are milliseconds of guest time from the start of the run.
+        #[arg(
+            long,
+            value_name = "SCRIPT",
+            conflicts_with = "gdb",
+            value_parser = run::parse_keys
+        )]
+        keys: Option<run::KeyScript>,
     },
 }
 
@@ -115,6 +142,9 @@ fn main() -> ExitCode {
             uart,
             uart_in,
             flash_file,
+            screenshot,
+            after,
+            keys,
         } => run::main(run::RunArgs {
             bundle,
             max_cycles,
@@ -126,6 +156,9 @@ fn main() -> ExitCode {
             uart,
             uart_in,
             flash_file,
+            screenshot,
+            after,
+            keys: keys.map(|k| k.0).unwrap_or_default(),
         }),
         Command::Inspect {
             bundle,
@@ -201,10 +234,16 @@ mod tests {
             uart,
             uart_in,
             flash_file,
+            screenshot,
+            after,
+            keys,
         } = cli.command
         else {
             panic!("not run");
         };
+        assert_eq!(screenshot, None);
+        assert_eq!(after, None);
+        assert_eq!(keys, None);
         assert_eq!(bundle, PathBuf::from("os.84b2"));
         assert_eq!(max_cycles, 1_000_000_000);
         assert!(!trace);
@@ -239,6 +278,12 @@ mod tests {
             "in.bin",
             "--flash-file",
             "nv.evoflash",
+            "--screenshot",
+            "s.png",
+            "--after",
+            "1_000",
+            "--keys",
+            "+on wait=10;-on",
         ])
         .expect("parse");
         let Command::Run {
@@ -251,6 +296,9 @@ mod tests {
             uart,
             uart_in,
             flash_file,
+            screenshot,
+            after,
+            keys,
             ..
         } = cli.command
         else {
@@ -265,6 +313,26 @@ mod tests {
         assert!(uart);
         assert_eq!(uart_in, Some(PathBuf::from("in.bin")));
         assert_eq!(flash_file, Some(PathBuf::from("nv.evoflash")));
+        assert_eq!(screenshot, Some(PathBuf::from("s.png")));
+        assert_eq!(after, Some(1_000));
+        let on = evo_core::Key::On;
+        assert_eq!(
+            keys.map(|k| k.0),
+            Some(vec![
+                evo_core::KeyAction {
+                    at_ms: 0,
+                    key: on,
+                    pressed: true
+                },
+                evo_core::KeyAction {
+                    at_ms: 10,
+                    key: on,
+                    pressed: false
+                },
+            ])
+        );
+        assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--keys", "bogus"]).is_err());
+        assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--after", "5"]).is_err());
 
         assert!(Cli::try_parse_from(["evo-cli", "run"]).is_err());
         assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--break", "zz"]).is_err());
@@ -296,6 +364,8 @@ mod tests {
             &["--trace"][..],
             &["--trace-range", "0..10"],
             &["--max-cycles", "5"],
+            &["--screenshot", "s.png"],
+            &["--keys", "on"],
         ] {
             let args = ["evo-cli", "run", "x", "--gdb", "3333"];
             let parsed = Cli::try_parse_from(args.iter().chain(other));

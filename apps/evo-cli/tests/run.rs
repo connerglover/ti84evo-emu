@@ -703,3 +703,239 @@ fn cli_reports_power_off() {
         "{stderr}"
     );
 }
+
+/// `ldr rt, [pc, #..]` at payload offset `at`, loading the word at payload offset `lit`.
+fn ldr_lit(rt: u16, at: u32, lit: u32) -> u16 {
+    0x4800 | (rt << 8) | ((lit - ((at + 4) & !3)) / 4) as u16
+}
+
+/// Bundle A: program the LCDC (0x4000_4000) with the 320×240 timing words and UPBASE
+/// 0x2004_8000, wait ~2_000 cycles, fill the 240×320 RGB565 buffer with 0x07E0 (green, through
+/// the Secure alias 0x3004_8000), then turn the LCD on (CONTROL 0x392D: enable, 16 bpp 565,
+/// BGR, power) and loop.
+fn draws_green() -> Vec<u8> {
+    let c = CODE;
+    let lit = |i: u32| LIT + 4 * i;
+    let code = [
+        ldr_lit(0, c, lit(0)),      // r0 = LCDC
+        ldr_lit(1, c + 2, lit(1)),  // TIM0
+        0x6001,                     // str r1, [r0, #0]
+        ldr_lit(1, c + 6, lit(2)),  // TIM1
+        0x6041,                     // str r1, [r0, #4]
+        ldr_lit(1, c + 10, lit(3)), // UPBASE
+        0x6101,                     // str r1, [r0, #0x10]
+        ldr_lit(2, c + 14, lit(4)), // delay count
+        0x3A01,                     // 1: subs r2, #1
+        0xD1FD,                     // bne 1b
+        ldr_lit(1, c + 20, lit(5)), // buffer (Secure alias)
+        ldr_lit(2, c + 22, lit(6)), // two green pixels
+        ldr_lit(3, c + 24, lit(7)), // word count
+        0x600A,                     // 2: str r2, [r1]
+        0x3104,                     // adds r1, #4
+        0x3B01,                     // subs r3, #1
+        0xD1FB,                     // bne 2b
+        ldr_lit(1, c + 34, lit(8)), // CONTROL
+        0x6181,                     // str r1, [r0, #0x18]
+        0xE7FE,                     // b .
+    ];
+    let words: [u32; 9] = [
+        0x4000_4000,
+        0x0A0A_0A38,
+        0x042D_093F,
+        0x2004_8000,
+        667,
+        0x3004_8000,
+        0x07E0_07E0,
+        240 * 320 / 2,
+        0x392D,
+    ];
+    let pool: Vec<u16> = words
+        .iter()
+        .flat_map(|w| [*w as u16, (w >> 16) as u16])
+        .collect();
+    payload(&[(1, CODE)], &[(CODE, &code), (LIT, &pool)])
+}
+
+/// Bundle B: enable IRQ 0 (the ON key) and loop; the IRQ 0 handler writes `K` to UART0.
+fn on_writes_k() -> Vec<u8> {
+    const HANDLER: u32 = 0x280;
+    payload(
+        &[(1, CODE), (16, HANDLER)],
+        &[
+            // ldr r0, =NVIC_ISER0 ; movs r1, #1 ; str r1, [r0] ; b .
+            (CODE, &[ldr_lit(0, CODE, LIT), 0x2101, 0x6001, 0xE7FE]),
+            // ldr r0, =UART0 ; movs r1, #'K' ; str r1, [r0] ; bx lr
+            (
+                HANDLER,
+                &[ldr_lit(0, HANDLER, LIT + 4), 0x214B, 0x6001, 0x4770],
+            ),
+            (LIT, &[0xE100, 0xE000, 0x6000, 0x4010]),
+        ],
+    )
+}
+
+/// A fresh path for a PNG named after the test (any earlier one removed).
+fn png_file(name: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.png"));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+#[test]
+fn cli_screenshot_png() {
+    let bundle = bundle_file("cli_screenshot_png", draws_green());
+    let shot = png_file("cli_screenshot_png");
+    let out = stdout(
+        evo_cli()
+            .arg("run")
+            .arg(&bundle)
+            .args(["--max-cycles", "1_000_000", "--screenshot"])
+            .arg(&shot),
+        0,
+    );
+    assert!(out.contains("stop: cycle-limit"), "{out}");
+    let decoder = png::Decoder::new(std::fs::File::open(&shot).expect("PNG written"));
+    let mut reader = decoder.read_info().expect("PNG header");
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).expect("PNG data");
+    assert_eq!((info.width, info.height), (320, 240));
+    assert_eq!(info.color_type, png::ColorType::Rgb);
+    assert_eq!(info.bit_depth, png::BitDepth::Eight);
+    let rgb = &buf[..info.buffer_size()];
+    assert_eq!(rgb.len(), 320 * 240 * 3);
+    assert!(
+        rgb.as_chunks::<3>().0.iter().all(|p| *p == [0, 255, 0]),
+        "every pixel is green"
+    );
+}
+
+/// `--after N` takes the screenshot at cycle N: before the program turns the LCD on there is
+/// nothing to show, which is reported, writes no file and keeps the exit status.
+#[test]
+fn cli_screenshot_after() {
+    let bundle = bundle_file("cli_screenshot_after", draws_green());
+    let shot = png_file("cli_screenshot_after");
+    let out = evo_cli()
+        .arg("run")
+        .arg(&bundle)
+        .args([
+            "--max-cycles",
+            "1_000_000",
+            "--after",
+            "1000",
+            "--screenshot",
+        ])
+        .arg(&shot)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("screenshot: display is off"), "{stderr}");
+    assert!(!shot.exists(), "no file for a dark screen");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        stdout.contains("stop: cycle-limit"),
+        "the run went on: {stdout}"
+    );
+}
+
+/// `--keys on` taps the ON key at the start of the run; the guest's IRQ 0 handler sees it.
+#[test]
+fn cli_keys_on_reaches_guest() {
+    let bundle = bundle_file("cli_keys_on", on_writes_k());
+    let out = stdout(
+        evo_cli()
+            .arg("run")
+            .arg(&bundle)
+            .args(["--max-cycles", "10000", "--keys", "on", "--uart"]),
+        0,
+    );
+    assert!(out.starts_with('K'), "{out}");
+
+    // Without the key, nothing.
+    let out = stdout(
+        evo_cli()
+            .arg("run")
+            .arg(&bundle)
+            .args(["--max-cycles", "10000", "--uart"]),
+        0,
+    );
+    assert!(out.starts_with("stop: "), "{out}");
+}
+
+/// A bad key script is a usage error, reported before the bundle is opened.
+#[test]
+fn cli_bad_key_script_exits_1() {
+    let missing = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no-such-keys-bundle.84b2");
+    let out = evo_cli()
+        .arg("run")
+        .arg(&missing)
+        .args(["--keys", "r9c9"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("r9c9"), "{stderr}");
+    assert!(
+        !stderr.contains("no-such-keys-bundle"),
+        "the bundle is never opened: {stderr}"
+    );
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn cli_after_requires_screenshot() {
+    let bundle = bundle_file("cli_after_requires_screenshot", looping());
+    let out = evo_cli()
+        .arg("run")
+        .arg(&bundle)
+        .args(["--after", "1000"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("--screenshot"), "{stderr}");
+    assert!(out.stdout.is_empty());
+}
+
+/// A guest asleep with nothing scheduled still gets a key press that comes later: time moves
+/// to the press, the ON key wakes it, and the run ends as `idle` once nothing is left.
+#[test]
+fn cli_keys_wake_idle_guest() {
+    const HANDLER: u32 = 0x280;
+    // ldr r0, =NVIC_ISER0 ; movs r1, #1 ; str r1, [r0] ; 1: wfi ; b 1b
+    let p = payload(
+        &[(1, CODE), (16, HANDLER)],
+        &[
+            (
+                CODE,
+                &[ldr_lit(0, CODE, LIT), 0x2101, 0x6001, 0xBF30, 0xE7FD],
+            ),
+            (
+                HANDLER,
+                &[ldr_lit(0, HANDLER, LIT + 4), 0x214B, 0x6001, 0x4770],
+            ),
+            (LIT, &[0xE100, 0xE000, 0x6000, 0x4010]),
+        ],
+    );
+    let bundle = bundle_file("cli_keys_wake_idle", p);
+    let out = stdout(
+        evo_cli()
+            .arg("run")
+            .arg(&bundle)
+            .args(["--keys", "wait=100 on", "--uart"]),
+        0,
+    );
+    assert!(out.starts_with("Kstop: idle "), "{out}");
+    let cycles: u64 = out
+        .split("cycles=")
+        .nth(1)
+        .and_then(|c| c.split_whitespace().next())
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_else(|| panic!("no cycles: {out}"));
+    // The press comes at 100 ms; the release at 150 ms is applied before the run ends.
+    assert!(cycles >= 150 * evo_core::CPU_HZ / 1000, "{out}");
+}

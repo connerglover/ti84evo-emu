@@ -8,7 +8,9 @@ use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use evo_core::{Machine, NvError, NvState, StopReason, UartPort};
+use evo_core::{
+    CPU_HZ, Frame, KeyAction, Machine, NvError, NvState, StopReason, UartPort, parse_key_script,
+};
 use evo_image::{Bundle, Layout};
 
 /// What `evo-cli run` was asked to do.
@@ -26,6 +28,65 @@ pub struct RunArgs {
     pub uart_in: Option<PathBuf>,
     /// The flash file: read at the start (missing: an erased part), written back at the end.
     pub flash_file: Option<PathBuf>,
+    /// Where to write the screenshot PNG.
+    pub screenshot: Option<PathBuf>,
+    /// Cycles from the start of the run at which to take the screenshot; `None`: at the stop.
+    pub after: Option<u64>,
+    /// Key presses and releases, in script order (times never decrease).
+    pub keys: Vec<KeyAction>,
+}
+
+/// A parsed `--keys` script (a newtype: clap would read a bare `Vec` as repeated values).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyScript(pub Vec<KeyAction>);
+
+/// `--keys SCRIPT`: the `evo_core::keys` grammar.
+pub fn parse_keys(s: &str) -> Result<KeyScript, String> {
+    parse_key_script(s)
+        .map(KeyScript)
+        .map_err(|e| e.to_string())
+}
+
+/// The cycle at which an action `at_ms` milliseconds after `start` fires:
+/// `start + at_ms * CPU_HZ / 1000`, saturating.
+fn action_cycle(start: u64, at_ms: u64) -> u64 {
+    let offset = u128::from(at_ms) * u128::from(CPU_HZ) / 1000;
+    start.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX))
+}
+
+/// The key script laid out in cycles, consumed as the run reaches each action.
+struct KeyTimeline {
+    /// (cycle, action), in script order.
+    actions: Vec<(u64, KeyAction)>,
+    next: usize,
+}
+
+impl KeyTimeline {
+    fn new(actions: &[KeyAction], start: u64) -> Self {
+        KeyTimeline {
+            actions: actions
+                .iter()
+                .map(|a| (action_cycle(start, a.at_ms), *a))
+                .collect(),
+            next: 0,
+        }
+    }
+
+    /// The cycle of the next action not yet applied.
+    fn next_at(&self) -> Option<u64> {
+        self.actions.get(self.next).map(|&(at, _)| at)
+    }
+
+    /// Apply every action due at or before the machine's current time.
+    fn apply_due(&mut self, m: &mut Machine) {
+        while let Some(&(at, a)) = self.actions.get(self.next) {
+            if at > m.sched.now {
+                break;
+            }
+            m.set_key(a.key, a.pressed);
+            self.next += 1;
+        }
+    }
 }
 
 /// Exit status for a lockup (0 is a normal stop, 1 a host-side error).
@@ -151,9 +212,30 @@ fn run_machine(machine: &mut Machine, args: &RunArgs) -> ExitCode {
     let mut stdout_err: Option<io::Error> = None;
     let tracing = args.trace || args.trace_range.is_some();
     let range = args.trace_range.clone().unwrap_or(0..u32::MAX);
-    let end = machine.sched.now.saturating_add(args.max_cycles);
+    let start = machine.sched.now;
+    let end = start.saturating_add(args.max_cycles);
+    let mut keys = KeyTimeline::new(&args.keys, start);
+    // `--after N`: the cycle to take the screenshot at; `None` once taken (or never asked).
+    let mut shot_at = args
+        .screenshot
+        .as_ref()
+        .and(args.after)
+        .map(|n| start.saturating_add(n));
+    let mut shot: Option<Option<Frame>> = None;
     let stop = loop {
-        let slice = end.saturating_sub(machine.sched.now).min(UART_SLICE);
+        keys.apply_due(machine);
+        if shot_at.is_some_and(|at| machine.sched.now >= at) {
+            shot = Some(machine.screen());
+            shot_at = None;
+        }
+        // A slice ends at the budget, after UART_SLICE, at the next key action and at --after.
+        let now = machine.sched.now;
+        let limit = [Some(end), keys.next_at(), shot_at]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(end);
+        let slice = limit.saturating_sub(now).min(UART_SLICE);
         let stop = if tracing {
             machine.run_with(slice, |m| {
                 if range.contains(&m.cpu.regs.pc) {
@@ -170,10 +252,35 @@ fn run_machine(machine: &mut Machine, args: &RunArgs) -> ExitCode {
         if stdout_err.is_none() {
             stdout_err = uarts.drain(machine, &mut out).err();
         }
-        if stop != StopReason::CycleLimit || machine.sched.now >= end || stdout_err.is_some() {
+        if stdout_err.is_some() {
+            break stop;
+        }
+        // Asleep with nothing scheduled, but a key press is still to come within the budget:
+        // nothing can happen before it, so time moves straight there (no event is due and
+        // SysTick is not counting, or the machine would not have reported `Idle`).
+        if stop == StopReason::Idle {
+            match keys.next_at() {
+                Some(at) if at <= end => {
+                    machine.sched.now = machine.sched.now.max(at);
+                    continue;
+                }
+                _ => break stop,
+            }
+        }
+        if stop != StopReason::CycleLimit || machine.sched.now >= end {
             break stop;
         }
     };
+    if args.screenshot.is_some() && shot.is_none() {
+        // Reported only when the run stopped short of --after (not when it reached it at the end).
+        if let Some(at) = shot_at.filter(|&at| machine.sched.now < at) {
+            eprintln!(
+                "screenshot: the run stopped at cycle {} before --after (cycle {at}); taken there",
+                machine.sched.now
+            );
+        }
+        shot = Some(machine.screen());
+    }
     if stdout_err.is_none() {
         stdout_err = summary(&mut out, machine, stop)
             .and_then(|()| out.flush())
@@ -181,7 +288,11 @@ fn run_machine(machine: &mut Machine, args: &RunArgs) -> ExitCode {
     }
     uarts.report();
 
-    if !write_unmapped(args.unmapped_out.as_deref(), machine) {
+    let mut failed = false;
+    if let (Some(path), Some(frame)) = (&args.screenshot, shot) {
+        failed |= !write_screenshot(path, frame.as_ref());
+    }
+    if !write_unmapped(args.unmapped_out.as_deref(), machine) || failed {
         return ExitCode::FAILURE;
     }
     match stdout_err {
@@ -247,6 +358,32 @@ fn gdb(
         }
         _ => ExitCode::SUCCESS,
     }
+}
+
+/// `--screenshot PATH`: write `frame` as an RGB8 PNG; with no frame (the LCD is off) say so and
+/// write nothing. False (reported) if the file cannot be written.
+fn write_screenshot(path: &Path, frame: Option<&Frame>) -> bool {
+    let Some(frame) = frame else {
+        eprintln!("screenshot: display is off");
+        return true;
+    };
+    match encode_png(path, frame) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("evo-cli: {}: {e}", path.display());
+            false
+        }
+    }
+}
+
+fn encode_png(path: &Path, frame: &Frame) -> Result<(), png::EncodingError> {
+    let file = io::BufWriter::new(fs::File::create(path)?);
+    let mut encoder = png::Encoder::new(file, frame.width, frame.height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(&frame.rgb)?;
+    writer.finish()
 }
 
 /// Write the unmapped-access log to `path`, if given; false (reported) if that fails.
