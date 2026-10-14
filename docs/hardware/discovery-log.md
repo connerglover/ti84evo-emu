@@ -35,6 +35,30 @@ otherwise. No TI code is reproduced beyond the short disassembly excerpts below.
   Arm's SSE-200-style secure infrastructure (SIE-200 MPCs, an SPCTRL-like block) plus
   third-party IP.
 
+## Corrections from Plan 2 research
+
+The Plan 2 research (the per-block docs in this folder) corrects these first guesses. The
+log below is kept as it was written.
+
+- **The SPI master uses 9-bit frames, not 16.** 3-wire SPI to the panel's ST7789V-class
+  driver IC, bit 8 = D/C, mode 3, 1 MHz (`spi-panel.md`). CTRL1 = 0x0008_0012.
+- **CRU +0x10 bit 30 is a chip-variant bit, not a status flag.** It selects the revision 9
+  vs 10 path; nothing waits on it (`security.md` §3).
+- **0x4010_5000 is the GPIO controller** (13 pins, IRQ 24), not a display or DMA helper
+  (`gpio.md`). Its configuration word (0x100B_7BC0) merely sits next to the LCDC's
+  (0x100B_7BC4); the secure `panel_on` does use GPIO pin 2 as the panel reset.
+- **The 0x00CF_0000 reads were an artifact of the 8 MiB flash.** They are a blank check of a
+  one-shot mailbox: with the space unmapped it read 0, looked "not blank", and the
+  `Restored Saved Data.` path ran. With 16 MiB of erased flash it reads 0xFF and nothing
+  happens (`spif-nor.md` §6.3).
+- **ITS/PS live at 0x0009_0000–0x000A_FFFF** (PS 0x0009_0000–0x000A_BFFF, ITS
+  0x000A_C000–0x000A_FFFF), below the secure slot, written through the SPIF and read
+  through the XIP window (`boot-flow.md` §2). The answer to `memory-map.md` Q2 at the end of
+  this log is superseded accordingly.
+- Also: 0x4010_4000 is the backlight PWM, whose reset is CRU +0x20 bit 4 (`lcdc.md`); flash
+  is 16 MiB and SRAM 1.5 MiB (`memory-map.md`); VTOR_NS is 0x0010_0400, the NS BSP's vector
+  table (`boot-flow.md` §2).
+
 ## Unmapped accesses (first boot)
 
 `evo-cli run "$EVO_OS_IMAGE" --max-cycles 50000000 --unmapped-out <file>`:
@@ -254,7 +278,7 @@ that block is clock, security and MPC control.
 To see what Plan 2 will meet next, the boot was pushed further in two ways:
 
 - GDB (`evo-cli run --gdb`) changed the BLK_CFG/BLK_MAX values in registers.
-- A scratch harness outside the repository added dumb register fakes to `Machine::bus`.
+- A throwaway emulator build with register fakes on `Machine::bus`.
 
 Neither is committed. In order, the boot met these blockers:
 
@@ -283,7 +307,7 @@ Neither is committed. In order, the boot met these blockers:
    Booting TF-M v2.1.1_co2_v1.00
    [Sec Thread] Secure image initializing!
    TF-M isolation level is:  0x00000001
-   Update / TRNG / Power / SCRATCH / Data / Boot / PTT Partition initializing
+   Update / TRNG / Power / ... / Data / Boot / PTT Partition initializing
    [INF][PS] Encryption alg: 0x5500100
    Creating an empty ITS flash layout.
    ```
