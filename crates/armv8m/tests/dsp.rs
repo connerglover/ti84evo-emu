@@ -138,6 +138,8 @@ fn sp_pc_operands_are_undefined() {
         (0xFA21, 0xFD82), // sxtab16 rd = sp
         (0xFB51, 0xFF02), // smmul rd = pc
         (0xFB71, 0xD002), // usada8 ra = sp
+        (0xFB61, 0xF002), // smmls ra = pc
+        (0xFB61, 0xF012), // smmlsr ra = pc
     ] {
         assert!(
             matches!(decode32(h1, h2), Instr::Undefined { .. }),

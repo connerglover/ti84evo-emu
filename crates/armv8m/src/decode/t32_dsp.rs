@@ -137,6 +137,8 @@ pub(super) fn multiply(h1: u32, h2: u32) -> Option<Instr> {
             ra,
             top: bit4,
         }),
+        // SMMLS has no non-accumulate form: Ra == PC is UNPREDICTABLE.
+        0b110 if plain && ra.is_none() => None,
         0b101 | 0b110 if plain => Some(Instr::MulMsw {
             rd,
             rn,
