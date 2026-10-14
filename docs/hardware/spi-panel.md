@@ -290,8 +290,13 @@ State: `ctrl0, ctrl1, ctrl2, inten: u32`, `tx: VecDeque<u16>` (capacity `DEPTH` 
 2. **Real panel ID.** It is unknown; the vendor programs ID2 in OTP. A hardware dump of `LCD
    Info`, from the BSP diagnostic menu, would settle it. The emulator can use any ID in the
    table.
+   **Emulator decision (Plan 2, Task 9):** `evo_hw::dev::spi::DEFAULT_PANEL_ID` =
+   `ID1 0x85, ID2 0x85, ID3 0x52` (generic ST7789V), which selects index 14 ("Unknown
+   Display") and the default init table. `St7789::new` takes any ID, so a confirmed ID can
+   replace it later.
 3. **Exact meaning of the CTRL0 bits** [3:2], [7], [17:16] and the CTRL2 bits [1], [3:2],
    [6], [8:7], [11:10]. The model only needs CTRL2[0] (enable) and CTRL1[22:16] (frame
    size). Bit 6 is presumably a FIFO flush.
 4. **FIFO depth** (+0x64[23:16]) is unknown. 8 is a guess; the behavior does not depend on
-   it.
+   it. **Emulator decision (Task 9):** TX depth `SPI_FIFO_DEPTH` = 8 (+0x64 reads
+   0x0007_0000), RX capacity `SPI_RX_CAP` = 16; neither line IRQ 19 nor IRQ 20 is driven.

@@ -2,6 +2,7 @@
 
 use crate::MemoryMap;
 use crate::dev::mpc::Mpc;
+use crate::dev::spi::{DEFAULT_PANEL_ID, Spi, St7789};
 use crate::dev::storage::Storage;
 use crate::dev::sysctl::{Cru, Spctrl};
 use crate::dev::timer::Timer;
@@ -37,4 +38,11 @@ pub fn attach(map: &mut MemoryMap) {
     // UARTs (uart.md §1, §8): the firmware uses the NS aliases only.
     map.add_device("uart0", 0x4010_6000, 0x1000, Box::new(Uart16550::new(17)));
     map.add_device("uart2", 0x4010_B000, 0x1000, Box::new(Uart16550::new(27)));
+    // SPI master and the LCD panel on its bus (spi-panel.md): NS alias only, no IRQ.
+    map.add_device(
+        "spi",
+        0x4010_7000,
+        0x1000,
+        Box::new(Spi::new(St7789::new(DEFAULT_PANEL_ID))),
+    );
 }
