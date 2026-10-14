@@ -60,12 +60,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr, suppress_flags: bool) -> Opt
         }
         Instr::MovReg { rd, rm, setflags } => {
             let v = cpu.reg(rm);
-            if rd == 15 {
-                cpu.bx_write_pc(v);
-                Flow::Branched
-            } else {
-                logic(cpu, rd, (v, carry), sf(setflags))
-            }
+            logic(cpu, rd, (v, carry), sf(setflags))
         }
         Instr::Mvn {
             rd,

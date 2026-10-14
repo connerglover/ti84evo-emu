@@ -152,21 +152,16 @@ fn adr() {
 }
 
 #[test]
-fn mov_hi_reg_to_pc_interworks() {
-    // mov pc, r1
-    let (mut cpu, mut bus) = cpu_with_code(&[0x468F]);
-    cpu.regs.r[1] = 0x201;
-    assert_eq!(dis(&cpu, &mut bus), "mov pc, r1");
-    assert_eq!(cpu.step(&mut bus), StepResult::Executed { cycles: 2 });
-    assert_eq!(cpu.regs.pc, 0x200);
-    assert!(cpu.regs.xpsr.t);
-
-    // Even target: T cleared (INVSTATE fault arrives with exceptions in Task 7).
-    let (mut cpu, mut bus) = cpu_with_code(&[0x468F]);
-    cpu.regs.r[1] = 0x200;
-    run(&mut cpu, &mut bus, 1);
-    assert_eq!(cpu.regs.pc, 0x200);
-    assert!(!cpu.regs.xpsr.t);
+fn mov_pc_branches_without_interworking() {
+    // mov pc, r1 : ALUWritePC, T bit unchanged
+    for (r1, expect_pc) in [(0x201u32, 0x200u32), (0x200, 0x200)] {
+        let (mut cpu, mut bus) = cpu_with_code(&[0x468F]);
+        cpu.regs.r[1] = r1;
+        assert_eq!(dis(&cpu, &mut bus), "mov pc, r1");
+        assert_eq!(cpu.step(&mut bus), StepResult::Executed { cycles: 2 });
+        assert_eq!(cpu.regs.pc, expect_pc);
+        assert!(cpu.regs.xpsr.t);
+    }
 }
 
 #[test]

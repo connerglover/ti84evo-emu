@@ -22,10 +22,24 @@ pub(crate) fn execute(
     instr: &Instr,
     suppress_flags: bool,
 ) -> Flow {
-    if let Some(flow) = alu::execute(cpu, instr, suppress_flags) {
-        return flow;
-    }
     match *instr {
+        Instr::MovImm { .. }
+        | Instr::MovReg { .. }
+        | Instr::Mvn { .. }
+        | Instr::ShiftImm { .. }
+        | Instr::ShiftReg { .. }
+        | Instr::AddImm { .. }
+        | Instr::SubImm { .. }
+        | Instr::RsbImm { .. }
+        | Instr::AddReg { .. }
+        | Instr::SubReg { .. }
+        | Instr::AluReg { .. }
+        | Instr::Mul { .. }
+        | Instr::CmpImm { .. }
+        | Instr::CmpReg { .. }
+        | Instr::CmnReg { .. }
+        | Instr::TstReg { .. }
+        | Instr::Adr { .. } => alu::execute(cpu, instr, suppress_flags).unwrap_or(Flow::Next),
         Instr::Bx { rm } => {
             let target = cpu.reg(rm);
             cpu.bx_write_pc(target);
@@ -41,7 +55,7 @@ pub(crate) fn execute(
             cpu.regs.xpsr.it = (firstcond << 4) | mask;
             Flow::Next
         }
-        // Undefined is intercepted in `Cpu::step`; later tasks add their groups above.
-        _ => Flow::Next,
+        // Intercepted in `Cpu::step` before execution.
+        Instr::Undefined { .. } => Flow::Next,
     }
 }
