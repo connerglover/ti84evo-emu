@@ -4,3 +4,4 @@
 
 pub mod backend;
 pub mod keypad;
+pub mod theme;
