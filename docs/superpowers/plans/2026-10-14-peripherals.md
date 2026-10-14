@@ -641,6 +641,8 @@ Registers: `lcdc.md` PL111 table (TIM0–3 +0x00..+0x0C, UPBASE +0x10, LPBASE +0
 
 ### Task 19: Keypad, ON key and key scripts
 
+> **Controller amendment (binding, supersedes the provisional `r<R>c<C>` naming where they conflict):** the real key map is now known — `$EVO_RE_DIR/keypad-map.md` (two independent RE passes, reconciled). The matrix is the TI-84 Plus CE layout: row register `+0x10+2g`, bit `b` → scan code `(7−g)·8 + b + 1` (CE GetCSC numbering); the IRQ 13 handler needs key-down status first, then ≥6 stable scan-done interrupts, and reports ≤3 keys. Name keys by their TI-84 names (`enter`, `alpha`, `2nd`, `ln`, `sin`, digits, arrows, …; keep `r<R>c<C>` accepted as an alias in key scripts) and import the table into `docs/hardware/keypad.md`. Add a test that holding `alpha`+`ln`+`enter` across a reset makes the BSP's boot combo matcher pick Self-Test (combo table at NS `0x0018_3DF0`; result byte `0x2001_0DB8`), env-gated on `EVO_OS_IMAGE`, and document the Engineering combo (`alpha`+`sin`+`enter`).
+
 **Files:** Create `crates/evo-hw/src/dev/keypad.rs`, `crates/evo-core/src/keys.rs`, tests `crates/evo-hw/tests/keypad.rs`, `crates/evo-core/tests/machine.rs` (keys); modify `soc.rs`, `crates/evo-core/{src/host.rs,src/lib.rs,Cargo.toml}` (`thiserror`), `docs/hardware/keypad.md`.
 
 **Interfaces — Produces:**
