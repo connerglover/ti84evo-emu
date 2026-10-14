@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Committed test program images (tools/testprogs/out).
+*.bin binary
+# Shell scripts must keep LF endings to run.
+*.sh text eol=lf

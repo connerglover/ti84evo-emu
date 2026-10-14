@@ -42,6 +42,19 @@ jobs:
           toolchain: "1.98"
       - run: cargo test --workspace
 
+  testprogs:
+    # The committed test program images (tools/testprogs/out) must match their sources.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: carlosperate/arm-none-eabi-gcc-action@v1
+        with:
+          release: "14.2.Rel1"
+      - run: sh tools/testprogs/build.sh
+      - run: git diff --exit-code tools/testprogs/out
+      - name: No new, uncommitted images
+        run: test -z "$(git status --porcelain tools/testprogs/out)"
+
   difftest:
     # Differential testing against Unicorn (GPL-2.0, test-only `difftest` feature).
     runs-on: ubuntu-latest
