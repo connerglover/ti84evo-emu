@@ -1,7 +1,7 @@
 //! Disassembly in GNU/UAL syntax (lowercase, `sp`/`lr`/`pc` names).
 
 use crate::bits::SRType;
-use crate::instr::{AluOp, HintOp, Instr, MemSize, Reg, RevKind, Shift};
+use crate::instr::{AluOp, HintOp, Instr, LongMulKind, MemSize, Reg, RevKind, Shift};
 
 const COND: [&str; 16] = [
     "eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al", "nv",
@@ -13,6 +13,30 @@ fn r(n: Reg) -> &'static str {
         "lr", "pc",
     ];
     NAMES[usize::from(n & 15)]
+}
+
+/// `.w` suffix for 32-bit encodings of mnemonics that also have a 16-bit form.
+fn w(len: u8) -> &'static str {
+    if len == 4 { ".w" } else { "" }
+}
+
+/// Mnemonic (with `s`) of a logical / carry ALU operation.
+fn alu_name(op: AluOp, setflags: bool) -> String {
+    let name = match op {
+        AluOp::And => "and",
+        AluOp::Eor => "eor",
+        AluOp::Orr => "orr",
+        AluOp::Orn => "orn",
+        AluOp::Bic => "bic",
+        AluOp::Adc => "adc",
+        AluOp::Sbc => "sbc",
+    };
+    format!("{name}{}", s(setflags))
+}
+
+/// `ORN` has no 16-bit form, so no `.w`.
+fn alu_w(op: AluOp, len: u8) -> &'static str {
+    if op == AluOp::Orn { "" } else { w(len) }
 }
 
 fn s(setflags: bool) -> &'static str {
@@ -126,8 +150,19 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
             rd,
             imm: v,
             setflags,
-        } => format!("mov{} {}, {}", s(setflags), r(rd), imm(v)),
-        Instr::MovReg { rd, rm, setflags } => format!("mov{} {}, {}", s(setflags), r(rd), r(rm)),
+            ..
+        } => format!("mov{}{} {}, {}", s(setflags), w(len), r(rd), imm(v)),
+        Instr::Movw { rd, imm: v } => format!("movw {}, {}", r(rd), imm(u32::from(v))),
+        Instr::Movt { rd, imm: v } => format!("movt {}, {}", r(rd), imm(u32::from(v))),
+        Instr::MvnImm {
+            rd,
+            imm: v,
+            setflags,
+            ..
+        } => format!("mvn{}{} {}, {}", s(setflags), w(len), r(rd), imm(v)),
+        Instr::MovReg { rd, rm, setflags } => {
+            format!("mov{}{} {}, {}", s(setflags), w(len), r(rd), r(rm))
+        }
         Instr::Mvn {
             rd,
             rm,
@@ -135,8 +170,9 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
             setflags,
         } => {
             format!(
-                "mvn{} {}, {}{}",
+                "mvn{}{} {}, {}{}",
                 s(setflags),
+                w(len),
                 r(rd),
                 r(rm),
                 shift_suffix(shift)
@@ -145,14 +181,22 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
         Instr::ShiftImm {
             rd,
             rm,
+            ty: SRType::Rrx,
+            setflags,
+            ..
+        } => format!("rrx{} {}, {}", s(setflags), r(rd), r(rm)),
+        Instr::ShiftImm {
+            rd,
+            rm,
             ty,
             amount,
             setflags,
         } => {
             format!(
-                "{}{} {}, {}, #{amount}",
+                "{}{}{} {}, {}, #{amount}",
                 ty_name(ty),
                 s(setflags),
+                w(len),
                 r(rd),
                 r(rm)
             )
@@ -164,7 +208,7 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
             ty,
             setflags,
         } => dnm(
-            &format!("{}{}", ty_name(ty), s(setflags)),
+            &format!("{}{}{}", ty_name(ty), s(setflags), w(len)),
             rd,
             rn,
             r(rm).to_string(),
@@ -176,14 +220,30 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
             imm: v,
             setflags,
             two_op,
-        } => dnm(&format!("add{}", s(setflags)), rd, rn, imm(v), two_op),
+            imm12,
+        } => {
+            let name = if imm12 {
+                "addw".to_string()
+            } else {
+                format!("add{}{}", s(setflags), w(len))
+            };
+            dnm(&name, rd, rn, imm(v), two_op)
+        }
         Instr::SubImm {
             rd,
             rn,
             imm: v,
             setflags,
             two_op,
-        } => dnm(&format!("sub{}", s(setflags)), rd, rn, imm(v), two_op),
+            imm12,
+        } => {
+            let name = if imm12 {
+                "subw".to_string()
+            } else {
+                format!("sub{}{}", s(setflags), w(len))
+            };
+            dnm(&name, rd, rn, imm(v), two_op)
+        }
         Instr::RsbImm {
             rd,
             rn,
@@ -192,6 +252,20 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
         } => {
             format!("rsb{} {}, {}, {}", s(setflags), r(rd), r(rn), imm(v))
         }
+        Instr::RsbReg {
+            rd,
+            rn,
+            rm,
+            shift,
+            setflags,
+        } => format!(
+            "rsb{} {}, {}, {}{}",
+            s(setflags),
+            r(rd),
+            r(rn),
+            r(rm),
+            shift_suffix(shift)
+        ),
         Instr::AddReg {
             rd,
             rn,
@@ -199,7 +273,7 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
             shift,
             setflags,
         } => dnm(
-            &format!("add{}", s(setflags)),
+            &format!("add{}{}", s(setflags), w(len)),
             rd,
             rn,
             format!("{}{}", r(rm), shift_suffix(shift)),
@@ -212,7 +286,7 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
             shift,
             setflags,
         } => dnm(
-            &format!("sub{}", s(setflags)),
+            &format!("sub{}{}", s(setflags), w(len)),
             rd,
             rn,
             format!("{}{}", r(rm), shift_suffix(shift)),
@@ -225,44 +299,98 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
             rm,
             shift,
             setflags,
-        } => {
-            let name = match op {
-                AluOp::And => "and",
-                AluOp::Eor => "eor",
-                AluOp::Orr => "orr",
-                AluOp::Bic => "bic",
-                AluOp::Adc => "adc",
-                AluOp::Sbc => "sbc",
-            };
-            dnm(
-                &format!("{name}{}", s(setflags)),
-                rd,
-                rn,
-                format!("{}{}", r(rm), shift_suffix(shift)),
-                len == 2,
-            )
-        }
+        } => dnm(
+            &format!("{}{}", alu_name(op, setflags), alu_w(op, len)),
+            rd,
+            rn,
+            format!("{}{}", r(rm), shift_suffix(shift)),
+            len == 2,
+        ),
+        Instr::AluImm {
+            op,
+            rd,
+            rn,
+            imm: v,
+            setflags,
+            ..
+        } => dnm(
+            &format!("{}{}", alu_name(op, setflags), alu_w(op, len)),
+            rd,
+            rn,
+            imm(v),
+            false,
+        ),
         Instr::Mul {
             rd,
             rn,
             rm,
             setflags,
         } => {
-            format!("mul{} {}, {}, {}", s(setflags), r(rd), r(rn), r(rm))
+            format!(
+                "mul{}{} {}, {}, {}",
+                s(setflags),
+                w(len),
+                r(rd),
+                r(rn),
+                r(rm)
+            )
         }
-        Instr::CmpImm { rn, imm: v } => format!("cmp {}, {}", r(rn), imm(v)),
+        Instr::MulAcc {
+            rd,
+            rn,
+            rm,
+            ra,
+            sub,
+        } => format!(
+            "{} {}, {}, {}, {}",
+            if sub { "mls" } else { "mla" },
+            r(rd),
+            r(rn),
+            r(rm),
+            r(ra)
+        ),
+        Instr::LongMul {
+            kind,
+            rdlo,
+            rdhi,
+            rn,
+            rm,
+        } => {
+            let name = match kind {
+                LongMulKind::Smull => "smull",
+                LongMulKind::Umull => "umull",
+                LongMulKind::Smlal => "smlal",
+                LongMulKind::Umlal => "umlal",
+                LongMulKind::Umaal => "umaal",
+            };
+            format!("{name} {}, {}, {}, {}", r(rdlo), r(rdhi), r(rn), r(rm))
+        }
+        Instr::Div { rd, rn, rm, signed } => format!(
+            "{} {}, {}, {}",
+            if signed { "sdiv" } else { "udiv" },
+            r(rd),
+            r(rn),
+            r(rm)
+        ),
+        Instr::CmpImm { rn, imm: v } => format!("cmp{} {}, {}", w(len), r(rn), imm(v)),
+        Instr::CmnImm { rn, imm: v } => format!("cmn{} {}, {}", w(len), r(rn), imm(v)),
+        Instr::TstImm { rn, imm: v, .. } => format!("tst{} {}, {}", w(len), r(rn), imm(v)),
+        Instr::TeqImm { rn, imm: v, .. } => format!("teq {}, {}", r(rn), imm(v)),
         Instr::CmpReg { rn, rm, shift } => {
-            format!("cmp {}, {}{}", r(rn), r(rm), shift_suffix(shift))
+            format!("cmp{} {}, {}{}", w(len), r(rn), r(rm), shift_suffix(shift))
         }
         Instr::CmnReg { rn, rm, shift } => {
-            format!("cmn {}, {}{}", r(rn), r(rm), shift_suffix(shift))
+            format!("cmn{} {}, {}{}", w(len), r(rn), r(rm), shift_suffix(shift))
         }
         Instr::TstReg { rn, rm, shift } => {
-            format!("tst {}, {}{}", r(rn), r(rm), shift_suffix(shift))
+            format!("tst{} {}, {}{}", w(len), r(rn), r(rm), shift_suffix(shift))
+        }
+        Instr::TeqReg { rn, rm, shift } => {
+            format!("teq {}, {}{}", r(rn), r(rm), shift_suffix(shift))
         }
         Instr::Adr { rd, imm: v } => {
             let target = (addr.wrapping_add(4) & !3).wrapping_add(v);
-            format!("adr {}, {target:#x}", r(rd))
+            format!("adr{} {}, {target:#x}", w(len), r(rd))
         }
         Instr::Bx { rm } => format!("bx {}", r(rm)),
         Instr::Blx { rm } => format!("blx {}", r(rm)),
@@ -373,10 +501,30 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
                 if signed { "s" } else { "u" },
                 if half { "h" } else { "b" }
             );
+            let name = format!("{name}{}", w(len));
             if rotate == 0 {
                 format!("{name} {}, {}", r(rd), r(rm))
             } else {
                 format!("{name} {}, {}, ror #{rotate}", r(rd), r(rm))
+            }
+        }
+        Instr::ExtendAdd {
+            rd,
+            rn,
+            rm,
+            rotate,
+            signed,
+            half,
+        } => {
+            let name = format!(
+                "{}xta{}",
+                if signed { "s" } else { "u" },
+                if half { "h" } else { "b" }
+            );
+            if rotate == 0 {
+                format!("{name} {}, {}, {}", r(rd), r(rn), r(rm))
+            } else {
+                format!("{name} {}, {}, {}, ror #{rotate}", r(rd), r(rn), r(rm))
             }
         }
         Instr::Rev { rd, rm, kind } => {
@@ -385,8 +533,54 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
                 RevKind::Rev16 => "rev16",
                 RevKind::Revsh => "revsh",
             };
-            format!("{name} {}, {}", r(rd), r(rm))
+            format!("{name}{} {}, {}", w(len), r(rd), r(rm))
         }
+        Instr::Clz { rd, rm } => format!("clz {}, {}", r(rd), r(rm)),
+        Instr::Rbit { rd, rm } => format!("rbit {}, {}", r(rd), r(rm)),
+        Instr::Sel { rd, rn, rm } => format!("sel {}, {}, {}", r(rd), r(rn), r(rm)),
+        Instr::Pkh {
+            rd,
+            rn,
+            rm,
+            tb,
+            amount,
+        } => {
+            if tb {
+                format!("pkhtb {}, {}, {}, asr #{amount}", r(rd), r(rn), r(rm))
+            } else if amount == 0 {
+                format!("pkhbt {}, {}, {}", r(rd), r(rn), r(rm))
+            } else {
+                format!("pkhbt {}, {}, {}, lsl #{amount}", r(rd), r(rn), r(rm))
+            }
+        }
+        Instr::Ssat {
+            rd,
+            rn,
+            bits,
+            shift,
+        } => format!("ssat {}, #{bits}, {}{}", r(rd), r(rn), shift_suffix(shift)),
+        Instr::Usat {
+            rd,
+            rn,
+            bits,
+            shift,
+        } => format!("usat {}, #{bits}, {}{}", r(rd), r(rn), shift_suffix(shift)),
+        Instr::Bfx {
+            rd,
+            rn,
+            lsb,
+            width,
+            signed,
+        } => format!(
+            "{}bfx {}, {}, #{lsb}, #{width}",
+            if signed { "s" } else { "u" },
+            r(rd),
+            r(rn)
+        ),
+        Instr::Bfi { rd, rn, lsb, width } => {
+            format!("bfi {}, {}, #{lsb}, #{width}", r(rd), r(rn))
+        }
+        Instr::Bfc { rd, lsb, width } => format!("bfc {}, #{lsb}, #{width}", r(rd)),
         Instr::Undefined { raw } => match len {
             2 if raw & 0xFF00 == 0xDE00 => format!("udf #{}", raw & 0xFF),
             2 => format!(".short {raw:#06x}"),

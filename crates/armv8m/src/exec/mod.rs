@@ -52,7 +52,29 @@ pub(crate) fn execute(
         | Instr::TstReg { .. }
         | Instr::Adr { .. }
         | Instr::Extend { .. }
-        | Instr::Rev { .. } => alu::execute(cpu, instr, suppress_flags),
+        | Instr::Rev { .. }
+        | Instr::Movw { .. }
+        | Instr::Movt { .. }
+        | Instr::MvnImm { .. }
+        | Instr::RsbReg { .. }
+        | Instr::AluImm { .. }
+        | Instr::CmnImm { .. }
+        | Instr::TstImm { .. }
+        | Instr::TeqImm { .. }
+        | Instr::TeqReg { .. }
+        | Instr::ExtendAdd { .. }
+        | Instr::Clz { .. }
+        | Instr::Rbit { .. }
+        | Instr::Sel { .. }
+        | Instr::Pkh { .. }
+        | Instr::Ssat { .. }
+        | Instr::Usat { .. }
+        | Instr::Bfx { .. }
+        | Instr::Bfi { .. }
+        | Instr::Bfc { .. }
+        | Instr::MulAcc { .. }
+        | Instr::LongMul { .. }
+        | Instr::Div { .. } => alu::execute(cpu, instr, suppress_flags),
         Instr::LoadImm { .. }
         | Instr::StoreImm { .. }
         | Instr::LoadReg { .. }

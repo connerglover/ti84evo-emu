@@ -64,6 +64,7 @@ pub fn decode16(hw: u16) -> Instr {
                     imm: field,
                     setflags: true,
                     two_op: false,
+                    imm12: false,
                 },
                 _ => Instr::SubImm {
                     rd,
@@ -71,6 +72,7 @@ pub fn decode16(hw: u16) -> Instr {
                     imm: field,
                     setflags: true,
                     two_op: false,
+                    imm12: false,
                 },
             }
         }
@@ -83,6 +85,7 @@ pub fn decode16(hw: u16) -> Instr {
                     rd: r,
                     imm,
                     setflags: true,
+                    carry: None,
                 },
                 1 => Instr::CmpImm { rn: r, imm },
                 2 => Instr::AddImm {
@@ -91,6 +94,7 @@ pub fn decode16(hw: u16) -> Instr {
                     imm,
                     setflags: true,
                     two_op: true,
+                    imm12: false,
                 },
                 _ => Instr::SubImm {
                     rd: r,
@@ -98,6 +102,7 @@ pub fn decode16(hw: u16) -> Instr {
                     imm,
                     setflags: true,
                     two_op: true,
+                    imm12: false,
                 },
             }
         }
@@ -114,6 +119,7 @@ pub fn decode16(hw: u16) -> Instr {
             imm: (h & 0xFF) << 2,
             setflags: false,
             two_op: false,
+            imm12: false,
         },
         // LDR (literal)
         0b01001 => Instr::LdrLit {
@@ -354,6 +360,7 @@ fn misc(hw: u16) -> Instr {
                     imm,
                     setflags: false,
                     two_op: true,
+                    imm12: false,
                 }
             } else {
                 Instr::SubImm {
@@ -362,6 +369,7 @@ fn misc(hw: u16) -> Instr {
                     imm,
                     setflags: false,
                     two_op: true,
+                    imm12: false,
                 }
             }
         }

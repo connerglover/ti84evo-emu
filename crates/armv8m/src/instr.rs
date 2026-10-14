@@ -28,6 +28,18 @@ pub enum AluOp {
     Bic,
     Adc,
     Sbc,
+    /// `ORN` (32-bit only): `Rn OR NOT(operand)`.
+    Orn,
+}
+
+/// 64-bit multiply flavours (`RdLo`/`RdHi` destinations).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LongMulKind {
+    Smull,
+    Umull,
+    Smlal,
+    Umlal,
+    Umaal,
 }
 
 /// Width of a load/store access.
@@ -68,6 +80,26 @@ pub enum Instr {
         rd: Reg,
         imm: u32,
         setflags: bool,
+        /// Carry-out of `ThumbExpandImm_C`: `Some(c)` sets APSR.C to `c` when flags are set,
+        /// `None` leaves it unchanged.
+        carry: Option<bool>,
+    },
+    /// `MOVW rd, #imm16`
+    Movw {
+        rd: Reg,
+        imm: u16,
+    },
+    /// `MOVT rd, #imm16`: replace the top halfword.
+    Movt {
+        rd: Reg,
+        imm: u16,
+    },
+    /// `MVN rd, #imm` (modified immediate).
+    MvnImm {
+        rd: Reg,
+        imm: u32,
+        setflags: bool,
+        carry: Option<bool>,
     },
     MovReg {
         rd: Reg,
@@ -101,6 +133,8 @@ pub enum Instr {
         setflags: bool,
         /// Spelled with two operands in UAL (16-bit imm8 and SP forms).
         two_op: bool,
+        /// Plain 12-bit immediate encoding (`ADDW`/`SUBW`) rather than a modified immediate.
+        imm12: bool,
     },
     SubImm {
         rd: Reg,
@@ -109,11 +143,29 @@ pub enum Instr {
         setflags: bool,
         /// Spelled with two operands in UAL (16-bit imm8 and SP forms).
         two_op: bool,
+        /// Plain 12-bit immediate encoding (`ADDW`/`SUBW`) rather than a modified immediate.
+        imm12: bool,
     },
     RsbImm {
         rd: Reg,
         rn: Reg,
         imm: u32,
+        setflags: bool,
+    },
+    RsbReg {
+        rd: Reg,
+        rn: Reg,
+        rm: Reg,
+        shift: Shift,
+        setflags: bool,
+    },
+    /// Logical / carry operation with a modified immediate (32-bit encodings).
+    AluImm {
+        op: AluOp,
+        rd: Reg,
+        rn: Reg,
+        imm: u32,
+        carry: Option<bool>,
         setflags: bool,
     },
     AddReg {
@@ -148,6 +200,10 @@ pub enum Instr {
         rn: Reg,
         imm: u32,
     },
+    CmnImm {
+        rn: Reg,
+        imm: u32,
+    },
     CmpReg {
         rn: Reg,
         rm: Reg,
@@ -159,6 +215,21 @@ pub enum Instr {
         shift: Shift,
     },
     TstReg {
+        rn: Reg,
+        rm: Reg,
+        shift: Shift,
+    },
+    TstImm {
+        rn: Reg,
+        imm: u32,
+        carry: Option<bool>,
+    },
+    TeqImm {
+        rn: Reg,
+        imm: u32,
+        carry: Option<bool>,
+    },
+    TeqReg {
         rn: Reg,
         rm: Reg,
         shift: Shift,
@@ -277,6 +348,92 @@ pub enum Instr {
         rd: Reg,
         rm: Reg,
         kind: RevKind,
+    },
+    /// `SXTAB/SXTAH/UXTAB/UXTAH rd, rn, rm{, ROR #rotate}`
+    ExtendAdd {
+        rd: Reg,
+        rn: Reg,
+        rm: Reg,
+        rotate: u8,
+        signed: bool,
+        half: bool,
+    },
+    Clz {
+        rd: Reg,
+        rm: Reg,
+    },
+    Rbit {
+        rd: Reg,
+        rm: Reg,
+    },
+    /// Select bytes from `rn`/`rm` according to APSR.GE.
+    Sel {
+        rd: Reg,
+        rn: Reg,
+        rm: Reg,
+    },
+    /// `PKHBT` (`tb == false`, LSL) / `PKHTB` (`tb == true`, ASR); `amount` is the shift.
+    Pkh {
+        rd: Reg,
+        rn: Reg,
+        rm: Reg,
+        tb: bool,
+        amount: u32,
+    },
+    /// `SSAT rd, #bits, rn{, shift}` (`bits` is 1..=32).
+    Ssat {
+        rd: Reg,
+        rn: Reg,
+        bits: u8,
+        shift: Shift,
+    },
+    /// `USAT rd, #bits, rn{, shift}` (`bits` is 0..=31).
+    Usat {
+        rd: Reg,
+        rn: Reg,
+        bits: u8,
+        shift: Shift,
+    },
+    /// `SBFX` / `UBFX`
+    Bfx {
+        rd: Reg,
+        rn: Reg,
+        lsb: u8,
+        width: u8,
+        signed: bool,
+    },
+    Bfi {
+        rd: Reg,
+        rn: Reg,
+        lsb: u8,
+        width: u8,
+    },
+    Bfc {
+        rd: Reg,
+        lsb: u8,
+        width: u8,
+    },
+    /// `MLA` (`sub == false`) / `MLS`: `rd = ra +/- rn * rm`.
+    MulAcc {
+        rd: Reg,
+        rn: Reg,
+        rm: Reg,
+        ra: Reg,
+        sub: bool,
+    },
+    LongMul {
+        kind: LongMulKind,
+        rdlo: Reg,
+        rdhi: Reg,
+        rn: Reg,
+        rm: Reg,
+    },
+    /// `SDIV` / `UDIV`
+    Div {
+        rd: Reg,
+        rn: Reg,
+        rm: Reg,
+        signed: bool,
     },
     Undefined {
         raw: u32,
