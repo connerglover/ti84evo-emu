@@ -3,6 +3,7 @@
 
 pub mod mpc;
 pub mod spi;
+pub mod spif;
 pub mod storage;
 pub mod sysctl;
 pub mod timer;

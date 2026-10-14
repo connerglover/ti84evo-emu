@@ -3,6 +3,7 @@
 use crate::MemoryMap;
 use crate::dev::mpc::Mpc;
 use crate::dev::spi::{DEFAULT_PANEL_ID, Spi, St7789};
+use crate::dev::spif::Spif;
 use crate::dev::storage::Storage;
 use crate::dev::sysctl::{Cru, Spctrl};
 use crate::dev::timer::Timer;
@@ -45,4 +46,7 @@ pub fn attach(map: &mut MemoryMap) {
         0x1000,
         Box::new(Spi::new(St7789::new(DEFAULT_PANEL_ID))),
     );
+    // SPIF QSPI controller over the NOR part (spif-nor.md): secure alias only, no IRQ. It
+    // erases and programs the FLASH_BUFFER bytes the XIP windows read.
+    map.add_device("spif", 0x5000_1000, 0x1000, Box::new(Spif::new()));
 }
