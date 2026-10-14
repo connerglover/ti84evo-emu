@@ -1,6 +1,6 @@
 mod common;
 
-use armv8m::{Access, Bus, BusError, Cpu, Instr, Sec, StepResult, decode32, disasm};
+use armv8m::{Access, Bus, BusError, Cpu, Instr, Sec, SleepKind, StepResult, decode32, disasm};
 use common::{FlatBus, RAM_BASE, cpu_with_code, step_hardfault};
 
 const UNALIGNED: u32 = 1 << 24;
@@ -640,7 +640,7 @@ fn barriers_hints_and_udf() {
     }
     let (mut cpu, mut bus) = cpu_with_code(&[0xF3AF, 0x8003]);
     assert_eq!(dis(&cpu, &mut bus), "wfi.w");
-    assert_eq!(cpu.step(&mut bus), StepResult::Sleep);
+    assert_eq!(cpu.step(&mut bus), StepResult::Sleep(SleepKind::Wfi));
     // udf.w #0x1234
     let (mut cpu, mut bus) = cpu_with_code(&[0xF7F1, 0xA234]);
     assert_eq!(dis(&cpu, &mut bus), "udf.w #4660");

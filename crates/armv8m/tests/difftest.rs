@@ -1557,7 +1557,7 @@ fn run_core(case: &Case, mem: &Memory) -> State {
         if cpu.regs.pc == mem.end || cpu.regs.xpsr.exception != 0 {
             break;
         }
-        if let r @ (StepResult::Lockup | StepResult::Bkpt(_) | StepResult::Sleep) =
+        if let r @ (StepResult::Lockup | StepResult::Bkpt(_) | StepResult::Sleep(_)) =
             cpu.step(&mut bus)
         {
             trouble = Some(format!("{r:?} at {:#x}", cpu.regs.pc));

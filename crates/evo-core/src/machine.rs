@@ -12,16 +12,18 @@
 //!
 //! # Sleep
 //!
-//! After WFI/WFE (or a return with `SCR.SLEEPONEXIT`) the machine is asleep unless an
-//! exception is already pending. While asleep the CPU is not stepped: time jumps to the next
-//! wake-up, the earlier of the next scheduler deadline and the next SysTick interrupt, and the
-//! CPU wakes once an exception is pending. If neither exists the CPU would sleep forever, and
-//! `run` returns [`StopReason::CycleLimit`] at once instead of waiting out its budget.
+//! After WFI/WFE (or a return with `SCR.SLEEPONEXIT`) the machine is asleep unless it would
+//! wake at once. While asleep the CPU is not stepped: time jumps to the next wake-up, the
+//! earlier of the next scheduler deadline and the next SysTick interrupt. The CPU wakes once
+//! an exception is pending, or, after WFE only, once the event register is set (e.g. by an
+//! interrupt pended with `SCR.SEVONPEND`, even a disabled one); that wake-up consumes the
+//! event. If no wake-up time exists the CPU would sleep forever, and `run` returns
+//! [`StopReason::CycleLimit`] at once instead of waiting out its budget.
 
 use std::collections::BTreeSet;
 
 use armv8m::decode::is_32bit;
-use armv8m::{Cpu, Sec, StepResult, decode16, decode32, disasm};
+use armv8m::{Cpu, Sec, SleepKind, StepResult, decode16, decode32, disasm};
 use evo_hw::MemoryMap;
 use evo_image::{Bundle, ImageError, Layout};
 use serde::{Deserialize, Serialize};
@@ -70,7 +72,8 @@ pub struct Machine {
     pub resets: u64,
     /// `VTOR_S` at boot, reloaded by every system reset.
     boot_vtor: u32,
-    asleep: bool,
+    /// Set while the CPU sleeps, with what put it to sleep.
+    sleep: Option<SleepKind>,
     /// The breakpoint the last `run` stopped at, which the next `run` steps over.
     stopped_at: Option<u32>,
 }
@@ -109,14 +112,14 @@ impl Machine {
             breakpoints: BTreeSet::new(),
             resets: 0,
             boot_vtor: vtor,
-            asleep: false,
+            sleep: None,
             stopped_at: None,
         })
     }
 
     /// True while the CPU sleeps in WFI/WFE waiting for an exception.
     pub fn asleep(&self) -> bool {
-        self.asleep
+        self.sleep.is_some()
     }
 
     /// Run for up to `max_cycles` cycles from now.
@@ -140,7 +143,7 @@ impl Machine {
             if self.sched.now >= end {
                 return StopReason::CycleLimit;
             }
-            if self.asleep {
+            if self.asleep() {
                 if let Some(stop) = self.idle(end) {
                     return stop;
                 }
@@ -159,15 +162,15 @@ impl Machine {
     }
 
     /// Execute one CPU step (one instruction, or the entry to a pending exception), ignoring
-    /// breakpoints. While asleep, wake if an exception is pending (and then step), else jump
-    /// to the next wake-up time without stepping. Returns `CycleLimit` unless the step locked
+    /// breakpoints. While asleep, wake if a wake-up is due (and then step), else jump to the
+    /// next wake-up time without stepping. Returns `CycleLimit` unless the step locked
     /// up or hit a guest `BKPT`.
     pub fn step(&mut self) -> StopReason {
-        if self.asleep {
+        if self.asleep() {
             if let Some(stop) = self.idle(u64::MAX) {
                 return stop;
             }
-            if self.asleep {
+            if self.asleep() {
                 return StopReason::CycleLimit;
             }
         }
@@ -209,10 +212,11 @@ impl Machine {
                 self.advance(u64::from(cycles));
                 None
             }
-            StepResult::Sleep => {
+            StepResult::Sleep(kind) => {
                 // The step does not report its cycles; WFI/WFE cost 1.
                 self.advance(1);
-                self.asleep = !self.cpu.exception_pending();
+                self.sleep = Some(kind);
+                self.wake_if_due();
                 None
             }
             StepResult::Bkpt(imm) => Some(StopReason::Bkpt { pc, imm }),
@@ -224,11 +228,10 @@ impl Machine {
         stop
     }
 
-    /// While asleep: wake if an exception is pending, else advance time to the next wake-up
-    /// (at most to `end`). `Some(CycleLimit)` if nothing will ever wake the CPU.
+    /// While asleep: wake if a wake-up is due, else advance time to the next wake-up time (at
+    /// most to `end`). `Some(CycleLimit)` if nothing will ever wake the CPU.
     fn idle(&mut self, end: u64) -> Option<StopReason> {
-        if self.cpu.exception_pending() {
-            self.asleep = false;
+        if self.wake_if_due() {
             return None;
         }
         let now = self.sched.now;
@@ -253,6 +256,21 @@ impl Machine {
         }
         self.advance(target - now);
         None
+    }
+
+    /// Wake the sleeping CPU if an exception is pending or, for WFE, the event register is set
+    /// (consuming it). Returns whether it woke.
+    fn wake_if_due(&mut self) -> bool {
+        let Some(kind) = self.sleep else {
+            return false;
+        };
+        if kind == SleepKind::Wfe && self.cpu.event {
+            self.cpu.event = false;
+        } else if !self.cpu.exception_pending() {
+            return false;
+        }
+        self.sleep = None;
+        true
     }
 
     /// Advance time by `cycles` and fire every event that is due.
@@ -286,7 +304,7 @@ impl Machine {
         let now = self.sched.now;
         self.sched = Scheduler::new();
         self.sched.now = now;
-        self.asleep = false;
+        self.sleep = None;
         self.stopped_at = None;
     }
 }

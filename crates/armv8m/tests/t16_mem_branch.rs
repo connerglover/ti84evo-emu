@@ -1,6 +1,6 @@
 mod common;
 
-use armv8m::{Cpu, StepResult, disasm};
+use armv8m::{Cpu, SleepKind, StepResult, disasm};
 use common::{FlatBus, RAM_BASE, cpu_with_code, run, step_hardfault};
 
 /// Disassemble the instruction at the current PC.
@@ -143,7 +143,7 @@ fn bkpt_returns_imm() {
 fn wfi_returns_sleep() {
     let (mut cpu, mut bus) = cpu_with_code(&[0xBF30]);
     assert_eq!(dis(&cpu, &mut bus), "wfi");
-    assert_eq!(cpu.step(&mut bus), StepResult::Sleep);
+    assert_eq!(cpu.step(&mut bus), StepResult::Sleep(SleepKind::Wfi));
     assert_eq!(cpu.regs.pc, 0x102);
 }
 
@@ -156,7 +156,7 @@ fn hints_nop_yield_wfe_sev() {
         assert_eq!(cycles(cpu.step(&mut bus)), 1);
     }
     // the event register was consumed: the second wfe sleeps
-    assert_eq!(cpu.step(&mut bus), StepResult::Sleep);
+    assert_eq!(cpu.step(&mut bus), StepResult::Sleep(SleepKind::Wfe));
 }
 
 #[test]

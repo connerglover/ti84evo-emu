@@ -7,7 +7,7 @@ mod mem;
 mod sys;
 
 use crate::bus::Bus;
-use crate::cpu::Cpu;
+use crate::cpu::{Cpu, SleepKind};
 use crate::exception::Fault;
 use crate::instr::Instr;
 
@@ -19,7 +19,7 @@ pub(crate) enum Flow {
     /// PC was written by the instruction.
     Branched,
     /// WFI/WFE: advance PC and report sleep.
-    Sleep,
+    Sleep(SleepKind),
     /// BKPT: PC stays on the instruction.
     Bkpt(u8),
     /// SVC: PC advances, then the exception is requested.

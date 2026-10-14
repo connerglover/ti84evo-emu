@@ -12,7 +12,7 @@ pub mod regs;
 pub mod scs;
 
 pub use bus::{Access, AccessKind, Bus, BusError};
-pub use cpu::{Cpu, StepResult};
+pub use cpu::{Cpu, SleepKind, StepResult};
 pub use decode::{decode16, decode32};
 pub use disasm::disasm;
 pub use instr::Instr;

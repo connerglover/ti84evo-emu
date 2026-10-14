@@ -283,6 +283,42 @@ fn wfi_skips_to_next_event() {
     assert_eq!(m.sched.now, 12_000);
 }
 
+/// With `SCR.SEVONPEND`, pending even a disabled IRQ sets the event register. That wakes a WFE
+/// (consuming the event) but not a WFI, which waits for an exception.
+#[test]
+fn wfe_wakes_on_event_wfi_does_not() {
+    const SCR: u32 = 0xE000_ED10;
+    const SEVONPEND: u32 = 1 << 4;
+    const WFE: u16 = 0xBF20;
+
+    // wfe ; adds r0, #1 ; b wfe
+    let mut p = Payload::new();
+    p.vector(1, CODE).code(CODE, &[WFE, ADDS_R0_1, 0xE7FC]);
+    let mut m = p.boot();
+    assert_eq!(m.run(1_000), StopReason::CycleLimit);
+    assert!(m.asleep(), "no event yet: WFE sleeps");
+    assert_eq!(m.cpu.regs.r[0], 0);
+
+    m.cpu.ppb_write32(SCR, SEVONPEND);
+    m.cpu.pulse_irq(5); // disabled: pending, but no exception will be taken
+    assert!(m.cpu.event);
+    assert_eq!(m.run(1_000), StopReason::CycleLimit);
+    assert_eq!(m.cpu.regs.r[0], 1, "woke once, then slept in the next WFE");
+    assert!(m.asleep());
+    assert!(!m.cpu.event, "the wake-up consumed the event");
+
+    // The same with WFI: the event does not wake it.
+    let mut m = sleeper().boot();
+    assert_eq!(m.run(1_000), StopReason::CycleLimit);
+    m.cpu.ppb_write32(SCR, SEVONPEND);
+    m.cpu.pulse_irq(5);
+    assert!(m.cpu.event);
+    assert_eq!(m.run(1_000), StopReason::CycleLimit);
+    assert_eq!(m.cpu.regs.r[0], 0, "WFI still asleep");
+    assert!(m.asleep());
+    assert!(m.cpu.event, "left for a later WFE");
+}
+
 #[test]
 fn wfi_wakes_on_systick() {
     let mut m = sleeper().boot();

@@ -1,7 +1,7 @@
 //! System, hint and IT instructions.
 
 use super::Flow;
-use crate::cpu::Cpu;
+use crate::cpu::{Cpu, SleepKind};
 use crate::exception::Fault;
 use crate::instr::{HintOp, Instr};
 use crate::regs::{Registers, Sec};
@@ -246,7 +246,8 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
                 cpu.event = false;
                 Flow::Next
             }
-            HintOp::Wfe | HintOp::Wfi => Flow::Sleep,
+            HintOp::Wfe => Flow::Sleep(SleepKind::Wfe),
+            HintOp::Wfi => Flow::Sleep(SleepKind::Wfi),
         },
         Instr::Msr { sysm, rn, mask } => {
             let v = cpu.reg(rn);

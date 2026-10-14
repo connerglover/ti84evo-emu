@@ -15,10 +15,25 @@ use crate::scs::sau::{Attr, Idau, IdauHandle, SecAttr};
 /// Outcome of one `Cpu::step`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepResult {
-    Executed { cycles: u32 },
-    Sleep,
+    Executed {
+        cycles: u32,
+    },
+    /// The processor went to sleep; the kind says what wakes it.
+    Sleep(SleepKind),
     Bkpt(u8),
     Lockup,
+}
+
+/// Why the processor went to sleep, which decides what wakes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SleepKind {
+    /// WFI: woken by a pending exception.
+    Wfi,
+    /// WFE with the event register clear: woken by a pending exception or by the event
+    /// register becoming set (SEV, `SCR.SEVONPEND`), which the wake-up consumes.
+    Wfe,
+    /// An exception return to Thread mode with `SCR.SLEEPONEXIT` set: woken like WFI.
+    OnExit,
 }
 
 /// Processor state.
@@ -87,7 +102,10 @@ fn writes_pc(instr: &Instr) -> bool {
 
 /// Result of executing (or failing to execute) one instruction.
 enum Exec {
-    Done { cycles: u32, sleep: bool },
+    Done {
+        cycles: u32,
+        sleep: Option<SleepKind>,
+    },
     Bkpt(u8),
     Lockup,
 }
@@ -319,10 +337,9 @@ impl Cpu {
             cycles += ENTRY_CYCLES;
             return self.entry_result(cycles);
         }
-        if sleep {
-            StepResult::Sleep
-        } else {
-            StepResult::Executed { cycles }
+        match sleep {
+            Some(kind) => StepResult::Sleep(kind),
+            None => StepResult::Executed { cycles },
         }
     }
 
@@ -339,7 +356,7 @@ impl Cpu {
         if self.raise_fault(fault) {
             Exec::Done {
                 cycles: 1,
-                sleep: false,
+                sleep: None,
             }
         } else {
             self.enter_lockup(None);
@@ -392,7 +409,7 @@ impl Cpu {
             Flow::Fault(f) => return self.fault(f),
             // Intercepted above; kept for completeness.
             Flow::Bkpt(imm) => return Exec::Bkpt(imm),
-            Flow::Next | Flow::Sleep | Flow::Svc(_) => {
+            Flow::Next | Flow::Sleep(_) | Flow::Svc(_) => {
                 self.regs.pc = pc.wrapping_add(u32::from(len));
             }
             // FncReturn was turned into Branched or Fault above.
@@ -408,7 +425,10 @@ impl Cpu {
             0
         };
         let cycles = 1 + u32::from(branched) + extra;
-        let mut sleep = flow == Flow::Sleep;
+        let mut sleep = match flow {
+            Flow::Sleep(kind) => Some(kind),
+            _ => None,
+        };
         match flow {
             Flow::Svc(_) => {
                 if !self.raise_sync(SVCALL, self.regs.sec) {
@@ -418,7 +438,7 @@ impl Cpu {
             }
             Flow::ExcReturn(v) => match self.exception_return(bus, v) {
                 ReturnOutcome::Done => {}
-                ReturnOutcome::Sleep => sleep = true,
+                ReturnOutcome::Sleep => sleep = Some(SleepKind::OnExit),
                 ReturnOutcome::Lockup => return Exec::Lockup,
             },
             _ => {}

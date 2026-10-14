@@ -197,7 +197,7 @@ fn run(s_image: &[u8], ns_image: Option<&[u8]>, max_steps: u64) -> Result<String
         match cpu.step(&mut bus) {
             // WFI/WFE complete immediately: every program sleeps in a loop that rechecks its
             // condition, and the timers keep counting the loop's cycles.
-            StepResult::Executed { .. } | StepResult::Sleep => {}
+            StepResult::Executed { .. } | StepResult::Sleep(_) => {}
             StepResult::Bkpt(SEMIHOSTING_BKPT) => {
                 let (op, arg) = (cpu.regs.r[0], cpu.regs.r[1]);
                 match op {

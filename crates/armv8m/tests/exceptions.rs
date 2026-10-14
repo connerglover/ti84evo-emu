@@ -2,7 +2,7 @@
 
 mod common;
 
-use armv8m::{Access, Bus, BusError, Cpu, Sec, StepResult};
+use armv8m::{Access, Bus, BusError, Cpu, Sec, SleepKind, StepResult};
 use common::{FlatBus, RAM_BASE, cpu_with_code};
 
 // SCS register addresses.
@@ -568,6 +568,20 @@ fn exception_pending_ignores_priority_but_not_enable() {
     // System exceptions count too.
     cpu.ppb_write32(ICSR, 1 << 28); // PENDSVSET
     assert!(cpu.exception_pending());
+}
+
+#[test]
+fn sleep_on_exit_reports_its_kind() {
+    const SCR: u32 = 0xE000_ED10;
+    const SLEEPONEXIT: u32 = 1 << 1;
+    // svc #0 ; b .   with an SVCall handler that just returns.
+    let (mut cpu, mut bus) = cpu_with_code(&[SVC0, B_SELF]);
+    handler(&mut bus, 11, 0x200, &[BX_LR]);
+    cpu.ppb_write32(SCR, SLEEPONEXIT);
+    executed(cpu.step(&mut bus));
+    assert_eq!(ipsr(&cpu), 11);
+    assert_eq!(cpu.step(&mut bus), StepResult::Sleep(SleepKind::OnExit));
+    assert_eq!((ipsr(&cpu), cpu.regs.pc), (0, 0x102), "back in Thread mode");
 }
 
 // ---- Faults ----
