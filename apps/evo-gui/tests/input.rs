@@ -1,9 +1,12 @@
 use std::time::Duration;
 
+use egui::{Event, Key, Modifiers};
 use evo_gui::backend::fake::{FAKE_PC, FakeBackend};
 use evo_gui::backend::{CLOCK_HZ, EmuBackend, RunStatus};
-use evo_gui::input::{KeyLatch, MIN_HOLD_CYCLES, Source};
-use evo_gui::keypad::KeyId;
+use evo_gui::input::{
+    KeyAction, KeyLatch, KeyboardTracker, Keymap, MIN_HOLD_CYCLES, PcKey, Source, pc_key_label,
+};
+use evo_gui::keypad::{KEYS, KeyId};
 use evo_gui::pacer::{
     CHUNK_CYCLES, FrameRunner, MIN_CHUNK_CYCLES, Pacer, SpeedMeter, WALL_BUDGET, speed_percent,
 };
@@ -234,4 +237,244 @@ fn speed_meter_smooths_over_a_second() {
     assert_eq!(meter.percent(), Some(100));
     meter.reset();
     assert_eq!(meter.percent(), None);
+}
+
+// ---------------------------------------------------------------- keymap
+
+fn pk(key: Key, shift: bool) -> PcKey {
+    PcKey { key, shift }
+}
+
+fn key_event(key: Key, pressed: bool, modifiers: Modifiers) -> Event {
+    Event::Key {
+        key,
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers,
+    }
+}
+
+fn down(key: Key) -> Event {
+    key_event(key, true, Modifiers::NONE)
+}
+
+fn up(key: Key) -> Event {
+    key_event(key, false, Modifiers::NONE)
+}
+
+#[test]
+fn default_map_covers_essentials() {
+    use KeyId::*;
+    let map = Keymap::default_map();
+    let essentials = [
+        Zero, One, Two, Three, Four, Five, Six, Seven, Eight, Nine, Dot, Neg, Add, Sub, Mul, Div,
+        Power, LParen, RParen, Comma, Enter, Del, Clear, Up, Down, Left, Right, Second, Alpha,
+        Mode, YEqu, Window, Zoom, Trace, Graph, On, Math, Apps, Vars, Stat, Sto, XTThetaN, Sin,
+        Cos, Tan, Log, Ln, Inverse, Prgm, Square,
+    ];
+    for id in essentials {
+        assert!(!map.keys_for(id).is_empty(), "{id:?} has no PC binding");
+    }
+}
+
+#[test]
+fn letters_follow_alpha_legends() {
+    let map = Keymap::default_map();
+    let mut seen = 0;
+    for def in &KEYS {
+        let Some(legend) = def.alpha else { continue };
+        let mut chars = legend.chars();
+        let (Some(c), None) = (chars.next(), chars.next()) else {
+            continue;
+        };
+        if !c.is_ascii_uppercase() {
+            continue;
+        }
+        let key = Key::from_name(&c.to_string()).expect("egui has a key per letter");
+        assert_eq!(map.lookup(pk(key, false)), Some(def.id), "letter {c}");
+        seen += 1;
+    }
+    assert_eq!(seen, 26);
+}
+
+#[test]
+fn no_pc_key_bound_twice() {
+    let map = Keymap::default_map();
+    let mut keys: Vec<PcKey> = map.bindings.iter().map(|(k, _)| *k).collect();
+    let n = keys.len();
+    keys.sort_by_key(|k| (k.key, k.shift));
+    keys.dedup();
+    assert_eq!(keys.len(), n);
+}
+
+#[test]
+fn press_and_release() {
+    let map = Keymap::default_map();
+    let mut t = KeyboardTracker::default();
+    assert_eq!(
+        t.actions(&[down(Key::Enter)], &map, false),
+        vec![KeyAction::Press(KeyId::Enter)]
+    );
+    assert_eq!(
+        t.actions(&[up(Key::Enter)], &map, false),
+        vec![KeyAction::Release(KeyId::Enter)]
+    );
+}
+
+#[test]
+fn shift_plus_presses_add() {
+    let map = Keymap::default_map();
+    let mut t = KeyboardTracker::default();
+    let ev = key_event(Key::Plus, true, Modifiers::SHIFT);
+    assert_eq!(
+        t.actions(&[ev], &map, false),
+        vec![KeyAction::Press(KeyId::Add)]
+    );
+}
+
+#[test]
+fn shift_falls_back_to_unshifted() {
+    let map = Keymap::default_map();
+    assert_eq!(map.lookup(pk(Key::Num1, true)), Some(KeyId::One));
+    assert_eq!(map.lookup(pk(Key::Num8, true)), Some(KeyId::Mul));
+    assert_eq!(map.lookup(pk(Key::Num8, false)), Some(KeyId::Eight));
+}
+
+#[test]
+fn repeat_is_ignored() {
+    let map = Keymap::default_map();
+    let mut t = KeyboardTracker::default();
+    assert_eq!(
+        t.actions(&[down(Key::Enter)], &map, false),
+        vec![KeyAction::Press(KeyId::Enter)]
+    );
+    let repeat = Event::Key {
+        key: Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: true,
+        modifiers: Modifiers::NONE,
+    };
+    assert_eq!(t.actions(&[repeat.clone(), repeat], &map, false), vec![]);
+    assert_eq!(
+        t.actions(&[up(Key::Enter)], &map, false),
+        vec![KeyAction::Release(KeyId::Enter)]
+    );
+}
+
+#[test]
+fn release_after_shift_lifted_releases_the_pressed_key() {
+    let map = Keymap::default_map();
+    let mut t = KeyboardTracker::default();
+    let ev = key_event(Key::Num8, true, Modifiers::SHIFT);
+    assert_eq!(
+        t.actions(&[ev], &map, false),
+        vec![KeyAction::Press(KeyId::Mul)]
+    );
+    assert_eq!(
+        t.actions(&[up(Key::Num8)], &map, false),
+        vec![KeyAction::Release(KeyId::Mul)]
+    );
+}
+
+#[test]
+fn focus_loss_releases_all() {
+    let map = Keymap::default_map();
+    let mut t = KeyboardTracker::default();
+    assert_eq!(
+        t.actions(&[down(Key::Enter)], &map, false),
+        vec![KeyAction::Press(KeyId::Enter)]
+    );
+    assert_eq!(
+        t.actions(&[Event::WindowFocused(false)], &map, false),
+        vec![KeyAction::ReleaseAll]
+    );
+    assert_eq!(t.actions(&[up(Key::Enter)], &map, false), vec![]);
+}
+
+#[test]
+fn typing_suppresses_presses_not_releases() {
+    let map = Keymap::default_map();
+    let mut t = KeyboardTracker::default();
+    assert_eq!(
+        t.actions(&[down(Key::Enter)], &map, false),
+        vec![KeyAction::Press(KeyId::Enter)]
+    );
+    assert_eq!(t.actions(&[down(Key::Num5)], &map, true), vec![]);
+    assert_eq!(
+        t.actions(&[up(Key::Enter)], &map, true),
+        vec![KeyAction::Release(KeyId::Enter)]
+    );
+    // The key typed into the text field never pressed anything, so its release is silent.
+    assert_eq!(t.actions(&[up(Key::Num5)], &map, false), vec![]);
+}
+
+#[test]
+fn ctrl_combinations_are_ignored() {
+    let map = Keymap::default_map();
+    let mut t = KeyboardTracker::default();
+    for mods in [Modifiers::CTRL, Modifiers::ALT, Modifiers::COMMAND] {
+        assert_eq!(
+            t.actions(&[key_event(Key::S, true, mods)], &map, false),
+            vec![]
+        );
+        assert_eq!(
+            t.actions(&[key_event(Key::S, false, mods)], &map, false),
+            vec![]
+        );
+    }
+}
+
+#[test]
+fn bind_replaces_existing() {
+    let mut map = Keymap::default_map();
+    map.bind(pk(Key::Space, false), KeyId::Enter);
+    map.bind(pk(Key::Space, false), KeyId::Sin);
+    assert_eq!(map.lookup(pk(Key::Space, false)), Some(KeyId::Sin));
+    let n = map
+        .bindings
+        .iter()
+        .filter(|(k, _)| *k == pk(Key::Space, false))
+        .count();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn unbind_key_removes_all_bindings() {
+    let mut map = Keymap::default_map();
+    assert!(map.keys_for(KeyId::Del).len() >= 2);
+    map.unbind_key(KeyId::Del);
+    assert!(map.keys_for(KeyId::Del).is_empty());
+    assert_eq!(map.lookup(pk(Key::Backspace, false)), None);
+}
+
+#[test]
+fn pc_key_label_formats() {
+    assert_eq!(pc_key_label(pk(Key::Num8, true)), "Shift+8");
+    assert_eq!(pc_key_label(pk(Key::Enter, false)), "Enter");
+}
+
+#[test]
+fn keymap_serde_roundtrip() {
+    let mut map = Keymap::default_map();
+    map.bind(pk(Key::Space, true), KeyId::Neg);
+    let json = serde_json::to_string(&map).expect("serialize");
+    let back: Keymap = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, map);
+}
+
+#[test]
+fn two_pc_keys_for_one_calc_key_release_when_both_up() {
+    let map = Keymap::default_map();
+    let mut t = KeyboardTracker::default();
+    assert_eq!(
+        t.actions(&[down(Key::Backspace), down(Key::Delete)], &map, false),
+        vec![KeyAction::Press(KeyId::Del)]
+    );
+    assert_eq!(t.actions(&[up(Key::Backspace)], &map, false), vec![]);
+    assert_eq!(
+        t.actions(&[up(Key::Delete)], &map, false),
+        vec![KeyAction::Release(KeyId::Del)]
+    );
 }
