@@ -674,3 +674,32 @@ fn cli_flash_file_write_failure_exits_1() {
         "the run itself completed"
     );
 }
+
+/// A guest that drops the power hold (GPIO pin 1) is reported on stderr after the run.
+#[test]
+fn cli_reports_power_off() {
+    // ldr r0, =0x4010_5000 ; movs r1, #2 ; str r1, [r0, #8] (DIR) ; str r1, [r0, #0x10] (SET) ;
+    // str r1, [r0, #0x14] (CLR) ; b .
+    let p = payload(
+        &[(1, CODE)],
+        &[
+            (CODE, &[0x483F, 0x2102, 0x6081, 0x6101, 0x6141, 0xE7FE]),
+            (0x300, &[0x5000, 0x4010]),
+        ],
+    );
+    let bundle = bundle_file("cli_power_off", p);
+    let out = evo_cli()
+        .env_remove("RUST_LOG")
+        .arg("run")
+        .arg(&bundle)
+        .args(["--max-cycles", "1000"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("power: off (GPIO pin 1 released)\n"),
+        "{stderr}"
+    );
+}

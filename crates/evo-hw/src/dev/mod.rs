@@ -2,6 +2,7 @@
 //! are registered at their base addresses by [`crate::soc::attach`].
 
 pub mod crypto;
+pub mod gpio;
 pub mod mpc;
 pub mod spi;
 pub mod spif;

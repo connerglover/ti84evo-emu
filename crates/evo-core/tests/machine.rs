@@ -974,3 +974,74 @@ fn bundle_images_win_over_nv() {
     assert_eq!(m.bus.peek(0x0000_0000, 4), Some(0));
     assert_eq!(m.bus.peek(0x9_0000, 1), Some(0xA5));
 }
+
+#[test]
+fn gpio_input_irq_wakes_sleeping_cpu() {
+    const GPIO: u32 = 0x4010_5000;
+    const L_GPIO: u32 = LIT + 0x20;
+    const L_PIN9: u32 = LIT + 0x24;
+    const L_IRQ24: u32 = LIT + 0x28;
+    /// IRQ 24 handler: `ldr r0, =GPIO ; ldr r1, =1 << 9 ; str r1, [r0, #0x30] (INT_CLR) ;
+    /// adds r4, #1 ; bx lr`.
+    const H24: u32 = 0x2B0;
+    // ldr r0, =GPIO ; ldr r1, =1 << 9 ; str r1, [r0, #0x38] (INT_BOTH) ;
+    // str r1, [r0, #0x20] (INT_EN) ; ldr r0, =ISER0 ; ldr r1, =1 << 24 ; str r1, [r0] ;
+    // wfi ; b .
+    let mut p = Payload::device_test(&[
+        I::Ld(0, L_GPIO),
+        I::Ld(1, L_PIN9),
+        str_r1_r0(0x38),
+        str_r1_r0(0x20),
+        I::Ld(0, L_ISER0),
+        I::Ld(1, L_IRQ24),
+        I::H(0x6001),
+        I::H(WFI),
+        I::H(B_SELF),
+    ]);
+    p.word(L_GPIO, GPIO)
+        .word(L_PIN9, 1 << 9)
+        .word(L_IRQ24, 1 << 24)
+        .vector(IRQ0 + 24, H24);
+    p.asm(
+        H24,
+        &[
+            I::Ld(0, L_GPIO),
+            I::Ld(1, L_PIN9),
+            str_r1_r0(0x30),
+            I::H(ADDS_R4_1),
+            I::H(BX_LR),
+        ],
+    );
+    let mut m = p.boot();
+    assert_eq!(m.run(1_000), StopReason::Idle);
+    assert_eq!(m.cpu.regs.r[4], 0);
+    m.set_gpio_input(9, Some(true));
+    m.run(1_000);
+    assert_eq!(m.cpu.regs.r[4], 1, "the handler ran once");
+    assert!(!m.cpu.scs.nvic.level(24), "the handler cleared the latch");
+    // The falling edge interrupts again.
+    m.set_gpio_input(9, Some(false));
+    m.run(1_000);
+    assert_eq!(m.cpu.regs.r[4], 2);
+    assert!(!m.take_power_off());
+}
+
+#[test]
+fn gpio_power_off_host_api() {
+    const L_GPIO: u32 = LIT + 0x20;
+    // ldr r0, =GPIO ; movs r1, #2 ; str r1, [r0, #8] (DIR) ; str r1, [r0, #0x10] (SET) ;
+    // str r1, [r0, #0x14] (CLR) ; b .
+    let mut p = Payload::device_test(&[
+        I::Ld(0, L_GPIO),
+        I::H(0x2102),
+        str_r1_r0(0x08),
+        str_r1_r0(0x10),
+        str_r1_r0(0x14),
+        I::H(B_SELF),
+    ]);
+    p.word(L_GPIO, 0x4010_5000);
+    let mut m = p.boot();
+    m.run(100);
+    assert!(m.take_power_off());
+    assert!(!m.take_power_off());
+}

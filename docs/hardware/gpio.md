@@ -107,6 +107,34 @@ Emulator hooks:
 - If pin 1 is an output and goes low, treat it as power-off: stop, or show "off".
 - Pin 2 low→high can reset the panel model.
 
+## Emulator model (`evo_hw::dev::gpio::Gpio`)
+
+The model above, with these decisions:
+
+- Only aligned 32-bit accesses reach registers. Other widths, unaligned offsets, the
+  untouched offsets (+0x0C, +0x24, +0x2C, +0x40 and up) and writes to the read-only
+  +0x04 and +0x28 read 0, are ignored and are logged as unmapped.
+- Registers keep 13 bits (pins 0..12). Higher bits read 0. Host inputs for pins 13 and up
+  are ignored.
+- The interrupt latch is set for a pin whether or not INT_EN is set; +0x28 reads
+  `latch & INT_EN`. Setting INT_TYPE, INT_POL or DIR also counts as a change, so a level
+  that already matches latches at once. The driver writes INT_CLR before INT_EN.
+- Host inputs: `Machine::set_gpio_input(pin, Some(level) | None)`. `None` means undriven,
+  so the pin reads its pull, else 0. An output pin reads its output bit, and the host level
+  applies again once the pin is an input.
+- **Power hold.** A write that takes pin 1 from output-high to output-low logs
+  `power-hold released` (info level) and arms a one-shot report.
+  `Machine::take_power_off()` returns it. After a run, `evo-cli run` prints
+  `power: off (GPIO pin 1 released)` on stderr. The machine keeps running, because Shipmode
+  restores the pin after 5 s if the unit is still alive. Changing pin 1 from an output to an
+  input is not a release.
+- **Pin 2 (panel reset) is not hooked, and this is deferred to Plan 3.** The panel model
+  tracks only sleep, display on/off and MADCTL, and the image comes from the LCDC, so a
+  panel reset has nothing to reset yet.
+- Reset: a System reset sets every register and the latch to 0 and drops IRQ 24. It keeps
+  the host input levels (what is wired to the pins does not change) and a pending power-off
+  report. PowerOn also clears both.
+
 Unconnected inputs read 0. The probe at 0x001051d0 branches on pin 11, and both branches stay
 bounded.
 

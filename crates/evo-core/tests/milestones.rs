@@ -172,8 +172,6 @@ const PENDING_DEVICES: &[(RangeInclusive<u32>, &str)] = &[
         0x5010_4000..=0x5010_4FFF,
         "backlight PWM, Secure alias (Task 18)",
     ),
-    (0x4010_5000..=0x4010_5FFF, "GPIO (Task 17)"),
-    (0x5010_5000..=0x5010_5FFF, "GPIO, Secure alias (Task 17)"),
 ];
 
 /// Each NS-alias [`PENDING_DEVICES`] window still has unmapped accesses, i.e. its device is not

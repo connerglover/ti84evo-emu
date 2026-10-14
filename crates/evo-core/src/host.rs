@@ -2,6 +2,7 @@
 //! of it besides running the CPU. Every API that touches a device goes through
 //! `Machine::with_dev`, so the device sees the current time and its IRQ changes reach the CPU.
 
+use evo_hw::dev::gpio::Gpio;
 use evo_hw::dev::uart::Uart16550;
 use evo_hw::dev::usb::UsbTypeC;
 
@@ -47,5 +48,20 @@ impl Machine {
     /// a System reset (the cable stays plugged in).
     pub fn set_usb_cc(&mut self, cc1: u8, cc2: u8) {
         self.with_dev("usbtc", |t: &mut UsbTypeC, _| t.set_cc(cc1, cc2));
+    }
+
+    /// Drive GPIO input `pin` (`docs/hardware/gpio.md`): `Some(level)`, or `None` = undriven
+    /// (its pull, else low). Pins >= `evo_hw::dev::gpio::GPIO_PINS` are ignored. An edge or
+    /// level the guest armed raises IRQ 24 and wakes a sleeping CPU. The levels survive a
+    /// System reset.
+    pub fn set_gpio_input(&mut self, pin: u8, level: Option<bool>) {
+        self.with_dev("gpio", |g: &mut Gpio, ctx| g.set_input(pin, level, ctx));
+    }
+
+    /// True once after the guest released the power hold (GPIO pin 1, an output, went from
+    /// high to low: the unit would switch itself off); the report is drained.
+    pub fn take_power_off(&mut self) -> bool {
+        self.with_dev("gpio", |g: &mut Gpio, _| g.take_power_off())
+            .unwrap_or(false)
     }
 }

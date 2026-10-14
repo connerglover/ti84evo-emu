@@ -99,6 +99,9 @@ pub fn main(args: RunArgs) -> ExitCode {
         machine.inject_uart_rx(UartPort::Uart0, bytes);
     }
     let code = run_machine(&mut machine, &args);
+    if machine.take_power_off() {
+        eprintln!("power: off (GPIO pin 1 released)");
+    }
     // However the run ended (stop, lockup, GDB session end, a trace cut short, an output
     // error), the flash goes back to the file.
     match &args.flash_file {
