@@ -176,6 +176,12 @@ pub enum KeyAction {
 /// Turns egui key events into [`KeyAction`]s, remembering which calculator key
 /// each held PC key pressed so that its release matches whatever the shift
 /// state is by then.
+///
+/// Held keys are tracked by the physical key when egui reports one. The
+/// logical key of a release can differ from the press when shift changes in
+/// between (Shift+= pressed as `Plus`, released as `Equals` after Shift goes
+/// up; `1` pressed as `Num1`, released as `Exclamationmark` after Shift goes
+/// down). The logical key is still what the keymap looks up.
 #[derive(Default)]
 pub struct KeyboardTracker {
     held: HashMap<Key, KeyId>,
@@ -191,18 +197,19 @@ impl KeyboardTracker {
             match *ev {
                 Event::Key {
                     key,
+                    physical_key,
                     pressed: true,
                     repeat,
                     modifiers,
-                    ..
                 } => {
+                    let hk = physical_key.unwrap_or(key);
                     if repeat
                         || typing
                         || modifiers.ctrl
                         || modifiers.alt
                         || modifiers.command
                         || modifiers.mac_cmd
-                        || self.held.contains_key(&key)
+                        || self.held.contains_key(&hk)
                     {
                         continue;
                     }
@@ -214,7 +221,7 @@ impl KeyboardTracker {
                         // Two PC keys bound to one calculator key (Backspace and
                         // Delete) press it once and release it when both are up.
                         let already = self.held.values().any(|&h| h == id);
-                        self.held.insert(key, id);
+                        self.held.insert(hk, id);
                         if !already {
                             out.push(KeyAction::Press(id));
                         }
@@ -222,10 +229,11 @@ impl KeyboardTracker {
                 }
                 Event::Key {
                     key,
+                    physical_key,
                     pressed: false,
                     ..
                 } => {
-                    if let Some(id) = self.held.remove(&key)
+                    if let Some(id) = self.held.remove(&physical_key.unwrap_or(key))
                         && !self.held.values().any(|&h| h == id)
                     {
                         out.push(KeyAction::Release(id));

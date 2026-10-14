@@ -378,6 +378,67 @@ fn release_after_shift_lifted_releases_the_pressed_key() {
     );
 }
 
+fn phys_event(key: Key, physical: Key, pressed: bool, modifiers: Modifiers) -> Event {
+    Event::Key {
+        key,
+        physical_key: Some(physical),
+        pressed,
+        repeat: false,
+        modifiers,
+    }
+}
+
+#[test]
+fn shift_equals_released_after_shift_lifted_releases_add() {
+    // Shift+= arrives as logical Plus; with Shift lifted first, the release
+    // arrives as logical Equals. The physical key is Equals both times.
+    let map = Keymap::default_map();
+    let mut t = KeyboardTracker::default();
+    let press = phys_event(Key::Plus, Key::Equals, true, Modifiers::SHIFT);
+    assert_eq!(
+        t.actions(&[press], &map, false),
+        vec![KeyAction::Press(KeyId::Add)]
+    );
+    let release = phys_event(Key::Equals, Key::Equals, false, Modifiers::NONE);
+    assert_eq!(
+        t.actions(&[release], &map, false),
+        vec![KeyAction::Release(KeyId::Add)]
+    );
+}
+
+#[test]
+fn one_released_after_shift_pressed_releases_one() {
+    // '1' pressed plain, Shift goes down, release arrives as logical '!'.
+    let map = Keymap::default_map();
+    let mut t = KeyboardTracker::default();
+    let press = phys_event(Key::Num1, Key::Num1, true, Modifiers::NONE);
+    assert_eq!(
+        t.actions(&[press], &map, false),
+        vec![KeyAction::Press(KeyId::One)]
+    );
+    let release = phys_event(Key::Exclamationmark, Key::Num1, false, Modifiers::SHIFT);
+    assert_eq!(
+        t.actions(&[release], &map, false),
+        vec![KeyAction::Release(KeyId::One)]
+    );
+}
+
+#[test]
+fn semicolon_released_as_colon_releases_xtthetan() {
+    let map = Keymap::default_map();
+    let mut t = KeyboardTracker::default();
+    let press = phys_event(Key::Semicolon, Key::Semicolon, true, Modifiers::NONE);
+    assert_eq!(
+        t.actions(&[press], &map, false),
+        vec![KeyAction::Press(KeyId::XTThetaN)]
+    );
+    let release = phys_event(Key::Colon, Key::Semicolon, false, Modifiers::SHIFT);
+    assert_eq!(
+        t.actions(&[release], &map, false),
+        vec![KeyAction::Release(KeyId::XTThetaN)]
+    );
+}
+
 #[test]
 fn focus_loss_releases_all() {
     let map = Keymap::default_map();
