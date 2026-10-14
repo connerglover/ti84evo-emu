@@ -1,6 +1,7 @@
 //! The interface between the GUI and an emulated machine.
 
 pub mod fake;
+pub mod machine;
 
 use crate::keypad::KeyId;
 

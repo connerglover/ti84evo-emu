@@ -2,6 +2,7 @@
 //! keypad input, and debug panels.
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -55,6 +56,31 @@ pub fn debug_max_width(window_w: f32) -> f32 {
     (window_w - reserved).max(0.0)
 }
 
+/// The toast shown when no bundle was given and the demo backend runs.
+pub const DEMO_NOTICE: &str =
+    "No OS bundle given: running the demo backend. Usage: evo-gui <bundle.84b2>";
+
+/// Which backend `main` starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Choice {
+    /// The fake backend; `notice` shows [`DEMO_NOTICE`] because no bundle was found.
+    Demo { notice: bool },
+    /// The emulated machine, booted from this bundle.
+    Bundle(PathBuf),
+}
+
+/// Picks the backend: `--demo`, else the bundle argument, else `EVO_OS_IMAGE` (`env`; empty
+/// counts as unset), else the demo with a notice.
+pub fn choose_backend(bundle_arg: Option<PathBuf>, demo: bool, env: Option<OsString>) -> Choice {
+    if demo {
+        return Choice::Demo { notice: false };
+    }
+    match bundle_arg.or_else(|| env.filter(|e| !e.is_empty()).map(PathBuf::from)) {
+        Some(path) => Choice::Bundle(path),
+        None => Choice::Demo { notice: true },
+    }
+}
+
 /// Start-up options of [`EvoApp`].
 #[derive(Clone, Debug)]
 pub struct AppOptions {
@@ -64,15 +90,18 @@ pub struct AppOptions {
     pub data_dir: PathBuf,
     /// Preferences loaded from the last run.
     pub prefs: Prefs,
+    /// Shown as an Info toast on the first frame.
+    pub notice: Option<String>,
 }
 
 impl AppOptions {
-    /// Defaults: not paused, default preferences.
+    /// Defaults: not paused, default preferences, no notice.
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             start_paused: false,
             data_dir,
             prefs: Prefs::default(),
+            notice: None,
         }
     }
 }
@@ -166,10 +195,14 @@ impl EvoApp {
     pub fn new(cc_ctx: &egui::Context, backend: Box<dyn EmuBackend>, opts: AppOptions) -> Self {
         install_fonts(cc_ctx);
         cc_ctx.set_theme(egui::ThemePreference::Light);
+        let mut toasts = Toasts::new();
+        if let Some(notice) = opts.notice {
+            toasts.push(notice, ToastKind::Info);
+        }
         Self {
             backend,
             store: Store::new(opts.data_dir.clone()),
-            toasts: Toasts::new(),
+            toasts,
             icons: None,
             picker: None,
             about_open: false,

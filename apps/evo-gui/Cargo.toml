@@ -10,6 +10,9 @@ description = "Desktop GUI front end of the TI-84 Evo emulator"
 snapshots = []
 
 [dependencies]
+armv8m = { path = "../../crates/armv8m" }
+evo-core = { path = "../../crates/evo-core" }
+evo-image = { path = "../../crates/evo-image" }
 eframe.workspace = true
 egui.workspace = true
 image.workspace = true
@@ -21,4 +24,5 @@ log.workspace = true
 env_logger.workspace = true
 
 [dev-dependencies]
+evo-image = { path = "../../crates/evo-image", features = ["testutil"] }
 egui_kittest.workspace = true

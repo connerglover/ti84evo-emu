@@ -446,3 +446,21 @@ cargo test -p evo-core --test real_os
 33,102. For GDB, run `evo-cli run "$EVO_OS_IMAGE" --gdb 3333`, then in
 `arm-none-eabi-gdb` enter `target remote :3333` and `break *0x100b64bc` (the return from
 `mpc_init_cfg`). `p $r0` there shows -10.
+
+## GUI bring-up
+
+Measured 2026-10-14 on an AMD Ryzen 7 5800X3D (Windows 11, release builds), with the 7.1 OS
+bundle at Plan 1's `Machine` (no Plan 2 devices, so the guest stays in the reset loop described
+above).
+
+- `cargo run -p evo-gui --release` with `EVO_OS_IMAGE` set: the window opens with the
+  `No display signal` placeholder; the Registers tab shows the secure core running (r1/r2
+  change between samples). After 10 s the header reads `Running · 12%`.
+- `evo-cli run "$EVO_OS_IMAGE" --max-cycles 1560000000` (10 s of emulated time) took
+  78.6 s: 1.56e9 / (78.6 · 156e6) · 100 = **12.7 %** of real time for the bare interpreter.
+
+The GUI (12 %) runs at the interpreter's own speed, so the UI-thread design costs almost
+nothing. By the Global Constraints decision rule of the GUI plan (a worker thread is justified
+only if the GUI is below 100 % while the interpreter alone is above it), the UI-thread design
+stays. The interpreter itself is the bottleneck: reaching real time needs a roughly 8x faster
+core.

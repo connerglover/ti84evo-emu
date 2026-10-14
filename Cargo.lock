@@ -1421,11 +1421,14 @@ dependencies = [
 name = "evo-gui"
 version = "0.1.0"
 dependencies = [
+ "armv8m",
  "clap",
  "eframe",
  "egui",
  "egui_kittest",
  "env_logger",
+ "evo-core",
+ "evo-image",
  "image",
  "log",
  "serde",

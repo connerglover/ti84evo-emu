@@ -1,13 +1,53 @@
 //! The `evo-gui` binary: opens the emulator window.
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
-use evo_gui::app::{AppOptions, EvoApp, TITLE};
+use clap::Parser;
+use evo_gui::app::{AppOptions, Choice, DEMO_NOTICE, EvoApp, TITLE, choose_backend};
+use evo_gui::backend::EmuBackend;
 use evo_gui::backend::fake::FakeBackend;
+use evo_gui::backend::machine::MachineBackend;
 use evo_gui::prefs::{PREFS_KEY, Prefs};
 
-fn main() -> eframe::Result {
+/// TI-84 Evo emulator window.
+#[derive(Parser)]
+#[command(name = "evo-gui", version)]
+struct Args {
+    /// The OS bundle (.84b2) to boot. Defaults to $EVO_OS_IMAGE.
+    bundle: Option<PathBuf>,
+    /// Run the demo backend instead of a bundle.
+    #[arg(long)]
+    demo: bool,
+}
+
+fn main() -> ExitCode {
     env_logger::init();
+    let args = Args::parse();
+    let (backend, notice): (Box<dyn EmuBackend>, Option<String>) =
+        match choose_backend(args.bundle, args.demo, std::env::var_os("EVO_OS_IMAGE")) {
+            Choice::Demo { notice } => (
+                Box::new(FakeBackend::new()),
+                notice.then(|| DEMO_NOTICE.to_owned()),
+            ),
+            Choice::Bundle(path) => match MachineBackend::open(&path) {
+                Ok(b) => (Box::new(b), None),
+                Err(e) => {
+                    eprintln!("evo-gui: {}: {e}", path.display());
+                    return ExitCode::from(1);
+                }
+            },
+        };
+    match run(backend, notice) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("evo-gui: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run(backend: Box<dyn EmuBackend>, notice: Option<String>) -> eframe::Result {
     let data_dir =
         eframe::storage_dir("evo-gui").unwrap_or_else(|| PathBuf::from("./evo-gui-data"));
     let options = eframe::NativeOptions {
@@ -28,13 +68,10 @@ fn main() -> eframe::Result {
                 .unwrap_or_default();
             let opts = AppOptions {
                 prefs,
+                notice,
                 ..AppOptions::new(data_dir)
             };
-            Ok(Box::new(EvoApp::new(
-                &cc.egui_ctx,
-                Box::new(FakeBackend::new()),
-                opts,
-            )))
+            Ok(Box::new(EvoApp::new(&cc.egui_ctx, backend, opts)))
         }),
     )
 }
