@@ -180,6 +180,7 @@ mod tests {
     const A: EventKind = EventKind::Peripheral(1);
     const B: EventKind = EventKind::Peripheral(2);
     const C: EventKind = EventKind::Peripheral(3);
+    const D: EventKind = EventKind::Peripheral(4);
 
     /// Pops everything due at the scheduler's current time.
     fn drain(s: &mut Scheduler) -> Vec<EventKind> {
@@ -318,12 +319,27 @@ mod tests {
         s.schedule(40, C); // replaces the 50; the 50 entry is now stale
         s.cancel(B); // stale
         s.schedule(10, B); // live again, behind A at cycle 10
+        // Cancelled and never rescheduled. Its entry is not at the heap top
+        // (A is), so it stays in the heap as stale and only the live filter
+        // in serialization keeps it from being resurrected on restore.
+        s.schedule(60, D);
+        s.cancel(D);
+        assert!(
+            s.heap.len() > s.live.len(),
+            "setup must leave stale entries"
+        );
 
         let json = serde_json::to_string(&s).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["events"].as_array().unwrap().len(),
+            s.live.len(),
+            "serialized events are exactly the live ones: {json}"
+        );
         let mut back: Scheduler = serde_json::from_str(&json).unwrap();
 
         assert_eq!(back.now, 7);
-        assert_eq!(back.heap.len(), 3, "only live events are serialized");
+        assert_eq!(back.heap.len(), 3);
         assert_eq!(back.next_deadline(), Some(10));
 
         // New events after a restore still queue behind restored ones.
@@ -331,7 +347,9 @@ mod tests {
         back.schedule(40, A);
         s.now = 1000;
         back.now = 1000;
-        assert_eq!(drain(&mut back), drain(&mut s));
+        let restored = drain(&mut back);
+        assert!(!restored.contains(&D), "cancelled event was resurrected");
+        assert_eq!(restored, drain(&mut s));
     }
 
     #[test]
