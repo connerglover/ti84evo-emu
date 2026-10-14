@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/armv8m", "crates/evo-core"]
+members = ["crates/armv8m", "crates/evo-core", "crates/evo-hw"]
 
 [workspace.package]
 edition = "2024"
