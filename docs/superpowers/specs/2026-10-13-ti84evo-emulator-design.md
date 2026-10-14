@@ -208,6 +208,27 @@ table (no TI artwork), configurable PC-keyboard mapping, toggleable debug
 panels (registers, disassembly, memory, UART, unmapped-access log),
 save-state slots.
 
+Visual design (user direction): the **layout of the classic TI-84 Plus CE web
+emulator** — a single vertical calculator, screen on top, full keypad below —
+rendered in the **styling of TI's Evo web emulator**:
+
+- Light blue app background; calculator body is a white rounded rectangle
+  with a thick blue outline, screen inset at the top of the body.
+- Keys: light-gray rounded keys with dark main labels; dark-slate number
+  keys; teal `2nd`; green `alpha`; secondary legends in blue (2nd functions,
+  left) and green (alpha letters, right) above each key, using the **Evo
+  legends** (e.g. `insert`, `plot`, `angle`, `recall`, `on ⌂`).
+- Four-way D-pad as dark separated wedges with a center gap.
+- Slim left toolbar (Evo style): screenshot, save/load state, reset,
+  debug-panel toggle, about. Debug panels open to the right of the
+  calculator so the calculator column stays intact.
+- Key press feedback: pressed-state color + optional hover outline; physical
+  PC-key presses animate the matching on-screen key.
+- No TI logo or wordmark; the header shows a neutral title (e.g. "TI-84 Evo
+  Emulator") in the Evo header position.
+- Keypad geometry and legends are data (a layout table), not hard-coded
+  drawing, so the styling can be tuned without touching input logic.
+
 ### 6.5 Save states
 
 `serde`-serialized, versioned binary format covering CPU, peripherals, RAM and
