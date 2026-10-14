@@ -49,7 +49,8 @@ impl Mpu {
         negative_priority: bool,
     ) -> (bool, bool, Option<u8>) {
         // All of the PPB, the external PPB (0xE004_0000..) included, stays privileged-only, even
-        // though only the internal PPB is handled by the CPU itself (see `scs::is_ppb`).
+        // though only the internal PPB is handled by the CPU itself (see `scs::is_ppb`). Data
+        // accesses enforce this in `exec::mem`: `ppb_read`/`ppb_write`, and `scs::is_eppb`.
         let ppb = (0xE000_0000..=0xE00F_FFFF).contains(&addr);
         if self.ctrl & CTRL_ENABLE == 0
             || ppb

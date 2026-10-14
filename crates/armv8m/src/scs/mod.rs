@@ -1,7 +1,9 @@
 //! System Control Space: the memory-mapped NVIC, SCB, SysTick, MPU and SAU registers, and the
 //! rest of the internal Private Peripheral Bus (PPB, `0xE000_0000..=0xE003_FFFF`), which the CPU
 //! handles itself before the `Bus`. The external PPB (EPPB, `0xE004_0000..=0xE00F_FFFF`) is
-//! reached over the system bus, so data accesses there go to the `Bus` like any other address.
+//! reached over the system bus, so privileged data accesses there go to the `Bus` like any other
+//! address. Unprivileged data accesses to any part of the PPB, the EPPB included, BusFault and
+//! never reach the `Bus`.
 //!
 //! Guest data accesses to internal PPB registers this core does not implement read as zero and
 //! ignore writes; each one is recorded as a `PpbMiss` for the host to collect with
@@ -40,6 +42,8 @@ pub const PRIORITY_MASK: u8 = !(0xFF >> PRIORITY_BITS);
 pub const PPB_START: u32 = 0xE000_0000;
 /// Last address of the internal PPB; `0xE004_0000..` (the external PPB) goes to the `Bus`.
 pub const INTERNAL_PPB_END: u32 = 0xE003_FFFF;
+/// Last address of the external PPB, and of the whole PPB.
+pub const EPPB_END: u32 = 0xE00F_FFFF;
 
 /// A guest data access to an internal PPB register this core does not implement: the read
 /// returned zero or the write was ignored.
@@ -117,6 +121,12 @@ pub struct Scs {
 /// True for addresses the CPU handles itself instead of the `Bus`: the internal PPB only.
 pub fn is_ppb(addr: u32) -> bool {
     (PPB_START..=INTERNAL_PPB_END).contains(&addr)
+}
+
+/// True for the external PPB (`0xE004_0000..=0xE00F_FFFF`). Data accesses there go to the `Bus`,
+/// but, like the rest of the PPB, only privileged ones.
+pub fn is_eppb(addr: u32) -> bool {
+    (INTERNAL_PPB_END + 1..=EPPB_END).contains(&addr)
 }
 
 /// The register word and security view that an access from security state `from` to PPB word

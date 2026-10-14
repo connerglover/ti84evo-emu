@@ -1337,36 +1337,68 @@ fn msr_msp_is_exempt_from_the_stack_limit() {
 
 // ---- PPB accesses the CPU does not implement ----
 
-/// A `FlatBus` that also answers `0x5555_5555` for word reads at or above `0xE004_0000` (the
-/// external PPB) and records word writes there.
+/// A `FlatBus` that answers `0x55` bytes for reads at or above `0xE004_0000` (the external PPB),
+/// records word writes there, and logs every access there as `(addr, privileged)`.
 struct EppbBus {
     inner: FlatBus,
     writes: Vec<(u32, u32)>,
+    accesses: Vec<(u32, bool)>,
 }
 
 const EPPB_START: u32 = 0xE004_0000;
 
+impl EppbBus {
+    fn new(inner: FlatBus) -> Self {
+        Self {
+            inner,
+            writes: Vec::new(),
+            accesses: Vec::new(),
+        }
+    }
+
+    /// Records `addr` and returns true when it is in the external PPB.
+    fn eppb(&mut self, addr: u32, a: Access) -> bool {
+        let hit = addr >= EPPB_START;
+        if hit {
+            self.accesses.push((addr, a.privileged));
+        }
+        hit
+    }
+}
+
 impl Bus for EppbBus {
     fn read8(&mut self, addr: u32, a: Access) -> Result<u8, BusError> {
+        if self.eppb(addr, a) {
+            return Ok(0x55);
+        }
         self.inner.read8(addr, a)
     }
     fn read16(&mut self, addr: u32, a: Access) -> Result<u16, BusError> {
+        if self.eppb(addr, a) {
+            return Ok(0x5555);
+        }
         self.inner.read16(addr, a)
     }
     fn read32(&mut self, addr: u32, a: Access) -> Result<u32, BusError> {
-        if addr >= EPPB_START {
+        if self.eppb(addr, a) {
             return Ok(0x5555_5555);
         }
         self.inner.read32(addr, a)
     }
     fn write8(&mut self, addr: u32, v: u8, a: Access) -> Result<(), BusError> {
+        if self.eppb(addr, a) {
+            return Ok(());
+        }
         self.inner.write8(addr, v, a)
     }
     fn write16(&mut self, addr: u32, v: u16, a: Access) -> Result<(), BusError> {
+        if self.eppb(addr, a) {
+            return Ok(());
+        }
         self.inner.write16(addr, v, a)
     }
     fn write32(&mut self, addr: u32, v: u32, a: Access) -> Result<(), BusError> {
-        if addr >= EPPB_START {
+        if self.eppb(addr, a) {
             self.writes.push((addr, v));
             return Ok(());
         }
@@ -1380,17 +1412,42 @@ fn eppb_access_reaches_the_bus() {
     let (mut cpu, inner) = cpu_with_code(&[
         0x4802, 0x6801, 0xF041, 0x0102, 0x6001, B_SELF, 0x3018, 0xE004,
     ]);
-    let mut bus = EppbBus {
-        inner,
-        writes: Vec::new(),
-    };
+    let mut bus = EppbBus::new(inner);
     for _ in 0..4 {
         executed(cpu.step(&mut bus));
     }
     assert_eq!(ipsr(&cpu), 0, "no fault");
     assert_eq!(cpu.regs.r[1], 0x5555_5557);
     assert_eq!(bus.writes, [(0xE004_3018, 0x5555_5557)]);
+    assert_eq!(bus.accesses, [(0xE004_3018, true), (0xE004_3018, true)]);
     assert_eq!(cpu.take_ppb_misses(), []);
+}
+
+#[test]
+fn unprivileged_eppb_access_is_busfault() {
+    // Unprivileged Thread mode: ldr r1,[r0] / str r1,[r0] at an aligned EPPB word, and an
+    // unaligned ldr there (the bytewise path). The whole PPB is privileged-only, so each one
+    // BusFaults (escalated to HardFault) without reaching the bus.
+    for (hw, addr) in [
+        (0x6801, 0xE004_3018), // ldr r1,[r0]
+        (0x6001, 0xE004_3018), // str r1,[r0]
+        (0x6801, 0xE004_3019), // ldr r1,[r0], unaligned
+        (0x6801, 0xE00F_FFFC), // ldr r1,[r0], last EPPB word
+    ] {
+        let (mut cpu, mut inner) = cpu_with_code(&[hw]);
+        handler(&mut inner, 3, 0x300, &[B_SELF]);
+        let mut bus = EppbBus::new(inner);
+        cpu.regs.control.s = 1;
+        cpu.regs.r[0] = addr;
+        cpu.regs.r[1] = 0x1234_5678;
+        executed(cpu.step(&mut bus));
+        assert_eq!(ipsr(&cpu), 3, "{hw:#06x} at {addr:#010x}");
+        assert_eq!(cpu.ppb_read32(CFSR), PRECISERR | BFARVALID);
+        assert_eq!(cpu.ppb_read32(BFAR), addr);
+        assert_eq!(bus.accesses, [], "{hw:#06x} at {addr:#010x}");
+        assert_eq!(bus.writes, []);
+        assert_eq!(cpu.take_ppb_misses(), []);
+    }
 }
 
 #[test]
