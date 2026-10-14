@@ -391,7 +391,7 @@ Read data is produced on demand from the open phase, one byte per FIFO pop; no b
 |---|---|
 | 0x00 / 0x04 / 0x08 / 0x0C | Last written value. |
 | 0x10, 0x20, 0x30 | Stored value. |
-| 0x18 | `1 \| ((read bytes available as u32) << 1)`. TX space (bit 0) is always 1. |
+| 0x18 | `1 \| (((read bytes available > 0) as u32) << 1)`. Bit 0 = TX space (always 1); bit 1 = RX not empty, a flag, not a count; other bits 0. With 64 bytes available the value is 0x3. |
 | 0x24 | `done as u32` (other bits 0). |
 | 0x34 | `xip_ctrl & !0x400` (bit 10 self-clears immediately). |
 | 0x54 | `lvl << 8`, `lvl = min(bytes left in the open data phase, 64)`; 0 when no phase is open. In a read that is RX bytes available; in a write it is TX free space (the firmware writes `min(lvl, remaining)`, so the cap is what matters). |
