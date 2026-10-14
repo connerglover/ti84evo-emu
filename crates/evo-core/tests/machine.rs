@@ -7,6 +7,7 @@ use std::ops::ControlFlow;
 
 use armv8m::Sec;
 use evo_core::{EventKind, Machine, StopReason};
+use evo_hw::{DevCtx, Device, ResetKind, StateError, UnmappedKind};
 use evo_image::testutil::secure_image_bundle;
 use evo_image::{Bundle, ImageError, Layout};
 
@@ -114,7 +115,7 @@ fn machine_boots_synthetic_bundle() {
     assert_eq!(m.sched.now, 0);
     assert_eq!(m.resets, 0);
 
-    // Flash: 8 MiB at both aliases, erased outside the image.
+    // Flash: 16 MiB at both aliases, erased outside the image.
     assert_eq!(m.bus.peek(0x000B_0400, 4), Some(SP_INIT));
     assert_eq!(m.bus.peek(0x100B_0400, 4), Some(SP_INIT));
     assert_eq!(
@@ -124,14 +125,14 @@ fn machine_boots_synthetic_bundle() {
     );
     assert_eq!(m.bus.peek(0x0000_0000, 4), Some(0xFFFF_FFFF));
     assert_eq!(m.bus.peek(0x107F_FFFC, 4), Some(0xFFFF_FFFF));
-    assert_eq!(m.bus.peek(0x0080_0000, 1), None);
-    assert_eq!(m.bus.peek(0x1080_0000, 1), None);
-    // SRAM: 2 MiB, one backing at both aliases.
+    assert_eq!(m.bus.peek(0x0100_0000, 1), None);
+    assert_eq!(m.bus.peek(0x1100_0000, 1), None);
+    // SRAM: 1.5 MiB, one backing at both aliases.
     assert!(m.bus.poke(0x2000_0010, 4, 0x1234_5678));
     assert_eq!(m.bus.peek(0x3000_0010, 4), Some(0x1234_5678));
-    assert_eq!(m.bus.peek(0x301F_FFFC, 4), Some(0));
-    assert_eq!(m.bus.peek(0x2020_0000, 1), None);
-    assert_eq!(m.bus.peek(0x3020_0000, 1), None);
+    assert_eq!(m.bus.peek(0x3017_FFFC, 4), Some(0));
+    assert_eq!(m.bus.peek(0x2018_0000, 1), None);
+    assert_eq!(m.bus.peek(0x3018_0000, 1), None);
 
     // Execution enters the loop and stays there.
     assert_eq!(m.run(100), StopReason::CycleLimit);
@@ -404,7 +405,7 @@ fn system_reset_request_reboots() {
     p.vector(1, CODE).code(
         CODE,
         &[
-            0x4806, // ldr r0, [pc, #24]  ; =0x3000_0000
+            0x4806, // ldr r0, [pc, #24]  ; =0x3000_0100
             0x6801, // ldr r1, [r0]
             0x3101, // adds r1, #1
             0x6001, // str r1, [r0]
@@ -420,7 +421,7 @@ fn system_reset_request_reboots() {
             NOP,
         ],
     );
-    p.word(CODE + 0x1C, 0x3000_0000)
+    p.word(CODE + 0x1C, 0x3000_0100)
         .word(CODE + 0x20, 0x4000_0000)
         .word(CODE + 0x24, 0xE000_ED0C)
         .word(CODE + 0x28, 0x05FA_0004);
@@ -429,7 +430,7 @@ fn system_reset_request_reboots() {
 
     assert_eq!(m.run(1_000), StopReason::CycleLimit);
     assert_eq!(m.resets, 2);
-    assert_eq!(m.bus.peek(0x3000_0000, 4), Some(3), "SRAM survives a reset");
+    assert_eq!(m.bus.peek(0x3000_0100, 4), Some(3), "SRAM survives a reset");
     assert_eq!(m.cpu.regs.pc, addr(CODE + 0x18), "third boot stays");
     assert_eq!(m.cpu.regs.msp.s, SP_INIT);
     assert_eq!(m.sched.next_deadline(), None, "pending events are dropped");
@@ -500,10 +501,10 @@ fn recent_trace_ends_at_the_lockup() {
 #[test]
 fn image_outside_flash_is_an_error() {
     // Ruling R16: placement is checked before the memory map is built, so a slot past the
-    // 8 MiB flash is an `ImageError`, not a panic.
+    // 16 MiB flash is an `ImageError`, not a panic.
     let b = looping().bundle();
     let layout = Layout {
-        secure_slot_base: 0x007F_FF00,
+        secure_slot_base: 0x00FF_FF00,
         ns_slot_base: 0x0038_0000,
     };
     assert!(matches!(
@@ -517,4 +518,374 @@ fn machine_state_is_serializable() {
     fn serde<T: serde::Serialize + serde::de::DeserializeOwned>() {}
     serde::<Machine>();
     serde::<StopReason>();
+}
+
+// ---- devices in the machine ----
+
+/// Window of the test device.
+const PROBE: u32 = 0x6000_0000;
+const AIRCR: u32 = 0xE000_ED0C;
+const SYSRESETREQ_KEY: u32 = 0x05FA_0004;
+const IRQ5: u32 = IRQ0 + 5;
+const IRQ6: u32 = IRQ0 + 6;
+/// IRQ 5 handler: `probe[0] = 0` (drop the line), `adds r4, #1`, `bx lr`.
+const H5: u32 = 0x280;
+/// IRQ 6 handler: `adds r5, #1`, `bx lr`.
+const H6: u32 = 0x2A0;
+/// Literal pool: one word per constant a test program loads.
+const LIT: u32 = 0x300;
+const L_PROBE: u32 = LIT;
+const L_ISER0: u32 = LIT + 4;
+const L_AIRCR: u32 = LIT + 8;
+const L_KEY: u32 = LIT + 0xC;
+const L_1000: u32 = LIT + 0x10;
+const L_DWT: u32 = LIT + 0x14;
+const L_EPPB: u32 = LIT + 0x18;
+const L_FLAG: u32 = LIT + 0x1C;
+/// SRAM word a program uses to tell its first boot from the next.
+const FLAG: u32 = 0x3000_0100;
+
+/// Test device at [`PROBE`]: +0 drives IRQ line 5 (`v != 0`), +4 asks for an event at
+/// `now + v` that asserts line 5, +8 pulses IRQ 6. Counts `event` and `reset` calls; with
+/// `reset_event` set, `reset(System)` asks for an event that many cycles later.
+#[derive(Default)]
+struct Probe {
+    events: u32,
+    resets: u32,
+    reset_event: Option<u64>,
+}
+
+impl Device for Probe {
+    fn read(&mut self, _off: u32, _width: u8, _ctx: &mut DevCtx<'_>) -> u32 {
+        0
+    }
+
+    fn write(&mut self, off: u32, _width: u8, v: u32, ctx: &mut DevCtx<'_>) {
+        match off {
+            0 => ctx.set_irq(5, v != 0),
+            4 => ctx.schedule_at(ctx.now + u64::from(v)),
+            8 => ctx.pulse_irq(6),
+            _ => {}
+        }
+    }
+
+    fn event(&mut self, ctx: &mut DevCtx<'_>) {
+        self.events += 1;
+        ctx.set_irq(5, true);
+    }
+
+    fn reset(&mut self, kind: ResetKind, ctx: &mut DevCtx<'_>) {
+        self.resets += 1;
+        if let (ResetKind::System, Some(d)) = (kind, self.reset_event) {
+            ctx.schedule_at(ctx.now + d);
+        }
+    }
+
+    fn save(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    fn load(&mut self, _state: &[u8]) -> Result<(), StateError> {
+        Ok(())
+    }
+}
+
+/// One item of a test program.
+#[derive(Clone, Copy)]
+enum I {
+    /// A 16-bit instruction.
+    H(u16),
+    /// `ldr rd, [pc, #..]` of the literal at payload offset `lit`.
+    Ld(u16, u32),
+    /// `bne` to payload offset `to`.
+    Bne(u32),
+}
+
+impl Payload {
+    /// A payload with the literal pool, both IRQ handlers and `prog` as reset handler.
+    fn device_test(prog: &[I]) -> Self {
+        let mut p = Payload::new();
+        p.word(L_PROBE, PROBE)
+            .word(L_ISER0, NVIC_ISER0)
+            .word(L_AIRCR, AIRCR)
+            .word(L_KEY, SYSRESETREQ_KEY)
+            .word(L_1000, 1000)
+            .word(L_DWT, 0xE000_1000)
+            .word(L_EPPB, 0xE004_3018)
+            .word(L_FLAG, FLAG);
+        p.vector(1, CODE).vector(IRQ5, H5).vector(IRQ6, H6);
+        p.asm(
+            H5,
+            &[
+                I::Ld(0, L_PROBE),
+                I::H(0x2100), // movs r1, #0
+                I::H(0x6001), // str r1, [r0]
+                I::H(ADDS_R4_1),
+                I::H(BX_LR),
+            ],
+        );
+        p.asm(H6, &[I::H(0x3501), I::H(BX_LR)]); // adds r5, #1 ; bx lr
+        p.asm(CODE, prog);
+        p
+    }
+
+    /// Assemble `prog` at payload offset `off`.
+    fn asm(&mut self, off: u32, prog: &[I]) -> &mut Self {
+        for (at, ins) in (off..).step_by(2).zip(prog) {
+            let hw = match *ins {
+                I::H(hw) => hw,
+                I::Ld(rd, lit) => {
+                    let base = (at + 4) & !3;
+                    0x4800 | (rd << 8) | ((lit - base) / 4) as u16
+                }
+                I::Bne(to) => {
+                    let delta = (i64::from(to) - i64::from(at + 4)) / 2;
+                    0xD100 | (delta as u16 & 0xFF)
+                }
+            };
+            self.code(at, &[hw]);
+        }
+        self
+    }
+}
+
+/// `str r1, [r0, #off]`.
+fn str_r1_r0(off: u16) -> I {
+    I::H(0x6001 | ((off / 4) << 6))
+}
+
+/// Request a system reset: `ldr r0, =AIRCR ; ldr r1, =KEY ; str r1, [r0] ; b .`.
+const RESET_PROG: [I; 4] = [
+    I::Ld(0, L_AIRCR),
+    I::Ld(1, L_KEY),
+    I::H(0x6001),
+    I::H(B_SELF),
+];
+
+/// Boot `p` and add `probe` at [`PROBE`].
+fn boot_with_probe(p: &Payload, probe: Probe) -> Machine {
+    let mut m = p.boot();
+    m.bus.add_device("probe", PROBE, 0x100, Box::new(probe));
+    m
+}
+
+fn probe(m: &Machine) -> &Probe {
+    m.bus.device::<Probe>("probe").expect("probe")
+}
+
+/// Step until the guest is about to execute the instruction at payload offset `off`; returns
+/// the cycle count then.
+fn run_to(m: &mut Machine, off: u32) -> u64 {
+    for _ in 0..1_000 {
+        if !m.asleep() && m.cpu.regs.pc == addr(off) {
+            return m.sched.now;
+        }
+        m.step();
+    }
+    panic!("never reached {off:#x}");
+}
+
+/// Step until the first system reset (at most 1000 cycles).
+fn step_to_reset(m: &mut Machine) {
+    while m.resets == 0 && m.sched.now < 1_000 {
+        m.step();
+    }
+    assert_eq!(m.resets, 1);
+}
+
+#[test]
+fn flash_is_16_mib_erased() {
+    let m = looping().boot();
+    assert_eq!(m.bus.peek(0x00FF_FFFC, 4), Some(0xFFFF_FFFF));
+    assert_eq!(m.bus.peek(0x1000_0000 | 0x00FF_FFFC, 4), Some(0xFFFF_FFFF));
+    assert_eq!(m.bus.peek(0x0100_0000, 1), None);
+}
+
+#[test]
+fn sram_is_1_5_mib() {
+    let m = looping().boot();
+    assert!(m.bus.peek(0x2017_FFFC, 4).is_some());
+    assert!(m.bus.peek(0x3017_FFFC, 4).is_some());
+    assert_eq!(m.bus.peek(0x2018_0000, 1), None);
+}
+
+#[test]
+fn bl2_header_at_boot_and_after_system_reset() {
+    let mut m = Payload::device_test(&RESET_PROG).boot();
+    assert_eq!(m.bus.peek(0x3000_0000, 4), Some(0x0004_2016));
+    assert!(m.bus.poke(0x3000_0000, 4, 0));
+    step_to_reset(&mut m);
+    assert_eq!(m.bus.peek(0x3000_0000, 4), Some(0x0004_2016));
+}
+
+#[test]
+fn device_irq_reaches_nvic() {
+    // ldr r0, =PROBE ; movs r1, #1 ; str r1, [r0] ; b .
+    let p = Payload::device_test(&[I::Ld(0, L_PROBE), I::H(0x2101), str_r1_r0(0), I::H(B_SELF)]);
+    let mut m = boot_with_probe(&p, Probe::default());
+    m.cpu.ppb_write32(NVIC_ISER0, 1 << 5);
+    run_to(&mut m, CODE + 4);
+    assert!(!m.cpu.scs.nvic.level(5));
+    m.step();
+    assert!(m.cpu.scs.nvic.level(5), "the store raised the line");
+    assert_eq!(m.cpu.regs.r[4], 0);
+    m.run(200);
+    assert_eq!(m.cpu.regs.r[4], 1, "the handler ran once");
+    assert!(!m.cpu.scs.nvic.level(5), "the handler dropped the line");
+}
+
+#[test]
+fn asserted_line_repends_after_system_reset() {
+    // Review Focus 1. First boot: set FLAG, raise line 5 with IRQ 5 disabled, reset. Second
+    // boot: enable IRQ 5. `Cpu::reset` cleared the NVIC, but the line is still high, so the
+    // handler must run.
+    const SECOND: u32 = CODE + 0x1C;
+    let p = Payload::device_test(&[
+        I::Ld(2, L_FLAG), // 0x00 ldr r2, =FLAG
+        I::H(0x6811),     // 0x02 ldr r1, [r2]
+        I::H(0x2900),     // 0x04 cmp r1, #0
+        I::Bne(SECOND),   // 0x06 bne second
+        I::H(0x2101),     // 0x08 movs r1, #1
+        I::H(0x6011),     // 0x0A str r1, [r2]
+        I::Ld(0, L_PROBE),
+        I::H(0x6001), // 0x0E str r1, [r0]: line 5 high
+        I::Ld(0, L_AIRCR),
+        I::Ld(1, L_KEY),
+        I::H(0x6001), // 0x14 SYSRESETREQ
+        I::H(B_SELF),
+        I::H(NOP),
+        I::H(NOP),
+        I::Ld(0, L_ISER0), // 0x1C second:
+        I::H(0x2120),      // movs r1, #32
+        I::H(0x6001),      // str r1, [r0]: enable IRQ 5
+        I::H(B_SELF),
+    ]);
+    let mut m = boot_with_probe(&p, Probe::default());
+    m.run(1_000);
+    assert_eq!(m.resets, 1);
+    assert_eq!(m.cpu.regs.r[4], 1, "the handler ran after the reset");
+}
+
+#[test]
+fn device_event_fires_at_deadline() {
+    // ldr r0, =PROBE ; movs r1, #100 ; str r1, [r0, #4] ; b .
+    let p = Payload::device_test(&[I::Ld(0, L_PROBE), I::H(0x2164), str_r1_r0(4), I::H(B_SELF)]);
+    let mut m = boot_with_probe(&p, Probe::default());
+    let t = run_to(&mut m, CODE + 4);
+    while m.sched.now < t + 150 {
+        m.step();
+        let due = m.sched.now >= t + 100;
+        assert_eq!(probe(&m).events, u32::from(due), "at {}", m.sched.now);
+    }
+}
+
+#[test]
+fn wfi_wakes_on_device_event() {
+    // ldr r0, =PROBE ; ldr r1, =1000 ; str r1, [r0, #4] ; wfi ; b .
+    let p = Payload::device_test(&[
+        I::Ld(0, L_PROBE),
+        I::Ld(1, L_1000),
+        str_r1_r0(4),
+        I::H(WFI),
+        I::H(B_SELF),
+    ]);
+    let mut m = boot_with_probe(&p, Probe::default());
+    m.cpu.ppb_write32(NVIC_ISER0, 1 << 5);
+    let mut t = None;
+    let mut wake = None;
+    let mut entry = None;
+    m.run_with(10_000, |m| {
+        let pc = m.cpu.regs.pc;
+        let now = Some(m.sched.now);
+        if pc == addr(CODE + 4) {
+            t = now;
+        }
+        // The first step after the `wfi` is the exception entry.
+        if pc == addr(CODE + 8) && wake.is_none() {
+            wake = now;
+        }
+        if pc == addr(H5) && entry.is_none() {
+            entry = now;
+        }
+        ControlFlow::Continue(())
+    });
+    assert_eq!(m.cpu.regs.r[4], 1, "the handler ran");
+    let t = t.expect("store ran");
+    let (wake, entry) = (wake.expect("woke"), entry.expect("handler ran"));
+    assert!((t + 1000..=t + 1003).contains(&wake), "t {t}, wake {wake}");
+    // Exception entry takes 12 cycles (`armv8m` ENTRY_CYCLES).
+    assert_eq!(entry, wake + 12, "handler's first instruction");
+
+    // Without the store nothing can wake the CPU.
+    let p = Payload::device_test(&[I::H(WFI), I::H(B_SELF)]);
+    let mut m = boot_with_probe(&p, Probe::default());
+    m.cpu.ppb_write32(NVIC_ISER0, 1 << 5);
+    assert_eq!(m.run(10_000), StopReason::Idle);
+}
+
+#[test]
+fn event_rescheduled_in_reset_survives_system_reset() {
+    let p = Payload::device_test(&RESET_PROG);
+    let probe_dev = Probe {
+        reset_event: Some(500),
+        ..Probe::default()
+    };
+    let mut m = boot_with_probe(&p, probe_dev);
+    let t = run_to(&mut m, CODE + 4);
+    step_to_reset(&mut m);
+    // The program requests a reset on every boot: spin in its `b .` instead.
+    m.cpu.regs.pc = addr(CODE + 6);
+    while m.sched.now < t + 510 {
+        if m.sched.now < t + 500 {
+            assert_eq!(probe(&m).events, 0, "early at {}", m.sched.now);
+        }
+        m.step();
+    }
+    assert_eq!(m.resets, 1);
+    assert_eq!(probe(&m).events, 1, "the event reached the new scheduler");
+}
+
+#[test]
+fn pulse_pends_once() {
+    // ldr r0, =PROBE ; movs r1, #1 ; str r1, [r0, #8] ; b .
+    let p = Payload::device_test(&[I::Ld(0, L_PROBE), I::H(0x2101), str_r1_r0(8), I::H(B_SELF)]);
+    let mut m = boot_with_probe(&p, Probe::default());
+    m.cpu.ppb_write32(NVIC_ISER0, 1 << 6);
+    m.run(1_000);
+    assert_eq!(m.cpu.regs.r[5], 1);
+}
+
+#[test]
+fn ppb_misses_and_eppb_land_in_unmapped_log() {
+    // ldr r0, =0xE000_1000 ; ldr r1, [r0] ; ldr r0, =0xE004_3018 ; ldr r1, [r0] ; b .
+    let mut m = Payload::device_test(&[
+        I::Ld(0, L_DWT),
+        I::H(0x6801),
+        I::Ld(0, L_EPPB),
+        I::H(0x6801),
+        I::H(B_SELF),
+    ])
+    .boot();
+    m.run(100);
+    let log: Vec<_> = m
+        .bus
+        .log
+        .entries()
+        .map(|(a, _)| (a.addr, a.kind, a.pc))
+        .collect();
+    assert!(
+        log.contains(&(0xE000_1000, UnmappedKind::Read, addr(CODE + 2))),
+        "{log:x?}"
+    );
+    assert!(
+        log.contains(&(0xE004_3018, UnmappedKind::Read, addr(CODE + 6))),
+        "{log:x?}"
+    );
+}
+
+#[test]
+fn devices_see_system_reset() {
+    let mut m = boot_with_probe(&Payload::device_test(&RESET_PROG), Probe::default());
+    step_to_reset(&mut m);
+    assert_eq!(probe(&m).resets, 1);
 }

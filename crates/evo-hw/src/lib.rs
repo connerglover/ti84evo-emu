@@ -3,6 +3,7 @@
 pub mod device;
 pub mod memmap;
 mod region;
+pub mod soc;
 pub mod unmapped;
 
 pub use device::{DevCtx, DevHarness, Device, ResetKind, StateError, load_serde, save_serde};
