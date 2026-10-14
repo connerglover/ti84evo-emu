@@ -1,7 +1,7 @@
 //! 16-bit Thumb decode.
 
 use crate::bits::SRType;
-use crate::instr::{AluOp, Instr, Shift};
+use crate::instr::{AluOp, HintOp, Instr, MemSize, RevKind, Shift};
 
 fn reg(hw: u16, lsb: u32) -> u8 {
     ((hw >> lsb) & 7) as u8
@@ -63,12 +63,14 @@ pub fn decode16(hw: u16) -> Instr {
                     rn,
                     imm: field,
                     setflags: true,
+                    two_op: false,
                 },
                 _ => Instr::SubImm {
                     rd,
                     rn,
                     imm: field,
                     setflags: true,
+                    two_op: false,
                 },
             }
         }
@@ -88,12 +90,14 @@ pub fn decode16(hw: u16) -> Instr {
                     rn: r,
                     imm,
                     setflags: true,
+                    two_op: true,
                 },
                 _ => Instr::SubImm {
                     rd: r,
                     rn: r,
                     imm,
                     setflags: true,
+                    two_op: true,
                 },
             }
         }
@@ -109,29 +113,78 @@ pub fn decode16(hw: u16) -> Instr {
             rn: 13,
             imm: (h & 0xFF) << 2,
             setflags: false,
+            two_op: false,
         },
-        // Miscellaneous: only ADD/SUB SP, #imm7 and IT here; Task 3 adds the rest (hints included).
-        0b10110 if hw & 0x0F00 == 0 => {
-            let imm = (h & 0x7F) << 2;
-            if hw & 0x80 == 0 {
-                Instr::AddImm {
-                    rd: 13,
-                    rn: 13,
-                    imm,
-                    setflags: false,
+        // LDR (literal)
+        0b01001 => Instr::LdrLit {
+            rt: reg(hw, 8),
+            imm: (h & 0xFF) << 2,
+            add: true,
+        },
+        // Load/store register offset
+        0b01010 | 0b01011 => load_store_reg(hw),
+        // Load/store word/byte immediate
+        0b01100..=0b01111 => {
+            let (rt, rn) = (reg(hw, 0), reg(hw, 3));
+            let imm5 = (h >> 6) & 0x1F;
+            let byte = hw & 0x1000 != 0;
+            let (size, imm) = if byte {
+                (MemSize::Byte, imm5)
+            } else {
+                (MemSize::Word, imm5 << 2)
+            };
+            mem_imm(hw & 0x0800 != 0, rt, rn, imm, size)
+        }
+        // Load/store halfword immediate
+        0b10000 | 0b10001 => mem_imm(
+            hw & 0x0800 != 0,
+            reg(hw, 0),
+            reg(hw, 3),
+            ((h >> 6) & 0x1F) << 1,
+            MemSize::Half,
+        ),
+        // Load/store SP-relative
+        0b10010 | 0b10011 => mem_imm(
+            hw & 0x0800 != 0,
+            reg(hw, 8),
+            13,
+            (h & 0xFF) << 2,
+            MemSize::Word,
+        ),
+        0b10110 | 0b10111 => misc(hw),
+        // STM / LDM
+        0b11000 | 0b11001 => {
+            let rn = reg(hw, 8);
+            let regs = (h & 0xFF) as u16;
+            if hw & 0x0800 == 0 {
+                Instr::Stm {
+                    rn,
+                    regs,
+                    wback: true,
                 }
             } else {
-                Instr::SubImm {
-                    rd: 13,
-                    rn: 13,
-                    imm,
-                    setflags: false,
+                Instr::Ldm {
+                    rn,
+                    regs,
+                    wback: regs & (1 << rn) == 0,
                 }
             }
         }
-        0b10111 if hw & 0x0F00 == 0x0F00 && hw & 0xF != 0 => Instr::It {
-            firstcond: ((hw >> 4) & 0xF) as u8,
-            mask: (hw & 0xF) as u8,
+        // Conditional branch, UDF, SVC
+        0b11010 | 0b11011 => {
+            let imm8 = h & 0xFF;
+            match (hw >> 8) & 0xF {
+                0xE => Instr::Undefined { raw: h },
+                0xF => Instr::Svc { imm: imm8 as u8 },
+                c => Instr::BCond {
+                    cond: c as u8,
+                    imm: i32::from(imm8 as u8 as i8) << 1,
+                },
+            }
+        }
+        // Unconditional branch
+        0b11100 => Instr::B {
+            imm: (((h & 0x7FF) << 21) as i32) >> 20,
         },
         _ => Instr::Undefined { raw: h },
     }
@@ -228,5 +281,146 @@ fn special_data(hw: u16) -> Instr {
         _ if hw & 7 != 0 => Instr::Undefined { raw: u32::from(hw) },
         _ if hw & 0x80 == 0 => Instr::Bx { rm },
         _ => Instr::Blx { rm },
+    }
+}
+
+/// Immediate-offset load or store (`load` selects LDR over STR).
+fn mem_imm(load: bool, rt: u8, rn: u8, imm: u32, size: MemSize) -> Instr {
+    if load {
+        Instr::LoadImm {
+            rt,
+            rn,
+            imm,
+            size,
+            signed: false,
+            index: true,
+            add: true,
+            wback: false,
+        }
+    } else {
+        Instr::StoreImm {
+            rt,
+            rn,
+            imm,
+            size,
+            index: true,
+            add: true,
+            wback: false,
+        }
+    }
+}
+
+/// Load/store register offset, `0101 opc Rm Rn Rt`.
+fn load_store_reg(hw: u16) -> Instr {
+    let (rt, rn, rm) = (reg(hw, 0), reg(hw, 3), reg(hw, 6));
+    let store = |size| Instr::StoreReg {
+        rt,
+        rn,
+        rm,
+        shift: 0,
+        size,
+    };
+    let load = |size, signed| Instr::LoadReg {
+        rt,
+        rn,
+        rm,
+        shift: 0,
+        size,
+        signed,
+    };
+    match (hw >> 9) & 7 {
+        0 => store(MemSize::Word),
+        1 => store(MemSize::Half),
+        2 => store(MemSize::Byte),
+        3 => load(MemSize::Byte, true),
+        4 => load(MemSize::Word, false),
+        5 => load(MemSize::Half, false),
+        6 => load(MemSize::Byte, false),
+        _ => load(MemSize::Half, true),
+    }
+}
+
+/// Miscellaneous 16-bit instructions, `1011 xxxx ...`.
+fn misc(hw: u16) -> Instr {
+    let h = u32::from(hw);
+    let (rd, rm) = (reg(hw, 0), reg(hw, 3));
+    match (hw >> 8) & 0xF {
+        0x0 => {
+            let imm = (h & 0x7F) << 2;
+            if hw & 0x80 == 0 {
+                Instr::AddImm {
+                    rd: 13,
+                    rn: 13,
+                    imm,
+                    setflags: false,
+                    two_op: true,
+                }
+            } else {
+                Instr::SubImm {
+                    rd: 13,
+                    rn: 13,
+                    imm,
+                    setflags: false,
+                    two_op: true,
+                }
+            }
+        }
+        // CBZ / CBNZ: 1011 op 0 i 1 imm5 Rn
+        0x1 | 0x3 | 0x9 | 0xB => Instr::Cbz {
+            rn: rd,
+            imm: (((h >> 9) & 1) << 6) | (((h >> 3) & 0x1F) << 1),
+            nonzero: hw & 0x0800 != 0,
+        },
+        0x2 => Instr::Extend {
+            rd,
+            rm,
+            rotate: 0,
+            signed: hw & 0x80 == 0,
+            half: hw & 0x40 == 0,
+        },
+        0x6 if hw & 0xFFE8 == 0xB660 => Instr::Cps {
+            disable: hw & 0x10 != 0,
+            i: hw & 2 != 0,
+            f: hw & 1 != 0,
+        },
+        0x4 | 0x5 => Instr::Push {
+            regs: (hw & 0xFF) | ((hw & 0x100) << 6),
+        },
+        0xA => match (hw >> 6) & 3 {
+            0 => Instr::Rev {
+                rd,
+                rm,
+                kind: RevKind::Rev,
+            },
+            1 => Instr::Rev {
+                rd,
+                rm,
+                kind: RevKind::Rev16,
+            },
+            3 => Instr::Rev {
+                rd,
+                rm,
+                kind: RevKind::Revsh,
+            },
+            _ => Instr::Undefined { raw: h },
+        },
+        0xC | 0xD => Instr::Pop {
+            regs: (hw & 0xFF) | ((hw & 0x100) << 7),
+        },
+        0xE => Instr::Bkpt { imm: h as u8 },
+        // Hints and IT
+        0xF if hw & 0xF != 0 => Instr::It {
+            firstcond: ((hw >> 4) & 0xF) as u8,
+            mask: (hw & 0xF) as u8,
+        },
+        0xF => Instr::Hint(match (hw >> 4) & 0xF {
+            1 => HintOp::Yield,
+            2 => HintOp::Wfe,
+            3 => HintOp::Wfi,
+            4 => HintOp::Sev,
+            // NOP and the hints without a visible effect here (SEVL, reserved).
+            _ => HintOp::Nop,
+        }),
+        _ => Instr::Undefined { raw: h },
     }
 }

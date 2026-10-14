@@ -229,3 +229,13 @@ fn undefined_16bit() {
     assert_eq!(disasm(&decode16(0xDE00), 0x100, 2), "udf #0");
     assert_eq!(disasm(&decode16(0xDE2A), 0x100, 2), "udf #42");
 }
+
+#[test]
+fn t1_three_operand_forms_keep_three_operands() {
+    // adds r0, r0, #1 (T1 imm3) vs adds r0, #1 (T2 imm8)
+    let (cpu, mut bus) = cpu_with_code(&[0x1C40]);
+    assert_eq!(dis(&cpu, &mut bus), "adds r0, r0, #1");
+    // adds r0, r0, r1 (T1 reg)
+    let (cpu, mut bus) = cpu_with_code(&[0x1840]);
+    assert_eq!(dis(&cpu, &mut bus), "adds r0, r0, r1");
+}

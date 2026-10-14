@@ -3,7 +3,7 @@
 use super::Flow;
 use crate::bits::{add_with_carry, shift_c};
 use crate::cpu::Cpu;
-use crate::instr::{AluOp, Instr, Shift};
+use crate::instr::{AluOp, Instr, RevKind, Shift};
 
 fn set_nz(cpu: &mut Cpu, v: u32) {
     cpu.regs.xpsr.n = v >> 31 != 0;
@@ -97,6 +97,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr, suppress_flags: bool) -> Opt
             rn,
             imm,
             setflags,
+            ..
         } => {
             let res = add_with_carry(cpu.reg(rn), imm, false);
             arith(cpu, rd, res, sf(setflags))
@@ -106,6 +107,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr, suppress_flags: bool) -> Opt
             rn,
             imm,
             setflags,
+            ..
         } => {
             let res = add_with_carry(cpu.reg(rn), !imm, true);
             arith(cpu, rd, res, sf(setflags))
@@ -204,6 +206,33 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr, suppress_flags: bool) -> Opt
         Instr::Adr { rd, imm } => {
             let base = cpu.reg(15) & !3;
             write_rd(cpu, rd, base.wrapping_add(imm))
+        }
+        Instr::Extend {
+            rd,
+            rm,
+            rotate,
+            signed,
+            half,
+        } => {
+            let v = cpu.reg(rm).rotate_right(u32::from(rotate));
+            let r = match (half, signed) {
+                (true, true) => v as u16 as i16 as i32 as u32,
+                (true, false) => v & 0xFFFF,
+                (false, true) => v as u8 as i8 as i32 as u32,
+                (false, false) => v & 0xFF,
+            };
+            cpu.set_reg(rd, r);
+            Flow::Next
+        }
+        Instr::Rev { rd, rm, kind } => {
+            let v = cpu.reg(rm);
+            let r = match kind {
+                RevKind::Rev => v.swap_bytes(),
+                RevKind::Rev16 => ((v & 0x00FF_00FF) << 8) | ((v >> 8) & 0x00FF_00FF),
+                RevKind::Revsh => (v as u16).swap_bytes() as i16 as i32 as u32,
+            };
+            cpu.set_reg(rd, r);
+            Flow::Next
         }
         _ => return None,
     };

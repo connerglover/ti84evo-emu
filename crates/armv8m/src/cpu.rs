@@ -22,6 +22,11 @@ pub enum StepResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cpu {
     pub regs: Registers,
+    /// Event register set by SEV and consumed by WFE.
+    pub event: bool,
+    /// Cycles charged on top of the base cost by the current instruction (per-step scratch).
+    #[serde(skip)]
+    pub(crate) extra_cycles: u32,
 }
 
 impl Default for Cpu {
@@ -38,7 +43,11 @@ impl Cpu {
             ..Default::default()
         };
         regs.xpsr.t = true;
-        Self { regs }
+        Self {
+            regs,
+            event: false,
+            extra_cycles: 0,
+        }
     }
 
     /// Load MSP_S and PC from the vector table at VTOR_S (default 0).
@@ -53,12 +62,17 @@ impl Cpu {
         }
     }
 
-    fn access(&self, kind: AccessKind) -> Access {
+    /// Handler mode, or Thread mode with CONTROL.nPRIV clear.
+    pub(crate) fn is_privileged(&self) -> bool {
         let nonpriv = self.regs.control.get(self.regs.sec) & 1 != 0;
+        self.regs.handler_mode() || !nonpriv
+    }
+
+    pub(crate) fn access(&self, kind: AccessKind) -> Access {
         Access {
             kind,
             secure: self.regs.sec == Sec::Secure,
-            privileged: self.regs.handler_mode() || !nonpriv,
+            privileged: self.is_privileged(),
         }
     }
 
@@ -128,18 +142,29 @@ impl Cpu {
 
         let in_it = self.regs.xpsr.it & 0xF != 0;
         let mut flow = Flow::Next;
+        self.extra_cycles = 0;
         if !in_it || condition_holds(self.regs.xpsr.it >> 4, &self.regs.xpsr) {
             // 16-bit "S" forms do not set flags inside an IT block.
             flow = exec::execute(self, bus, &instr, in_it && len == 2);
         }
-        if flow == Flow::Next {
-            self.regs.pc = pc.wrapping_add(u32::from(len));
+        match flow {
+            Flow::Fault => return self.raise_fault(),
+            Flow::Bkpt(imm) => return StepResult::Bkpt(imm),
+            Flow::Next | Flow::Sleep | Flow::Svc(_) => {
+                self.regs.pc = pc.wrapping_add(u32::from(len));
+            }
+            Flow::Branched => {}
         }
         if in_it {
             self.it_advance();
         }
-        StepResult::Executed {
-            cycles: 1 + u32::from(flow == Flow::Branched),
+        match flow {
+            Flow::Sleep => StepResult::Sleep,
+            // Task 7: take the SVCall exception here instead of faulting.
+            Flow::Svc(_) => self.raise_fault(),
+            _ => StepResult::Executed {
+                cycles: 1 + u32::from(flow == Flow::Branched) + self.extra_cycles,
+            },
         }
     }
 
