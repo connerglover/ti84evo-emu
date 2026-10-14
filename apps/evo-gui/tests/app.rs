@@ -1,9 +1,11 @@
-use egui::{Rect, pos2, vec2};
+use egui::{Event, Key, PointerButton, Pos2, Rect, pos2, vec2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use evo_gui::app::{AppOptions, EvoApp, status_text};
-use evo_gui::backend::fake::FakeBackend;
-use evo_gui::backend::{Frame, RunStatus};
+use evo_gui::backend::fake::{FAKE_PC, FakeBackend};
+use evo_gui::backend::{EmuBackend, Frame, RunStatus};
+use evo_gui::keypad::KeyId;
+use evo_gui::keypad::geometry::{DPAD_CENTER, KEYPAD_ORIGIN};
 use evo_gui::lcd::{ScaleFilter, lcd_draw_rect};
 
 fn data_dir() -> std::path::PathBuf {
@@ -132,4 +134,179 @@ fn lcd_draw_rect_snaps() {
 
     let small = Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 240.0));
     assert_eq!(lcd_draw_rect(small, 1.5, ScaleFilter::Nearest), small);
+}
+
+fn pointer_button(pos: Pos2, pressed: bool) -> Event {
+    Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    }
+}
+
+#[test]
+fn clicking_a_key_taps_it() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness(fake, false);
+    h.run_steps(1);
+    h.get_by_label("enter").click();
+    // Move, press and release run as three frames.
+    h.run_steps(1);
+    assert_eq!(probe.key_log(), [(KeyId::Enter, true)]);
+    h.run_steps(4);
+    assert_eq!(
+        probe.key_log(),
+        [(KeyId::Enter, true), (KeyId::Enter, false)]
+    );
+}
+
+#[test]
+fn same_frame_tap_is_held() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness(fake, false);
+    h.run_steps(1);
+    let p = h.get_by_label("enter").rect().center();
+    let events = &mut h.input_mut().events;
+    events.push(Event::PointerMoved(p));
+    events.push(pointer_button(p, true));
+    events.push(pointer_button(p, false));
+    h.step();
+    assert_eq!(probe.key_log(), [(KeyId::Enter, true)]);
+    h.run_steps(4);
+    assert_eq!(
+        probe.key_log(),
+        [(KeyId::Enter, true), (KeyId::Enter, false)]
+    );
+}
+
+/// Presses the primary button at `p` in one frame (move and press).
+fn press_at(h: &mut Harness<'static, EvoApp>, p: Pos2) {
+    let events = &mut h.input_mut().events;
+    events.push(Event::PointerMoved(p));
+    events.push(pointer_button(p, true));
+    h.step();
+}
+
+#[test]
+fn dpad_overlap_presses_the_right_wedge() {
+    for (r, deg) in [(25.0f32, 220.0f32), (29.0, 145.0)] {
+        let fake = FakeBackend::new();
+        let probe = fake.probe();
+        let mut h = harness(fake, true);
+        h.run_steps(1);
+        let a = deg.to_radians();
+        let t = h.state().calc_transform();
+        let p = t.to_screen(KEYPAD_ORIGIN + DPAD_CENTER.to_vec2() + vec2(a.cos(), a.sin()) * r);
+        press_at(&mut h, p);
+        assert_eq!(probe.key_log(), [(KeyId::Left, true)], "r {r}, {deg} deg");
+    }
+}
+
+#[test]
+fn dpad_center_gap_presses_nothing() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness(fake, false);
+    h.run_steps(1);
+    let t = h.state().calc_transform();
+    let p = t.to_screen(KEYPAD_ORIGIN + DPAD_CENTER.to_vec2());
+    press_at(&mut h, p);
+    h.input_mut().events.push(pointer_button(p, false));
+    h.run_steps(2);
+    assert!(probe.key_log().is_empty(), "{:?}", probe.key_log());
+}
+
+#[test]
+fn dpad_release_after_drag_releases_the_pressed_wedge() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness(fake, false);
+    h.run_steps(1);
+    let t = h.state().calc_transform();
+    let c = KEYPAD_ORIGIN + DPAD_CENTER.to_vec2();
+    let left = t.to_screen(c + vec2(-30.0, 0.0));
+    let right = t.to_screen(c + vec2(30.0, 0.0));
+    press_at(&mut h, left);
+    h.input_mut().events.push(Event::PointerMoved(right));
+    h.step();
+    h.input_mut().events.push(pointer_button(right, false));
+    h.run_steps(5);
+    assert_eq!(probe.key_log(), [(KeyId::Left, true), (KeyId::Left, false)]);
+}
+
+#[test]
+fn key_tooltip_lists_bindings() {
+    let mut h = harness(FakeBackend::new(), true);
+    h.run_steps(1);
+    let p = h.get_by_label("enter").rect().center();
+    h.hover_at(p);
+    // Tooltips appear after a short delay.
+    h.run_steps(60);
+    h.get_by_label("enter \u{2014} Enter");
+}
+
+#[test]
+fn keypad_keys_take_no_focus() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness(fake, true);
+    h.run_steps(1);
+    h.key_press(Key::Tab);
+    h.key_press(Key::Space);
+    h.run_steps(2);
+    assert!(probe.key_log().is_empty(), "{:?}", probe.key_log());
+}
+
+#[test]
+fn pc_key_drives_calculator_key() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness(fake, true);
+    h.run_steps(1);
+    h.key_down(Key::Enter);
+    h.run_steps(1);
+    assert_eq!(probe.held(), [KeyId::Enter]);
+    assert!(h.state().key_down(KeyId::Enter));
+    h.key_up(Key::Enter);
+    h.state_mut().set_paused(false);
+    h.run_steps(4);
+    assert!(probe.held().is_empty());
+    assert!(!h.state().key_down(KeyId::Enter));
+}
+
+#[test]
+fn breakpoint_pauses_and_opens_debug() {
+    let mut fake = FakeBackend::new();
+    fake.toggle_breakpoint(FAKE_PC);
+    let mut h = harness(fake, false);
+    h.run_steps(2);
+    let app = h.state();
+    assert!(app.paused());
+    assert!(app.debug_open());
+    assert_eq!(app.status(), RunStatus::Breakpoint(FAKE_PC));
+    h.get_by_label("Breakpoint at 0x10000200");
+}
+
+#[test]
+fn idle_backend_shows_idle() {
+    let mut h = harness(FakeBackend::idle(), false);
+    h.run_steps(2);
+    h.get_by_label("Idle (CPU asleep)");
+    assert!(!h.state().paused());
+}
+
+#[test]
+fn running_advances_cycles_and_reports_speed() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness(fake, false);
+    // Building the harness already runs a few frames.
+    let before = probe.cycles();
+    h.run_steps(3);
+    assert_eq!(probe.cycles() - before, 3 * 2_600_000);
+    h.run_steps(60);
+    h.get_by_label("Running \u{b7} 100%");
 }

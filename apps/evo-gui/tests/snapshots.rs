@@ -127,3 +127,26 @@ fn snapshot_theme_colors() {
         "NO_SIGNAL_BG",
     );
 }
+
+#[test]
+#[cfg_attr(
+    not(feature = "snapshots"),
+    ignore = "golden images: cargo test -p evo-gui --features snapshots"
+)]
+fn snapshot_calculator_enter_held() {
+    use egui::{Event, PointerButton};
+    use egui_kittest::kittest::Queryable;
+    let _gpu = gpu_lock();
+    let mut h = harness(FakeBackend::new());
+    let p = h.get_by_label("enter").rect().center();
+    let events = &mut h.input_mut().events;
+    events.push(Event::PointerMoved(p));
+    events.push(Event::PointerButton {
+        pos: p,
+        button: PointerButton::Primary,
+        pressed: true,
+        modifiers: Default::default(),
+    });
+    h.run_steps(10);
+    h.snapshot("calculator_enter_held");
+}
