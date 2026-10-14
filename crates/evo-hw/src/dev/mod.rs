@@ -3,6 +3,7 @@
 
 pub mod crypto;
 pub mod gpio;
+pub mod lcdc;
 pub mod mpc;
 pub mod spi;
 pub mod spif;

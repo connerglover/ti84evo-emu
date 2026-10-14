@@ -3,6 +3,7 @@
 use crate::MemoryMap;
 use crate::dev::crypto::{Sha256Engine, TRNG_SEED, Trng};
 use crate::dev::gpio::Gpio;
+use crate::dev::lcdc::{Lcdc, Pwm};
 use crate::dev::mpc::Mpc;
 use crate::dev::spi::{DEFAULT_PANEL_ID, Spi, St7789};
 use crate::dev::spif::Spif;
@@ -60,4 +61,8 @@ pub fn attach(map: &mut MemoryMap) {
     map.add_device("usbtc", 0x4010_C000, 0x1000, Box::new(UsbTypeC::new()));
     // GPIO (gpio.md): 13 pins, IRQ 24; pin 1 is the power hold. NS alias, used by S and NS.
     map.add_device("gpio", 0x4010_5000, 0x1000, Box::new(Gpio::new()));
+    // PL111 LCDC (lcdc.md): VComp IRQ 14 once per frame; Machine::screen decodes its
+    // framebuffer from SRAM. The backlight PWM next to it is plain storage, no IRQ.
+    map.add_device("lcdc", 0x4000_4000, 0x1000, Box::new(Lcdc::new()));
+    map.add_device("pwm", 0x4010_4000, 0x1000, Box::new(Pwm::new()));
 }

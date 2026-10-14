@@ -3,10 +3,14 @@
 //! `Machine::with_dev`, so the device sees the current time and its IRQ changes reach the CPU.
 
 use evo_hw::dev::gpio::Gpio;
+use evo_hw::dev::lcdc::{Frame, Lcdc};
 use evo_hw::dev::uart::Uart16550;
 use evo_hw::dev::usb::UsbTypeC;
 
+use evo_hw::soc::SRAM_BUFFER;
+
 use crate::Machine;
+use crate::machine::SRAM_NS;
 
 /// One of the SoC's UARTs (`docs/hardware/uart.md`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,5 +67,13 @@ impl Machine {
     pub fn take_power_off(&mut self) -> bool {
         self.with_dev("gpio", |g: &mut Gpio, _| g.take_power_off())
             .unwrap_or(false)
+    }
+
+    /// The image the LCD shows now (`docs/hardware/lcdc.md`), decoded from the framebuffer
+    /// the PL111 LCDC points at: `None` while the LCD is off, in a pixel format other than
+    /// RGB565, or pointing outside SRAM. Reading it changes nothing.
+    pub fn screen(&self) -> Option<Frame> {
+        let sram = self.bus.region_bytes(SRAM_BUFFER)?;
+        self.bus.device::<Lcdc>("lcdc")?.frame(sram, SRAM_NS)
     }
 }

@@ -69,6 +69,22 @@ It is write-only, with no polling and no IRQ. Its NS descriptor is at 0x0017_88E
 §1). Model: storage. Brightness = `+0 / +4`, clamped to 1. Its reset is CRU +0x20 bit 4,
 released at 0x100b284c just before the first write (`security.md` §3).
 
+## Emulator model (`evo_hw::dev::lcdc`)
+
+- `Lcdc` implements the minimal model above with aligned word accesses only; the PrimeCell
+  IDs are implemented; LNBU (RIS bit 2) is never set. RIS, MIS, +0x2C/+0x30 and the IDs
+  ignore writes.
+- `FRAME_CYCLES` = 2,600,000 (60 Hz). The first VComp is one frame after LcdEn goes 0 -> 1;
+  each next deadline is the previous one plus one frame. Clearing LcdEn cancels the event; a
+  System reset returns the LCDC and the PWM to power-on state.
+- `Lcdc::frame` (behind `Machine::screen`) decodes RGB565 at UPBASE with bit 28 cleared (the
+  Secure SRAM alias 0x3xxx_xxxx is the same bytes as 0x2xxx_xxxx). It returns `None` unless
+  LcdEn, LcdPwr and bpp = 6 are set and the whole buffer lies in SRAM. Working orientation
+  (open question 2, until Task 23 checks it against the logo): the output is LPP x PPL
+  (320x240) and output pixel (x, y) = buffer line x, pixel y; BGR = 1 swaps the R and B fields.
+- `Pwm` stores +0x00 and +0x04; `brightness()` = duty / period clamped to 0..=1, 0 for
+  period 0. Other offsets are unhandled.
+
 ## Open questions
 
 1. The LCDC pixel clock and so the real frame rate.

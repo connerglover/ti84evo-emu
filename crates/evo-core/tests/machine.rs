@@ -1045,3 +1045,71 @@ fn gpio_power_off_host_api() {
     assert!(m.take_power_off());
     assert!(!m.take_power_off());
 }
+
+#[test]
+fn lcdc_vcomp_irq_and_screen() {
+    const LCDC: u32 = 0x4000_4000;
+    const FB: u32 = 0x2004_8000;
+    const L_LCDC: u32 = LIT + 0x20;
+    const L_TIM0: u32 = LIT + 0x24;
+    const L_TIM1: u32 = LIT + 0x28;
+    const L_FB: u32 = LIT + 0x2C;
+    const L_CTRL: u32 = LIT + 0x30;
+    const L_IRQ14: u32 = LIT + 0x34;
+    /// IRQ 14 handler: `ldr r0, =LCDC ; movs r1, #8 ; str r1, [r0, #0x28] (ICR) ;
+    /// adds r4, #1 ; bx lr`.
+    const H14: u32 = 0x2C0;
+    // Program the firmware's 240x320 RGB565 BGR setup, IMSC = VComp, enable IRQ 14, wfi.
+    let mut p = Payload::device_test(&[
+        I::Ld(0, L_LCDC),
+        I::Ld(1, L_TIM0),
+        str_r1_r0(0x00),
+        I::Ld(1, L_TIM1),
+        str_r1_r0(0x04),
+        I::Ld(1, L_FB),
+        str_r1_r0(0x10),
+        I::H(0x2108), // movs r1, #8
+        str_r1_r0(0x1C),
+        I::Ld(1, L_CTRL),
+        str_r1_r0(0x18),
+        I::Ld(0, L_ISER0),
+        I::Ld(1, L_IRQ14),
+        I::H(0x6001),
+        I::H(WFI),
+        I::H(B_SELF),
+    ]);
+    p.word(L_LCDC, LCDC)
+        .word(L_TIM0, 0x0A0A_0A38)
+        .word(L_TIM1, 0x042D_093F)
+        .word(L_FB, FB)
+        .word(L_CTRL, 0x312D | 0x800)
+        .word(L_IRQ14, 1 << 14)
+        .vector(IRQ0 + 14, H14);
+    p.asm(
+        H14,
+        &[
+            I::Ld(0, L_LCDC),
+            I::H(0x2108),
+            str_r1_r0(0x28),
+            I::H(ADDS_R4_1),
+            I::H(BX_LR),
+        ],
+    );
+    let mut m = p.boot();
+    assert_eq!(m.screen(), None, "LCD off at power-on");
+    assert!(m.bus.poke(FB, 2, 0xF800));
+    m.run(2_000_000);
+    assert_eq!(m.cpu.regs.r[4], 0, "no VComp before the first frame");
+    let f: evo_core::Frame = m.screen().expect("LCD on");
+    assert_eq!((f.width, f.height), (320, 240));
+    assert_eq!(&f.rgb[..3], &[0, 0, 255]);
+    m.run(1_000_000);
+    assert_eq!(
+        m.cpu.regs.r[4], 1,
+        "VComp at 2_600_000 ran the handler once"
+    );
+    assert!(
+        !m.cpu.scs.nvic.level(14),
+        "the handler cleared the interrupt"
+    );
+}

@@ -303,14 +303,13 @@ the Read-ID probe no longer times out.
   match the text with the escape sequences removed.
 - **Second power-on.** Booted again from `nv_state()` after the first boot, the secure image
   finds the ITS layout and does not print `Creating an empty ITS flash layout.`
-- **Peripheral accesses before the hand-off that no device models yet.** The secure image
+- **Peripheral accesses before the hand-off (the splash devices).** The secure image
   shows its splash before `bxns`: GPIO 0x4010_5000 (+00/+08/+10/+18; `gpio_*`
   0x100b2ec0..0x100b2fb2, panel reset), the PL111 LCDC 0x4000_4000 (TIM0–3, UPBASE/LPBASE =
   0x2004_8000, CONTROL = 0x312D then `|= 0x800`; `panel_on` 0x100b3200..0x100b3276) and the
-  backlight PWM 0x4010_4000 (+00 = 0xA0, +04 = 0xFF at 0x100b285a/0x100b285e). Their models
-  are Tasks 17 (GPIO) and 18 (LCDC, PWM). Until then `milestones.rs` lists these windows (both
-  aliases) in `PENDING_DEVICES`, not in `KNOWN_UNMODELLED`; the test fails once a window has
-  no unmapped access left, so the task that models the device removes its entries.
+  backlight PWM 0x4010_4000 (+00 = 0xA0, +04 = 0xFF at 0x100b285a/0x100b285e). Tasks 17
+  (GPIO) and 18 (LCDC, PWM) model them, so they no longer reach the unmapped log; the Secure
+  aliases (0x5000_4000, 0x5010_4000) are not accessed, and M2 fails if they are.
 - **First unmapped NS accesses** (BSP init, after the hand-off), in order:
   - keypad 0x4010_3000: +04 = 0x808 (0x0015f1d8), +00 = 0x5B68_0C33 (0x0015f1e2), +08 read
     then `= 0`, +0C read then `= 2` (0x0015f1e4..0x0015f1f2);

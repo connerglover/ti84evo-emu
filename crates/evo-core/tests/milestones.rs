@@ -159,35 +159,6 @@ const KNOWN_UNMODELLED: &[(RangeInclusive<u32>, &str)] = &[
     ),
 ];
 
-/// Device windows the secure image already programs before the hand-off (its splash: GPIO
-/// panel reset, PL111 timing/framebuffer, backlight PWM; `gpio.md`, `lcdc.md`) whose models
-/// later tasks of this plan add. Not a permanent allowance: each entry names its task, and
-/// [`assert_pending_still_unmodelled`] fails once the device is modelled, so that task removes
-/// the entry (`boot-flow.md`, "Milestones").
-const PENDING_DEVICES: &[(RangeInclusive<u32>, &str)] = &[
-    (0x4000_4000..=0x4000_4FFF, "LCDC (Task 18)"),
-    (0x5000_4000..=0x5000_4FFF, "LCDC, Secure alias (Task 18)"),
-    (0x4010_4000..=0x4010_4FFF, "backlight PWM (Task 18)"),
-    (
-        0x5010_4000..=0x5010_4FFF,
-        "backlight PWM, Secure alias (Task 18)",
-    ),
-];
-
-/// Each NS-alias [`PENDING_DEVICES`] window still has unmapped accesses, i.e. its device is not
-/// modelled yet. When this fails, the device is in: remove its entries.
-fn assert_pending_still_unmodelled(m: &Machine) {
-    for (range, what) in PENDING_DEVICES
-        .iter()
-        .filter(|(r, _)| *r.start() < 0x5000_0000)
-    {
-        assert!(
-            m.bus.log.entries().any(|(a, _)| range.contains(&a.addr)),
-            "{what} is modelled now: remove its PENDING_DEVICES entries"
-        );
-    }
-}
-
 /// IRQ lines that a healthy boot never asserts: 7 (MPC), 8 (PPC), 10, 17, 22, 23 and 26.
 const FATAL_STUB_IRQS: u64 = 1 << 7 | 1 << 8 | 1 << 10 | 1 << 17 | 1 << 22 | 1 << 23 | 1 << 26;
 
@@ -198,15 +169,9 @@ const KEY_SOURCE: RangeInclusive<u32> = 0x1800_E000..=0x1800_E0FF;
 const NS_ENTRY: u32 = 0x0011_6D50;
 
 /// Log entries in 0x4000_0000..=0x5FFF_FFFF or 0xE000_0000..=0xE00F_FFFF not covered by
-/// [`KNOWN_UNMODELLED`] (or, until their tasks land, [`PENDING_DEVICES`]), plus any other
-/// non-memory entry outside [`KEY_SOURCE`].
+/// [`KNOWN_UNMODELLED`], plus any other non-memory entry outside [`KEY_SOURCE`].
 fn unexpected_unmapped(m: &Machine) -> Vec<UnmappedAccess> {
-    let known = |a: u32| {
-        KNOWN_UNMODELLED
-            .iter()
-            .chain(PENDING_DEVICES)
-            .any(|(r, _)| r.contains(&a))
-    };
+    let known = |a: u32| KNOWN_UNMODELLED.iter().any(|(r, _)| r.contains(&a));
     m.bus
         .log
         .entries()
@@ -291,7 +256,6 @@ fn m2_ns_handoff() {
     assert_eq!(os.m.bus.irq_lines() & FATAL_STUB_IRQS, 0);
     let bad = unexpected_unmapped(&os.m);
     assert!(bad.is_empty(), "unexpected unmapped accesses: {bad:#x?}");
-    assert_pending_still_unmodelled(&os.m);
     let before_ns = os.m.bus.log.len();
 
     run_to_bsp(&mut os);
