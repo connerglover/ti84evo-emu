@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 /// Security state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Sec {
-    Secure,
     #[default]
+    Secure,
     NonSecure,
 }
 
@@ -140,6 +140,11 @@ mod tests {
         assert_eq!(x.to_u32(), v);
         let x = Xpsr::from_u32(0x0200_0000);
         assert_eq!(x.it, 0b01);
+    }
+
+    #[test]
+    fn default_is_secure() {
+        assert_eq!(Registers::default().sec, Sec::Secure);
     }
 
     #[test]
