@@ -10,6 +10,7 @@ serde.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
 log.workspace = true
+sha2 = { version = "0.10", features = ["compress"] }
 
 [dev-dependencies]
 serde_json.workspace = true

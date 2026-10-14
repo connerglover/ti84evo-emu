@@ -57,6 +57,11 @@ during Mbed TLS init.
   Reading +128 may clear EHR_VALID until the next batch, but the firmware restarts the
   source per 24 B batch (+12C 0 -> 1) anyway.
 - No IRQ output (keep IRQ 26 deasserted). Reset value 0 for all registers.
+- As implemented (`evo_hw::dev::crypto::Trng`): EHR_VALID follows the enable at once, with
+  no sampling delay; reading +128 does not clear it. The generator is xorshift64* (high 32
+  bits per output) seeded with `TRNG_SEED = 0x9E37_79B9_7F4A_7C15`, one draw per EHR read.
+  A System reset clears the registers but keeps the generator running; a PowerOn reset
+  restarts it from the seed. Only aligned word accesses reach registers.
 - Expected volume at boot: 22 batches per 528-byte request, a few requests (mbedtls entropy
   plus the TRNG partition self-test of 10000 B, about 420 batches).
 

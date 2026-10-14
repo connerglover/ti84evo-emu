@@ -1,6 +1,7 @@
 //! The TI-84 Evo SoC: every peripheral at its base address (see `docs/hardware/memory-map.md`).
 
 use crate::MemoryMap;
+use crate::dev::crypto::{Sha256Engine, TRNG_SEED, Trng};
 use crate::dev::mpc::Mpc;
 use crate::dev::spi::{DEFAULT_PANEL_ID, Spi, St7789};
 use crate::dev::spif::Spif;
@@ -49,4 +50,7 @@ pub fn attach(map: &mut MemoryMap) {
     // SPIF QSPI controller over the NOR part (spif-nor.md): secure alias only, no IRQ. It
     // erases and programs the FLASH_BUFFER bytes the XIP windows read.
     map.add_device("spif", 0x5000_1000, 0x1000, Box::new(Spif::new()));
+    // Polled crypto blocks (crypto.md): secure aliases only, IRQs 26/23 never asserted.
+    map.add_device("trng", 0x5010_A000, 0x1000, Box::new(Trng::new(TRNG_SEED)));
+    map.add_device("sha", 0x5000_2000, 0x1000, Box::new(Sha256Engine::new()));
 }
