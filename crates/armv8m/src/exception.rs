@@ -599,7 +599,8 @@ impl Cpu {
             *self.regs.msp.get_mut(sec) = new_sp;
         }
 
-        // EXC_RETURN: no FP frame, default callee-register stacking; ES is set when taken.
+        // EXC_RETURN: no FP frame, default callee-register stacking. ES and SPSEL (the
+        // transitory CONTROL.SPSEL of the state the exception targets) are set when taken.
         let mut exc_return = EXC_RETURN_PREFIX | EXC_RETURN_DCRS | EXC_RETURN_FTYPE;
         if sec == Sec::Secure {
             exc_return |= EXC_RETURN_S;
@@ -607,18 +608,17 @@ impl Cpu {
         if thread {
             exc_return |= EXC_RETURN_MODE;
         }
-        if use_psp {
-            exc_return |= EXC_RETURN_SPSEL;
-        }
         self.regs.lr = exc_return;
         derived
     }
 
     /// The Secure stack pointer (as a mutable reference) and its limit for the frame that the
-    /// EXC_RETURN value `exc_return` describes.
+    /// EXC_RETURN value `exc_return` describes: `LookUpSP_with_security_mode(TRUE, mode)`, with
+    /// the mode from EXC_RETURN.Mode and the stack from CONTROL_S.SPSEL (EXC_RETURN.SPSEL
+    /// belongs to the state the exception targets, not to the Secure background).
     fn secure_frame_sp(&mut self, exc_return: u32) -> (&mut u32, u32) {
         let r = &mut self.regs;
-        if exc_return & EXC_RETURN_MODE != 0 && exc_return & EXC_RETURN_SPSEL != 0 {
+        if exc_return & EXC_RETURN_MODE != 0 && r.control.s & 0b10 != 0 {
             (&mut r.psp.s, r.psplim.s)
         } else {
             (&mut r.msp.s, r.msplim.s)
@@ -664,7 +664,13 @@ impl Cpu {
     /// Non-secure exception interrupted a Secure background. It is 0 when they are on the
     /// stack although the exception is Secure, which happens when a Non-secure exception over
     /// a Secure background tail-chains into a Secure one.
+    ///
+    /// EXC_RETURN.SPSEL records the transitory CONTROL.SPSEL of the target state (the state
+    /// ES names), which Handler mode then clears; `exception_return` restores it. The other
+    /// state's CONTROL.SPSEL is not touched and keeps selecting its stack.
     fn exception_taken(&mut self, bus: &mut impl Bus, num: u16, sec: Sec, tail_chain: bool) {
+        let spsel = self.regs.control.get(sec) & 0b10 != 0;
+        self.regs.lr = (self.regs.lr & !EXC_RETURN_SPSEL) | (u32::from(spsel) << 2);
         let lr = self.regs.lr;
         let mut derived = None;
         if lr & EXC_RETURN_S != 0 {
@@ -778,14 +784,26 @@ impl Cpu {
 
         // Non-secure software can neither return from a Secure exception (ES = 1) nor claim a
         // non-default callee context (DCRS = 0). The exception is then treated as Non-secure.
-        if cur == Sec::NonSecure && (es || !dcrs) {
+        let inver = cur == Sec::NonSecure && (es || !dcrs);
+        let (exc_return, exc_sec) = if inver {
+            (exc_return & !EXC_RETURN_ES, Sec::NonSecure)
+        } else {
+            (exc_return, exc_sec)
+        };
+        // Restore the transitory CONTROL.SPSEL of the state the exception was taken to. This
+        // comes before any tail-chain or derived exception, which record it in their own
+        // EXC_RETURN. (Still in Handler mode, so it does not switch the current stack.)
+        let control = self.regs.control.get_mut(exc_sec);
+        *control = (*control & !0b10) | (u32::from(spsel) << 1);
+        if inver {
             log::warn!("invalid exception return {exc_return:#010x} from Non-secure state");
-            return self.return_fault(bus, exc_return & !EXC_RETURN_ES, Fault::InvEr);
+            return self.return_fault(bus, exc_return, Fault::InvEr);
         }
+        // EXC_RETURN.SPSEL describes the state named by ES, which may be the other state than
+        // the background's, so Mode = 0 with SPSEL = 1 is valid (unlike v7-M's 0xFFFF_FFF5).
         let valid = exc_return & 0x00FF_FF82 == 0x00FF_FF80
             && exc_return & EXC_RETURN_FTYPE != 0
             && self.is_active_for_state(num, exc_sec)
-            && !(!to_thread && spsel)
             && (to_thread || self.active_count() > 1);
         if !valid {
             log::warn!("invalid exception return {exc_return:#010x} from exception {num}");
@@ -812,8 +830,9 @@ impl Cpu {
             return self.entry_outcome();
         }
 
-        // PopStack.
-        let use_psp = to_thread && spsel;
+        // PopStack: the frame is on `LookUpSP_with_security_mode(S, Mode)`, the stack the
+        // background state's own CONTROL.SPSEL selects.
+        let use_psp = to_thread && self.regs.control.get(frame_sec) & 0b10 != 0;
         let mut frame = if use_psp {
             *self.regs.psp.get(frame_sec)
         } else {
@@ -872,8 +891,6 @@ impl Cpu {
             *self.regs.msp.get_mut(frame_sec) = sp;
         }
         self.regs.sec = frame_sec;
-        let control = self.regs.control.get_mut(frame_sec);
-        *control = (*control & !0b10) | (u32::from(spsel) << 1);
 
         if to_thread && self.scs.scb.scr.get(cur) & scb::SCR_SLEEPONEXIT != 0 {
             return ReturnOutcome::Sleep;

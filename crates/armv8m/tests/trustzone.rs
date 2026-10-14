@@ -766,6 +766,159 @@ fn secure_irq_preempts_ns_thread() {
     assert_eq!((cpu.regs.pc, cpu.regs.msp.ns), (0x100, SP_NS));
 }
 
+// ---- CONTROL.SPSEL across security states ----
+//
+// EXC_RETURN.SPSEL is the transitory CONTROL.SPSEL of the state the exception is taken to (the
+// state named by ES); the background state's CONTROL.SPSEL is left alone and selects the stack
+// that holds the frame (`LookUpSP_with_security_mode`).
+
+/// Process stack tops for the two states.
+const PSP_S: u32 = 0x3000_2000;
+const PSP_NS: u32 = 0x2000_2000;
+
+#[test]
+fn ns_irq_over_secure_thread_keeps_control_ns_spsel() {
+    let (mut cpu, mut bus) = tz();
+    bus.code(0x1000_0100, &[B_SELF]);
+    ns_handler(&mut bus, 16 + 3, 0x400, &[BX_LR]);
+    cpu.ppb_write32(NVIC_ITNS0, 1 << 3);
+    cpu.ppb_write32(NVIC_ISER0, 1 << 3);
+    cpu.regs.control.ns = 0b10;
+    cpu.regs.psp.ns = PSP_NS;
+    cpu.pulse_irq(3);
+    step(&mut cpu, &mut bus);
+    assert_eq!((ipsr(&cpu), cpu.regs.sec), (19, Sec::NonSecure));
+    // SPSEL is CONTROL_NS.SPSEL (the handler's state), not the Secure background's.
+    assert_eq!(cpu.regs.lr, 0xFFFF_FFFC);
+    assert_eq!(cpu.regs.control.ns, 0, "Handler mode runs on MSP_NS");
+    assert_eq!(cpu.regs.msp.s, SP_S - 0x48, "frame on MSP_S");
+    step(&mut cpu, &mut bus);
+    assert_eq!((ipsr(&cpu), cpu.regs.sec), (0, Sec::Secure));
+    assert_eq!((cpu.regs.pc, cpu.regs.msp.s), (0x1000_0100, SP_S));
+    assert_eq!(cpu.regs.control.ns, 0b10, "CONTROL_NS.SPSEL restored");
+    assert_eq!(cpu.regs.control.s, 0);
+    assert_eq!(cpu.regs.psp.ns, PSP_NS);
+
+    // A Secure thread on PSP_S with CONTROL_NS.SPSEL = 0: EXC_RETURN.SPSEL is 0, and the frame
+    // is still found on PSP_S through CONTROL_S.SPSEL.
+    let (mut cpu, mut bus) = tz();
+    bus.code(0x1000_0100, &[B_SELF]);
+    ns_handler(&mut bus, 16 + 3, 0x400, &[BX_LR]);
+    cpu.ppb_write32(NVIC_ITNS0, 1 << 3);
+    cpu.ppb_write32(NVIC_ISER0, 1 << 3);
+    cpu.regs.control.s = 0b10;
+    cpu.regs.psp.s = PSP_S;
+    cpu.pulse_irq(3);
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.regs.lr, 0xFFFF_FFF8);
+    assert_eq!(cpu.regs.psp.s, PSP_S - 0x48, "frame on PSP_S");
+    assert_eq!(cpu.regs.control.s, 0b10, "background CONTROL_S untouched");
+    step(&mut cpu, &mut bus);
+    assert_eq!((ipsr(&cpu), cpu.regs.sec), (0, Sec::Secure));
+    assert_eq!((cpu.regs.pc, cpu.regs.psp.s), (0x1000_0100, PSP_S));
+    assert_eq!((cpu.regs.control.s, cpu.regs.control.ns), (0b10, 0));
+}
+
+#[test]
+fn secure_irq_over_ns_thread_keeps_control_s_spsel() {
+    let (mut cpu, mut bus) = tz();
+    bus.code(0x100, &[B_SELF]);
+    s_handler(&mut bus, 16 + 2, 0x1000_0600, &[BX_LR]);
+    cpu.ppb_write32(NVIC_ISER0, 1 << 2);
+    cpu.regs.control.s = 0b10;
+    cpu.regs.psp.s = PSP_S;
+    enter_ns(&mut cpu, 0x100);
+    cpu.pulse_irq(2);
+    step(&mut cpu, &mut bus);
+    assert_eq!((ipsr(&cpu), cpu.regs.sec), (18, Sec::Secure));
+    assert_eq!(cpu.regs.lr, 0xFFFF_FFBD);
+    assert_eq!(cpu.regs.control.s, 0);
+    assert_eq!(cpu.regs.msp.ns, SP_NS - 0x20, "frame on MSP_NS");
+    step(&mut cpu, &mut bus);
+    assert_eq!((ipsr(&cpu), cpu.regs.sec), (0, Sec::NonSecure));
+    assert_eq!((cpu.regs.pc, cpu.regs.msp.ns), (0x100, SP_NS));
+    assert_eq!(cpu.regs.control.s, 0b10, "CONTROL_S.SPSEL restored");
+    assert_eq!((cpu.regs.psp.s, cpu.regs.msp.s), (PSP_S, SP_S));
+}
+
+#[test]
+fn blxns_from_psp_s_survives_secure_irq_in_ns_code() {
+    let (mut cpu, mut bus) = tz();
+    // Secure: blxns r0 ; nop       NS: bx lr       Secure IRQ 2: bx lr
+    bus.code(0x1000_0100, &[BLXNS_R0, NOP]);
+    bus.code(0x200, &[BX_LR]);
+    s_handler(&mut bus, 16 + 2, 0x1000_0600, &[BX_LR]);
+    cpu.ppb_write32(NVIC_ISER0, 1 << 2);
+    cpu.regs.control.s = 0b10;
+    cpu.regs.psp.s = PSP_S;
+    cpu.regs.r[0] = 0x200;
+    step(&mut cpu, &mut bus);
+    assert_eq!((cpu.regs.sec, cpu.regs.pc), (Sec::NonSecure, 0x200));
+    assert_eq!(cpu.regs.psp.s, PSP_S - 8, "BLXNS frame on PSP_S");
+
+    cpu.pulse_irq(2);
+    step(&mut cpu, &mut bus);
+    assert_eq!((ipsr(&cpu), cpu.regs.sec), (18, Sec::Secure));
+    step(&mut cpu, &mut bus);
+    assert_eq!(
+        (ipsr(&cpu), cpu.regs.sec, cpu.regs.pc),
+        (0, Sec::NonSecure, 0x200)
+    );
+    assert_eq!(cpu.regs.control.s, 0b10);
+
+    // FNC_RETURN pops the BLXNS frame from PSP_S.
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.regs.sec, Sec::Secure);
+    assert_eq!(cpu.regs.pc, 0x1000_0102);
+    assert_eq!((cpu.regs.psp.s, cpu.regs.msp.s), (PSP_S, SP_S));
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.regs.pc, 0x1000_0104);
+}
+
+#[test]
+fn ns_irq_over_secure_handler_with_ns_thread_on_psp() {
+    // NS thread on PSP_NS -> Secure IRQ 2 -> NS IRQ 3 (higher priority) preempts the Secure
+    // handler. Its EXC_RETURN returns to Handler mode with SPSEL = CONTROL_NS.SPSEL = 1, which
+    // is a valid value in v8-M, and both returns land on the right stacks.
+    let (mut cpu, mut bus) = tz();
+    bus.code(0x100, &[B_SELF]);
+    s_handler(&mut bus, 16 + 2, 0x1000_0600, &[NOP, BX_LR]);
+    ns_handler(&mut bus, 16 + 3, 0x400, &[BX_LR]);
+    cpu.ppb_write32(NVIC_ITNS0, 1 << 3);
+    cpu.ppb_write32(NVIC_ISER0, (1 << 2) | (1 << 3));
+    cpu.ppb_write32(NVIC_IPR0, 0x80 << 16);
+    cpu.regs.control.ns = 0b10;
+    cpu.regs.psp.ns = PSP_NS;
+    enter_ns(&mut cpu, 0x100);
+    cpu.pulse_irq(2);
+    step(&mut cpu, &mut bus);
+    assert_eq!((ipsr(&cpu), cpu.regs.lr), (18, 0xFFFF_FFB9));
+    assert_eq!(cpu.regs.psp.ns, PSP_NS - 0x20);
+    cpu.pulse_irq(3);
+    step(&mut cpu, &mut bus);
+    assert_eq!((ipsr(&cpu), cpu.regs.sec), (19, Sec::NonSecure));
+    assert_eq!(cpu.regs.lr, 0xFFFF_FFF4);
+    assert_eq!(
+        cpu.regs.msp.s,
+        SP_S - 0x48,
+        "frame on MSP_S (Secure Handler mode)"
+    );
+    step(&mut cpu, &mut bus);
+    assert_eq!(
+        (ipsr(&cpu), cpu.regs.sec, cpu.regs.pc),
+        (18, Sec::Secure, 0x1000_0600)
+    );
+    assert_eq!((cpu.regs.msp.s, cpu.regs.control.ns), (SP_S, 0b10));
+    step(&mut cpu, &mut bus);
+    step(&mut cpu, &mut bus);
+    assert_eq!(
+        (ipsr(&cpu), cpu.regs.sec, cpu.regs.pc),
+        (0, Sec::NonSecure, 0x100)
+    );
+    assert_eq!((cpu.regs.psp.ns, cpu.regs.msp.ns), (PSP_NS, SP_NS));
+    assert_eq!(cpu.regs.control.ns, 0b10);
+}
+
 #[test]
 fn ns_exc_return_claiming_secure_is_inver() {
     // A Non-secure handler returns with ES = 1.
