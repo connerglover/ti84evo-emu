@@ -192,6 +192,26 @@ harmless.
 Map it at 0x4010_1000 (size 0x1000). Mapping the same device at 0x5010_1000 is harmless, but
 no code uses that address.
 
+### Emulator implementation (`evo_hw::dev::timer::Timer`)
+
+The emulator implements the model above, registered as `"timer"` at 0x4010_1000/0x1000 by
+`evo_hw::soc::attach`. Decisions for the open questions below:
+
+- **Interrupts are not modeled.** INT_STAT is never set, so its W1C writes have no visible
+  effect, and IRQs 1-3 are never asserted. INT_EN stores and reads back; the first write of
+  a non-zero INT_EN logs a `log::warn!` ("timer interrupts not modeled") once per device
+  instance. The optional underflow/IRQ behaviour above is not implemented.
+- **Underflow reloads from LOAD** (open question 3), with period LOAD + 1 ticks.
+- **Disabled channels are frozen**, and a VALUE write while enabled restarts the count from
+  the written value at the current cycle (open question 5).
+- **CTRL bits 3n+2 and 9+n** are stored only (open question 2). The 39,000 Hz rate is used
+  whenever CTRL bit 3n+1 is clear (open question 1).
+- Only aligned 32-bit accesses reach registers. Other widths, and the offsets the table does
+  not list, read 0, ignore writes and are logged as unhandled.
+- A System reset keeps every register. A PowerOn reset clears them all to 0.
+- The saved state is VALUE, LOAD and `since` for each channel, plus CTRL, INT_STAT and
+  INT_EN. The warn-once flag is not saved.
+
 ## Related blocks the boot path touches (or does not)
 
 - **Clock gates.** Platform init 0x100B2798 calls 0x100B5B68(mask, 1) for masks 0x40,
@@ -214,11 +234,13 @@ no code uses that address.
 2. **CTRL bits 3n+2 and 9+n.** Init clears both, nothing sets them, and the meaning is
    unknown (IRQ enable? one-shot? cascade?). Store them only.
 3. **Underflow behaviour.** Does the counter reload from LOAD, wrap through 0xFFFF_FFFF, or
-   stop (one-shot)? With LOAD = ~0 the results are the same. Reload-from-LOAD is assumed.
+   stop (one-shot)? With LOAD = ~0 the results are the same. Reload-from-LOAD is assumed,
+   and the emulator implements it.
 4. **INT_STAT bit position.** It equals bit 3n+2 (2, 5, 8), the same position as the unknown
    CTRL bit. It may be a shared bit layout, and the status may not be set unless CTRL bit
    3n+2 is set.
 5. **VALUE reads while disabled, and VALUE writes while enabled.** The firmware does neither,
-   so the model's choices (frozen; restart from the written value) are unverified.
+   so the model's choices (frozen; restart from the written value) are unverified. The
+   emulator implements those choices.
 6. **Clock-gate bit for the timer** in 0x5020_0014/18 is unidentified. The firmware does not
    depend on it.
