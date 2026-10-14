@@ -1,11 +1,20 @@
 use std::sync::{Arc, Mutex};
 
+use armv8m::BusError;
 use armv8m::{Access, AccessKind, Bus};
-use evo_hw::{Device, MemoryMap, UnmappedAccess};
+use evo_hw::{Device, MemoryMap, UnmappedAccess, UnmappedKind};
 
 fn acc(secure: bool) -> Access {
     Access {
         kind: AccessKind::Read,
+        secure,
+        privileged: true,
+    }
+}
+
+fn fetch(secure: bool) -> Access {
+    Access {
+        kind: AccessKind::Fetch,
         secure,
         privileged: true,
     }
@@ -60,6 +69,7 @@ fn unmapped_read_returns_zero_and_logs() {
                     addr: 0x5000_0000,
                     width: 4,
                     write: None,
+                    kind: UnmappedKind::Read,
                     pc: 0x0800_1234,
                     secure: true
                 },
@@ -70,6 +80,7 @@ fn unmapped_read_returns_zero_and_logs() {
                     addr: 0x5000_0010,
                     width: 2,
                     write: None,
+                    kind: UnmappedKind::Read,
                     pc: 0x0800_1234,
                     secure: false
                 },
@@ -80,6 +91,7 @@ fn unmapped_read_returns_zero_and_logs() {
                     addr: 0x5000_0020,
                     width: 1,
                     write: None,
+                    kind: UnmappedKind::Read,
                     pc: 0x0800_1234,
                     secure: true
                 },
@@ -101,6 +113,7 @@ fn unmapped_write_is_dropped_and_logged_with_masked_value() {
         addr,
         width,
         write: Some(v),
+        kind: UnmappedKind::Write,
         pc: 0x100,
         secure,
     };
@@ -172,6 +185,7 @@ fn rom_write_is_logged_not_applied() {
                 addr: 0,
                 width: 4,
                 write: Some(0xFFFF_FFFF),
+                kind: UnmappedKind::Write,
                 pc: 0x44,
                 secure: true
             },
@@ -379,11 +393,13 @@ fn to_markdown_table_format() {
     }
     m.pc_hint = 0x0800_1238;
     m.write16(0x5000_0004, 0xAB, acc(NS)).unwrap();
+    assert_eq!(m.read16(0x5000_0008, fetch(S)), Err(BusError::Decode));
     let expected = "\
-| addr | width | R/W | value | pc | sec | count |
+| addr | width | kind | value | pc | sec | count |
 |---|---|---|---|---|---|---|
-| 0x50000000 | 4 | R | - | 0x08001234 | S | 3 |
-| 0x50000004 | 2 | W | 0x00ab | 0x08001238 | NS | 1 |
+| 0x50000000 | 4 | read | - | 0x08001234 | S | 3 |
+| 0x50000004 | 2 | write | 0x00ab | 0x08001238 | NS | 1 |
+| 0x50000008 | 2 | fetch | - | 0x08001238 | S | 1 |
 ";
     assert_eq!(m.log.to_markdown(), expected);
 }
@@ -393,8 +409,118 @@ fn to_markdown_empty_log_is_header_only() {
     let m = MemoryMap::new();
     assert_eq!(
         m.log.to_markdown(),
-        "| addr | width | R/W | value | pc | sec | count |\n|---|---|---|---|---|---|---|\n"
+        "| addr | width | kind | value | pc | sec | count |\n|---|---|---|---|---|---|---|\n"
     );
+}
+
+// ---- instruction fetches from unmapped space fault (IBUSERR) ----
+
+#[test]
+fn unmapped_fetch_is_bus_error_and_logged() {
+    let mut m = MemoryMap::new();
+    m.pc_hint = 0x0800_0100;
+    assert_eq!(m.read16(0x7000_0000, fetch(S)), Err(BusError::Decode));
+    assert_eq!(m.read32(0x7000_0010, fetch(NS)), Err(BusError::Decode));
+    assert_eq!(m.read8(0x7000_0020, fetch(S)), Err(BusError::Decode));
+    let got: Vec<_> = entries(&m)
+        .into_iter()
+        .map(|(a, c)| (a.addr, a.width, a.kind, a.write, a.pc, a.secure, c))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (
+                0x7000_0000,
+                2,
+                UnmappedKind::Fetch,
+                None,
+                0x0800_0100,
+                true,
+                1
+            ),
+            (
+                0x7000_0010,
+                4,
+                UnmappedKind::Fetch,
+                None,
+                0x0800_0100,
+                false,
+                1
+            ),
+            (
+                0x7000_0020,
+                1,
+                UnmappedKind::Fetch,
+                None,
+                0x0800_0100,
+                true,
+                1
+            ),
+        ]
+    );
+}
+
+#[test]
+fn unmapped_data_read_still_returns_zero_ok_at_a_fetch_fault_address() {
+    let mut m = MemoryMap::new();
+    assert_eq!(m.read16(0x7000_0000, fetch(S)), Err(BusError::Decode));
+    // Data reads and writes keep the log-and-continue behavior.
+    assert_eq!(m.read16(0x7000_0000, acc(S)), Ok(0));
+    assert_eq!(m.write16(0x7000_0000, 1, acc(S)), Ok(()));
+}
+
+#[test]
+fn log_dedup_distinguishes_fetch_from_read() {
+    let mut m = MemoryMap::new();
+    m.pc_hint = 0x20;
+    // Same addr, width and pc: a fetch and a data read are different entries.
+    let _ = m.read32(0x7000_0000, fetch(S));
+    m.read32(0x7000_0000, acc(S)).unwrap();
+    let _ = m.read32(0x7000_0000, fetch(S));
+    m.read32(0x7000_0000, acc(S)).unwrap();
+    m.read32(0x7000_0000, acc(S)).unwrap();
+    let got: Vec<_> = entries(&m).into_iter().map(|(a, c)| (a.kind, c)).collect();
+    assert_eq!(got, vec![(UnmappedKind::Fetch, 2), (UnmappedKind::Read, 3)]);
+}
+
+#[test]
+fn fetch_from_mapped_memory_succeeds_without_logging() {
+    let mut m = MemoryMap::new();
+    m.add_rom("rom", vec![0x70, 0x47, 0x00, 0xBF], &[0x0800_0000]);
+    m.add_ram("ram", 0x100, &[0x2000_0000]);
+    assert_eq!(m.read16(0x0800_0000, fetch(S)), Ok(0x4770));
+    assert_eq!(m.read32(0x0800_0000, fetch(S)), Ok(0xBF00_4770));
+    assert_eq!(m.read16(0x2000_0000, fetch(S)), Ok(0));
+    assert_eq!(m.log.len(), 0);
+}
+
+#[test]
+fn fetch_running_off_the_end_of_memory_faults_and_logs_each_unmapped_byte() {
+    let mut m = MemoryMap::new();
+    m.add_rom("rom", vec![0x70, 0x47], &[0x0800_0000]);
+    m.pc_hint = 0x0800_0000;
+    // A 32-bit fetch with its second halfword past the end of ROM: bus error, and both
+    // unmapped bytes are in the log as fetches.
+    assert_eq!(m.read32(0x0800_0000, fetch(S)), Err(BusError::Decode));
+    let got: Vec<_> = entries(&m)
+        .into_iter()
+        .map(|(a, _)| (a.addr, a.width, a.kind))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (0x0800_0002, 1, UnmappedKind::Fetch),
+            (0x0800_0003, 1, UnmappedKind::Fetch)
+        ]
+    );
+}
+
+#[test]
+fn write_with_fetch_kind_is_still_a_dropped_write() {
+    // A write is never an instruction fetch, whatever the access attributes claim.
+    let mut m = MemoryMap::new();
+    assert_eq!(m.write32(0x7000_0000, 1, fetch(S)), Ok(()));
+    assert_eq!(entries(&m)[0].0.kind, UnmappedKind::Write);
 }
 
 // ---- debugger API (peek/poke): no logging, no device side effects ----

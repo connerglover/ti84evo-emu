@@ -13,14 +13,37 @@ use serde::{Deserialize, Serialize};
 /// exhaust host memory; accesses beyond this are only counted in [`UnmappedLog::dropped`].
 pub const MAX_ENTRIES: usize = 65_536;
 
+/// What kind of access was logged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UnmappedKind {
+    /// Instruction fetch. The bus answers these with `BusError::Decode` (IBUSERR).
+    Fetch,
+    /// Data read: reads as zero.
+    Read,
+    /// Write: dropped.
+    Write,
+}
+
+impl UnmappedKind {
+    /// Name used in the markdown table.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnmappedKind::Fetch => "fetch",
+            UnmappedKind::Read => "read",
+            UnmappedKind::Write => "write",
+        }
+    }
+}
+
 /// One access that did not land on RAM, ROM or a device.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnmappedAccess {
     pub addr: u32,
     /// Access width in bytes: 1, 2 or 4.
     pub width: u8,
-    /// `Some(value)` for a (dropped) write, masked to `width`; `None` for a read.
+    /// `Some(value)` for a (dropped) write, masked to `width`; `None` for a fetch or read.
     pub write: Option<u32>,
+    pub kind: UnmappedKind,
     /// `MemoryMap::pc_hint` at the time of the access.
     pub pc: u32,
     pub secure: bool,
@@ -28,10 +51,10 @@ pub struct UnmappedAccess {
 
 /// Identity of a log entry: accesses with the same key are one entry with a count. The value
 /// written and the security state are not part of it; the first occurrence's are kept.
-type Key = (u32, u8, bool, u32);
+type Key = (u32, u8, UnmappedKind, u32);
 
 fn key(a: &UnmappedAccess) -> Key {
-    (a.addr, a.width, a.write.is_some(), a.pc)
+    (a.addr, a.width, a.kind, a.pc)
 }
 
 /// Deduplicating, size-bounded log of [`UnmappedAccess`]es, in order of first occurrence.
@@ -113,18 +136,19 @@ impl UnmappedLog {
     /// The log as a markdown table, one row per entry in order of first occurrence.
     pub fn to_markdown(&self) -> String {
         let mut s = String::from(
-            "| addr | width | R/W | value | pc | sec | count |\n|---|---|---|---|---|---|---|\n",
+            "| addr | width | kind | value | pc | sec | count |\n|---|---|---|---|---|---|---|\n",
         );
         for (a, count) in self.entries() {
-            let (rw, value) = match a.write {
-                Some(v) => ("W", format!("0x{v:0w$x}", w = usize::from(a.width) * 2)),
-                None => ("R", "-".to_owned()),
+            let value = match a.write {
+                Some(v) => format!("0x{v:0w$x}", w = usize::from(a.width) * 2),
+                None => "-".to_owned(),
             };
+            let kind = a.kind.as_str();
             let sec = if a.secure { "S" } else { "NS" };
             // Writing to a String cannot fail.
             let _ = writeln!(
                 s,
-                "| 0x{:08x} | {} | {rw} | {value} | 0x{:08x} | {sec} | {count} |",
+                "| 0x{:08x} | {} | {kind} | {value} | 0x{:08x} | {sec} | {count} |",
                 a.addr, a.width, a.pc
             );
         }

@@ -6,4 +6,4 @@ pub mod unmapped;
 
 pub use memmap::MemoryMap;
 pub use region::Device;
-pub use unmapped::{UnmappedAccess, UnmappedLog};
+pub use unmapped::{UnmappedAccess, UnmappedKind, UnmappedLog};

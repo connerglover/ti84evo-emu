@@ -1,15 +1,17 @@
 //! The TI-84 Evo physical memory map, as seen by the CPU through [`armv8m::Bus`].
 //!
 //! Anything nobody has modeled yet reads as zero and swallows writes, but is recorded in
-//! [`MemoryMap::log`] (address, width, value, PC, security) so the undocumented SoC's
-//! peripherals can be discovered by running the real firmware. Nothing here faults: the Plan 1
-//! bus never returns a `BusError`.
+//! [`MemoryMap::log`] (address, width, kind, value, PC, security) so the undocumented SoC's
+//! peripherals can be discovered by running the real firmware. The one exception is an
+//! instruction fetch from unmapped space: it is logged too, but answered with
+//! `BusError::Decode` so the CPU raises IBUSERR instead of executing zeros (`movs r0, r0`)
+//! forever. Data accesses never fault in Plan 1.
 
-use armv8m::{Access, Bus, BusError};
+use armv8m::{Access, AccessKind, Bus, BusError};
 use serde::{Deserialize, Serialize};
 
 use crate::region::{self, Buffer, Device, Region, Target};
-use crate::unmapped::{UnmappedAccess, UnmappedLog};
+use crate::unmapped::{UnmappedAccess, UnmappedKind, UnmappedLog};
 
 /// Sorted table of RAM, ROM and device windows plus the log of accesses that hit none of them.
 ///
@@ -189,11 +191,19 @@ impl MemoryMap {
 
     // ---- guest access ----
 
-    fn log_access(&mut self, addr: u32, width: u8, write: Option<u32>, secure: bool) {
+    fn log_access(
+        &mut self,
+        addr: u32,
+        width: u8,
+        kind: UnmappedKind,
+        write: Option<u32>,
+        secure: bool,
+    ) {
         self.log.record(UnmappedAccess {
             addr,
             width,
             write,
+            kind,
             pc: self.pc_hint,
             secure,
         });
@@ -273,27 +283,60 @@ impl MemoryMap {
         }
     }
 
-    /// A guest read of `width` bytes. Never fails: unmapped bytes read as 0 and are logged.
-    /// An access that straddles windows or is partly unmapped is split into byte accesses, so
-    /// each unmapped byte is logged on its own and devices never see an access that runs off
-    /// their end.
-    fn read(&mut self, addr: u32, width: u8, secure: bool) -> u32 {
+    /// A guest read of `width` bytes: the value, and whether any byte of it was unmapped.
+    /// Unmapped bytes read as 0 and are logged as `kind`. An access that straddles windows or
+    /// is partly unmapped is split into byte accesses, so each unmapped byte is logged on its
+    /// own and devices never see an access that runs off their end.
+    fn read(&mut self, addr: u32, width: u8, kind: UnmappedKind, secure: bool) -> (u32, bool) {
         match self.span(addr, width) {
             Span::Inside { region, off } => {
                 if let Some(v) = self.read_inside(region, off, width) {
-                    return v;
+                    return (v, false);
                 }
-                self.log_access(addr, width, None, secure);
-                0
+                self.log_access(addr, width, kind, None, secure);
+                (0, true)
             }
             Span::Unmapped => {
-                self.log_access(addr, width, None, secure);
-                0
+                self.log_access(addr, width, kind, None, secure);
+                (0, true)
             }
-            Span::Straddle => (0..u32::from(width)).fold(0, |v, i| {
-                v | (self.read(addr.wrapping_add(i), 1, secure) << (8 * i))
-            }),
+            Span::Straddle => {
+                let (mut v, mut unmapped) = (0, false);
+                for i in 0..u32::from(width) {
+                    let (b, miss) = self.read(addr.wrapping_add(i), 1, kind, secure);
+                    v |= b << (8 * i);
+                    unmapped |= miss;
+                }
+                (v, unmapped)
+            }
         }
+    }
+
+    /// The bus-facing read: a fetch that touched unmapped space is a bus error (after being
+    /// logged); any other read just gets the zeros.
+    fn bus_read(&mut self, addr: u32, width: u8, a: Access) -> Result<u32, BusError> {
+        let fetch = a.kind == AccessKind::Fetch;
+        let kind = if fetch {
+            UnmappedKind::Fetch
+        } else {
+            UnmappedKind::Read
+        };
+        let (v, unmapped) = self.read(addr, width, kind, a.secure);
+        if fetch && unmapped {
+            Err(BusError::Decode)
+        } else {
+            Ok(v)
+        }
+    }
+
+    fn log_write(&mut self, addr: u32, width: u8, v: u32, secure: bool) {
+        self.log_access(
+            addr,
+            width,
+            UnmappedKind::Write,
+            Some(v & mask(width)),
+            secure,
+        );
     }
 
     /// A guest write of `width` bytes. Never fails: writes to unmapped space and ROM are
@@ -302,10 +345,10 @@ impl MemoryMap {
         match self.span(addr, width) {
             Span::Inside { region, off } => {
                 if !self.write_inside(region, off, width, v) {
-                    self.log_access(addr, width, Some(v & mask(width)), secure);
+                    self.log_write(addr, width, v, secure);
                 }
             }
-            Span::Unmapped => self.log_access(addr, width, Some(v & mask(width)), secure),
+            Span::Unmapped => self.log_write(addr, width, v, secure),
             Span::Straddle => {
                 for i in 0..u32::from(width) {
                     self.write(addr.wrapping_add(i), 1, (v >> (8 * i)) & 0xFF, secure);
@@ -317,13 +360,13 @@ impl MemoryMap {
 
 impl Bus for MemoryMap {
     fn read8(&mut self, addr: u32, a: Access) -> Result<u8, BusError> {
-        Ok(self.read(addr, 1, a.secure) as u8)
+        Ok(self.bus_read(addr, 1, a)? as u8)
     }
     fn read16(&mut self, addr: u32, a: Access) -> Result<u16, BusError> {
-        Ok(self.read(addr, 2, a.secure) as u16)
+        Ok(self.bus_read(addr, 2, a)? as u16)
     }
     fn read32(&mut self, addr: u32, a: Access) -> Result<u32, BusError> {
-        Ok(self.read(addr, 4, a.secure))
+        self.bus_read(addr, 4, a)
     }
     fn write8(&mut self, addr: u32, v: u8, a: Access) -> Result<(), BusError> {
         self.write(addr, 1, u32::from(v), a.secure);

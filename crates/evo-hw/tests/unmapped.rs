@@ -1,11 +1,12 @@
 use evo_hw::unmapped::MAX_ENTRIES;
-use evo_hw::{UnmappedAccess, UnmappedLog};
+use evo_hw::{UnmappedAccess, UnmappedKind, UnmappedLog};
 
 fn rd(addr: u32, pc: u32) -> UnmappedAccess {
     UnmappedAccess {
         addr,
         width: 4,
         write: None,
+        kind: UnmappedKind::Read,
         pc,
         secure: true,
     }
@@ -81,4 +82,22 @@ fn serde_roundtrip_preserves_dropped_counter() {
     let back: UnmappedLog = serde_json::from_str(&json).unwrap();
     assert_eq!(back.len(), MAX_ENTRIES);
     assert_eq!(back.dropped(), 3);
+}
+
+#[test]
+fn kind_is_part_of_the_dedup_key() {
+    let mut log = UnmappedLog::default();
+    let fetch = UnmappedAccess {
+        kind: UnmappedKind::Fetch,
+        ..rd(0x30, 1)
+    };
+    log.record(rd(0x30, 1));
+    log.record(fetch.clone());
+    log.record(fetch);
+    let got: Vec<_> = log.entries().map(|(a, c)| (a.kind, c)).collect();
+    assert_eq!(got, vec![(UnmappedKind::Read, 1), (UnmappedKind::Fetch, 2)]);
+    // And it survives a serde roundtrip.
+    let back: UnmappedLog = serde_json::from_str(&serde_json::to_string(&log).unwrap()).unwrap();
+    let got: Vec<_> = back.entries().map(|(a, c)| (a.kind, c)).collect();
+    assert_eq!(got, vec![(UnmappedKind::Read, 1), (UnmappedKind::Fetch, 2)]);
 }
