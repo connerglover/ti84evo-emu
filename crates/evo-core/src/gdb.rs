@@ -37,7 +37,9 @@
 //! leaving the machine usable. The link layer is handled here, because `gdbstub` ends the
 //! session on a bad checksum, a NAK or a stray byte: packets with a bad checksum are NAKed
 //! (`-`) and dropped, a reply the client NAKs is sent again, line noise between packets is
-//! skipped, and a well-formed packet that `gdbstub` rejects gets an `E01` reply.
+//! skipped, and a well-formed packet that `gdbstub` rejects gets an `E01` reply. Memory
+//! accesses whose range wraps past 0xFFFF_FFFF, and `m` reads longer than `MAX_READ` (2048)
+//! bytes, get `E01` from the link without reaching `gdbstub`.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -440,10 +442,15 @@ impl SingleThreadBase for Debuggee<'_> {
     }
 
     fn write_registers(&mut self, regs: &Regs) -> TargetResult<(), Self> {
-        // `G` carries every register. Write only those that changed, so that a new `sp` is
-        // not undone by the old value of the `msp` or `psp` it aliases.
-        for (i, &v) in regs.0.iter().enumerate() {
-            if read_reg(self.m, i) != v {
+        // `G` carries every register, and some are several names for one (sp, msp and msp_s,
+        // say). Write only those that differ from their values before this packet; comparing
+        // with the live values instead would let the unchanged old value of `msp` undo a new
+        // `sp` written just before it. If a packet changes two names for one register, the
+        // later one in `g` order wins.
+        let mut before = Regs::default();
+        self.read_registers(&mut before)?;
+        for (i, (&v, &old)) in regs.0.iter().zip(&before.0).enumerate() {
+            if v != old {
                 write_reg(self.m, i, v);
             }
         }
@@ -729,6 +736,12 @@ impl Link {
         if self.acks {
             self.send_raw(b"+")?;
         }
+        if refused(body) {
+            log::debug!(
+                "gdb: E01 for a memory access past 0xffffffff or a read over {MAX_READ} bytes"
+            );
+            return self.send_packet(ERROR_REPLY.to_vec());
+        }
         // The `+` above was the last one: `gdbstub` agrees to it and replies `OK`.
         if no_ack_mode {
             self.acks = false;
@@ -776,13 +789,20 @@ impl Link {
         }
         self.tx_buf.push(b);
         let n = self.tx_buf.len();
-        // `gdbstub` escapes `#` in bodies, so the first one ends the packet.
+        // `gdbstub` escapes `#` in bodies, so the first one ends the packet. Replies are
+        // bounded: the longest is an `m` reply, and `refused` caps those.
         if n >= 4 && self.tx_buf[n - 3] == b'#' {
             let packet = std::mem::take(&mut self.tx_buf);
-            self.send_raw(&packet)?;
-            self.last_sent = packet;
+            self.send_packet(packet)?;
             self.unanswered = false;
         }
+        Ok(())
+    }
+
+    /// Send a whole packet, keeping it for a client NAK.
+    fn send_packet(&mut self, packet: Vec<u8>) -> io::Result<()> {
+        self.send_raw(&packet)?;
+        self.last_sent = packet;
         Ok(())
     }
 
@@ -795,12 +815,50 @@ impl Link {
         }
         self.tx_buf.clear();
         if std::mem::take(&mut self.unanswered) {
-            let reply = b"$E01#a6".to_vec();
-            self.send_raw(&reply)?;
-            self.last_sent = reply;
+            self.send_packet(ERROR_REPLY.to_vec())?;
         }
         Ok(())
     }
+}
+
+/// The error reply the link sends itself.
+const ERROR_REPLY: &[u8] = b"$E01#a6";
+
+/// Longest `m` read served. GDB asks for at most `PacketSize / 2` bytes per `m` (`remote.c`,
+/// `remote_read_bytes_1`); the reply, two hex digits a byte, is then about `MAX_PACKET`
+/// bytes, and `gdbstub` reads it in one chunk.
+const MAX_READ: u64 = MAX_PACKET as u64 / 2;
+
+/// Whether the link answers `body` with `E01` itself instead of passing it to `gdbstub`: a
+/// memory access (`m`, `M`, `X`) whose range wraps past 0xFFFF_FFFF, or an `m` read longer
+/// than `MAX_READ`. `gdbstub` 0.7.10 overflows its address on a wrapping read of several
+/// chunks (a panic in debug builds), and the link holds a whole reply in memory (8 GiB for
+/// `m0,ffffffff`). Packets that do not parse are left to `gdbstub`.
+fn refused(body: &[u8]) -> bool {
+    let Some((&kind @ (b'm' | b'M' | b'X'), rest)) = body.split_first() else {
+        return false;
+    };
+    // `addr,len`, then (for `M` and `X`) `:` and the data.
+    let header = rest.split(|&b| b == b':').next().unwrap_or_default();
+    let mut fields = header.split(|&b| b == b',');
+    let (Some(addr), Some(len), None) = (fields.next(), fields.next(), fields.next()) else {
+        return false;
+    };
+    let (Some(addr), Some(len)) = (parse_hex(addr), parse_hex(len)) else {
+        return false;
+    };
+    let wraps = addr.checked_add(len).is_none_or(|end| end > 1 << 32);
+    wraps || (kind == b'm' && len > MAX_READ)
+}
+
+/// A hex number of 1 to 16 digits.
+fn parse_hex(digits: &[u8]) -> Option<u64> {
+    if !(1..=16).contains(&digits.len()) {
+        return None;
+    }
+    digits.iter().try_fold(0u64, |n, &c| {
+        Some(n << 4 | u64::from(char::from(c).to_digit(16)?))
+    })
 }
 
 fn checksum(body: &[u8]) -> u8 {
@@ -876,5 +934,29 @@ mod tests {
         assert!(Reg::from_raw_id(16).is_none());
         assert!(Reg::from_raw_id(24).is_none());
         assert!(Reg::from_raw_id(40).is_none());
+    }
+
+    #[test]
+    fn refused_memory_accesses() {
+        let refused = |body: &str| refused(body.as_bytes());
+        // Up to and including the last byte of the address space is fine.
+        assert!(!refused("mfffff800,800"));
+        assert!(!refused("Mffffffff,1:aa"));
+        assert!(!refused("X30000000,0:"));
+        assert!(refused("mfffff801,800"));
+        assert!(refused("Mffffffff,2:aabb"));
+        assert!(refused("Xffffffff,2:,:"), "data may hold `,` and `:`");
+        assert!(refused("m0,801"));
+        assert!(
+            !refused("M30000000,1000:00"),
+            "long writes are bounded by the packet"
+        );
+        assert!(refused("mffffffffffffffff,1"), "u64 overflow");
+        // Not a memory access, or not parseable: left to `gdbstub`.
+        assert!(!refused("qSupported:multiprocess+"));
+        assert!(!refused("mzz,4"));
+        assert!(!refused("m10"));
+        assert!(!refused("m1,2,3"));
+        assert!(!refused("m10000000000000000,1"), "17 digits");
     }
 }

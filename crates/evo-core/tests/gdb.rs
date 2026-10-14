@@ -392,6 +392,34 @@ fn malformed_packet_is_nacked() {
     assert_eq!(m.sched.now, 0, "nothing ran");
 }
 
+/// Memory accesses that wrap past 0xFFFF_FFFF, and reads longer than a reply can hold, get
+/// `E01` from the stub itself: `gdbstub` overflows on the first (a panic in debug builds), and
+/// would buffer gigabytes for the second.
+#[test]
+fn oversized_or_wrapping_memory_access_is_refused() {
+    let mut m = boot(LOOP);
+    session(&mut m, |c| {
+        assert_eq!(c.cmd("mfffff000,2000"), "E01", "wraps, over several chunks");
+        assert_eq!(c.cmd("mffffffff,2"), "E01", "wraps");
+        assert_eq!(c.cmd("m0,ffffffff"), "E01", "4 GiB");
+        assert_eq!(c.cmd("m30000000,801"), "E01", "one byte over the limit");
+        assert_eq!(c.cmd("Mffffffff,2:0102"), "E01", "write that wraps");
+        assert_eq!(c.cmd("Xfffffffe,4:abcd"), "E01", "binary write that wraps");
+        // GDB's own largest read (PacketSize / 2 bytes) and reads up to the top of memory
+        // are served.
+        assert_eq!(c.cmd("m30000000,800"), "0".repeat(0x1000));
+        assert_eq!(c.cmd("mfffffffe,2"), "0000");
+        assert_eq!(
+            c.cmd("Mfffffffe,2:0102").chars().next(),
+            Some('E'),
+            "unmapped"
+        );
+        assert_eq!(signal(&c.cmd("?")), "05", "the session goes on");
+        assert_eq!(c.cmd("D"), "OK");
+    })
+    .expect("serve");
+}
+
 #[test]
 fn no_ack_mode() {
     let mut m = boot(LOOP);
@@ -535,12 +563,60 @@ fn memory_access_has_no_side_effects() {
     );
 }
 
+/// `G` carries all registers, including several names for one register (sp, msp and msp_s in
+/// Secure Thread mode with SPSEL clear). Changing any one of them must stick.
+#[test]
+fn g_write_changes_aliased_registers() {
+    fn g_packet(regs: &[u32]) -> String {
+        let hexes: String = regs.iter().map(|&w| hex(w)).collect();
+        format!("G{hexes}")
+    }
+    let mut m = boot(LOOP);
+    session(&mut m, |c| {
+        let mut regs = words(&c.cmd("g"));
+        regs[13] = 0x3000_0700;
+        assert_eq!(c.cmd(&g_packet(&regs)), "OK", "sp");
+        let regs = words(&c.cmd("g"));
+        assert_eq!(
+            (regs[13], regs[17], regs[24]),
+            (0x3000_0700, 0x3000_0700, 0x3000_0700),
+            "sp, msp, msp_s"
+        );
+
+        let mut regs = words(&c.cmd("g"));
+        regs[17] = 0x3000_0600;
+        assert_eq!(c.cmd(&g_packet(&regs)), "OK", "msp");
+        let regs = words(&c.cmd("g"));
+        assert_eq!(
+            (regs[13], regs[17], regs[24]),
+            (0x3000_0600, 0x3000_0600, 0x3000_0600)
+        );
+
+        let mut regs = words(&c.cmd("g"));
+        regs[23] = 0x2000_0F00;
+        regs[26] = 0x3000_0400;
+        assert_eq!(c.cmd(&g_packet(&regs)), "OK", "msp_ns, psp_s");
+        let regs = words(&c.cmd("g"));
+        assert_eq!(
+            (regs[23], regs[26], regs[18]),
+            (0x2000_0F00, 0x3000_0400, 0x3000_0400)
+        );
+        assert_eq!(c.cmd("D"), "OK");
+    })
+    .expect("serve");
+    let r = &m.cpu.regs;
+    assert_eq!(
+        (r.msp.s, r.msp.ns, r.psp.s),
+        (0x3000_0600, 0x2000_0F00, 0x3000_0400)
+    );
+}
+
 #[test]
 fn writes_registers() {
     let mut m = boot(SLEEP);
     assert_eq!(m.run(100), StopReason::Idle);
     session(&mut m, |c| {
-        // `G` changes only what differs from the current values: here r1.
+        // `G` changes only what differs from the values before it: here r1.
         let mut regs = words(&c.cmd("g"));
         regs[1] = 0xCAFE_F00D;
         let g: String = regs.iter().map(|&w| hex(w)).collect();
