@@ -43,12 +43,17 @@ jobs:
       - run: cargo test --workspace
 
   difftest:
-    # enabled in Task 9
-    if: false
+    # Differential testing against Unicorn (GPL-2.0, test-only `difftest` feature).
     runs-on: ubuntu-latest
+    env:
+      DIFFTEST_CASES: "10000"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.98"
+          components: clippy
+      # unicorn-engine-sys builds Unicorn with CMake and runs bindgen (libclang).
+      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libclang-dev
+      - run: cargo clippy -p armv8m --all-targets --features difftest -- -D warnings
       - run: cargo test -p armv8m --features difftest

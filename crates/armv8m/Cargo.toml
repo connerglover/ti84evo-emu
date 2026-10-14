@@ -4,6 +4,14 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Differential testing against Unicorn (GPL-2.0). Test-only: never enabled by shipped binaries.
+difftest = ["dep:unicorn-engine"]
+
 [dependencies]
 serde.workspace = true
 log.workspace = true
+unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_arm"], optional = true }
+
+[dev-dependencies]
+proptest = "1"
