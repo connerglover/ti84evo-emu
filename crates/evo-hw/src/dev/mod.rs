@@ -9,3 +9,4 @@ pub mod storage;
 pub mod sysctl;
 pub mod timer;
 pub mod uart;
+pub mod usb;

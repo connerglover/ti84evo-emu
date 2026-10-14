@@ -3,6 +3,7 @@
 //! `Machine::with_dev`, so the device sees the current time and its IRQ changes reach the CPU.
 
 use evo_hw::dev::uart::Uart16550;
+use evo_hw::dev::usb::UsbTypeC;
 
 use crate::Machine;
 
@@ -39,5 +40,12 @@ impl Machine {
         self.with_dev(port.device(), |u: &mut Uart16550, ctx| {
             u.inject_rx(bytes, ctx)
         });
+    }
+
+    /// Set the USB Type-C CC1/CC2 attach state (`docs/hardware/usb.md`), each masked to 2
+    /// bits; 0 = unattached. The guest reads it at `0x4010_C01C` bits 9:8 / 11:10. It survives
+    /// a System reset (the cable stays plugged in).
+    pub fn set_usb_cc(&mut self, cc1: u8, cc2: u8) {
+        self.with_dev("usbtc", |t: &mut UsbTypeC, _| t.set_cc(cc1, cc2));
     }
 }

@@ -36,6 +36,10 @@ The ID check that kills the BSP:
 | +000 | R/W | bit 1 = soft reset, must self-clear (poll without timeout at 0x0012746a) |
 | others | storage | +100 bit 4 is polled about 2000 times after `= 0x10`, then given up (bounded) |
 
+Implemented as `evo_hw::dev::usb::Usb`: byte/halfword/word storage, +E0/+E4 read the
+constants above and ignore writes, +000 bit 1 reads 0 at once. Every reset returns to the
+power-on state.
+
 IRQ 16 (OTG) is never needed for boot. The real ID and version values are unknown. Get them
 from hardware or MCCI headers.
 
@@ -58,6 +62,8 @@ Accesses seen: +84 RMW 0, +1A4 = 0x95, and byte and halfword accesses over +00..
 - +0x1C bits 9:8 and 11:10 read the host-controlled CC1/CC2 state (power-on 0 =
   unattached); guest writes to those bits are dropped.
 - IRQ 28 never asserted.
+- System reset clears the registers but keeps the host CC state (the cable stays plugged in);
+  power-on clears both. The host sets it with `Machine::set_usb_cc`.
 
 ## Open questions
 

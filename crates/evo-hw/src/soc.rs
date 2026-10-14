@@ -9,6 +9,7 @@ use crate::dev::storage::Storage;
 use crate::dev::sysctl::{Cru, Spctrl};
 use crate::dev::timer::Timer;
 use crate::dev::uart::Uart16550;
+use crate::dev::usb::{Usb, UsbTypeC};
 
 /// Name of the flash buffer (the `MemoryMap` ROM a flash controller writes through
 /// `DevCtx::buffer_mut`).
@@ -53,4 +54,7 @@ pub fn attach(map: &mut MemoryMap) {
     // Polled crypto blocks (crypto.md): secure aliases only, IRQs 26/23 never asserted.
     map.add_device("trng", 0x5010_A000, 0x1000, Box::new(Trng::new(TRNG_SEED)));
     map.add_device("sha", 0x5000_2000, 0x1000, Box::new(Sha256Engine::new()));
+    // USB OTG minimum and the Type-C stub (usb.md): NS BSP only, IRQs 16/28 never asserted.
+    map.add_device("usb", 0x4000_3000, 0x1000, Box::new(Usb::new()));
+    map.add_device("usbtc", 0x4010_C000, 0x1000, Box::new(UsbTypeC::new()));
 }

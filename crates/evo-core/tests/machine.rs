@@ -914,6 +914,20 @@ fn uart_host_api() {
     assert_eq!(m.cpu.regs.r[3], u32::from(b'z'));
 }
 
+#[test]
+fn usb_cc_host_api() {
+    const L_USBTC: u32 = LIT + 0x20;
+    // ldr r0, =USBTC ; ldr r2, [r0, #0x1C] (CC) ; b .
+    let mut p = Payload::device_test(&[I::Ld(0, L_USBTC), I::H(0x69C2), I::H(B_SELF)]);
+    p.word(L_USBTC, 0x4010_C000);
+    let mut m = p.boot();
+    m.set_usb_cc(1, 2);
+    m.run(100);
+    assert_eq!(m.cpu.regs.r[2], 0x900);
+    let tc = m.bus.device::<evo_hw::dev::usb::UsbTypeC>("usbtc");
+    assert_eq!(tc.map(|t| t.cc()), Some((1, 2)));
+}
+
 /// An erased part with 0xA5 at flash offset 0x9_0000 (the ITS/PS area, outside both image
 /// slots) and 0x12 in security-register byte 0.
 fn nv_with_marks(fill: u8) -> evo_core::NvState {
