@@ -20,6 +20,12 @@
 //! event. If no wake-up time exists the CPU would sleep forever, and `run` returns
 //! [`StopReason::Idle`] at once instead of waiting out its budget. A debugger halt also ends
 //! the sleep ([`Machine::wake`]).
+//!
+//! # Recent trace
+//!
+//! The machine remembers the last [`RECENT_STEPS`] CPU steps (cycle count, security state and
+//! PC; three stores per step) and formats them only when asked
+//! ([`Machine::recent_trace`]), e.g. to show how the guest reached a lockup.
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -46,6 +52,42 @@ pub const SRAM_NS: u32 = 0x2000_0000;
 pub const SRAM_S: u32 = 0x3000_0000;
 /// Erased NOR flash reads as all ones.
 const ERASED: u8 = 0xFF;
+/// CPU steps [`Machine::recent_trace`] remembers.
+pub const RECENT_STEPS: usize = 64;
+
+/// One remembered CPU step: what the trace line printed before it shows.
+#[derive(Clone, Copy, Default)]
+struct RecentStep {
+    cycles: u64,
+    pc: u32,
+    secure: bool,
+}
+
+/// Ring buffer of the last [`RECENT_STEPS`] CPU steps.
+#[derive(Default)]
+struct RecentSteps {
+    /// Up to `RECENT_STEPS` entries; once full, `next` is the oldest.
+    steps: Vec<RecentStep>,
+    /// Where the next step is written once `steps` is full.
+    next: usize,
+}
+
+impl RecentSteps {
+    fn push(&mut self, step: RecentStep) {
+        if self.steps.len() < RECENT_STEPS {
+            self.steps.push(step);
+        } else {
+            self.steps[self.next] = step;
+            self.next = (self.next + 1) % RECENT_STEPS;
+        }
+    }
+
+    /// Oldest first.
+    fn iter(&self) -> impl Iterator<Item = &RecentStep> {
+        let (newer, older) = self.steps.split_at(self.next);
+        older.iter().chain(newer)
+    }
+}
 
 /// Why [`Machine::run`] or [`Machine::step`] returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +131,9 @@ pub struct Machine {
     sleep: Option<SleepKind>,
     /// The breakpoint the last `run` stopped at, which the next `run` steps over.
     stopped_at: Option<u32>,
+    /// Debugging aid, not machine state: not saved, and empty after a restore.
+    #[serde(skip)]
+    recent: RecentSteps,
 }
 
 impl Machine {
@@ -127,6 +172,7 @@ impl Machine {
             boot_vtor: vtor,
             sleep: None,
             stopped_at: None,
+            recent: RecentSteps::default(),
         })
     }
 
@@ -210,18 +256,34 @@ impl Machine {
     /// One trace line for the instruction at the PC, which is about to execute:
     /// `{cycles:>12} {S|N} {pc:08x}: {disasm}`. The instruction is read without touching
     /// devices or the unmapped log; code that cannot be read that way shows as `<unreadable>`.
-    pub fn trace_line(&mut self) -> String {
-        let pc = self.cpu.regs.pc;
-        let sec = match self.cpu.regs.sec {
-            Sec::Secure => 'S',
-            Sec::NonSecure => 'N',
+    pub fn trace_line(&self) -> String {
+        let step = RecentStep {
+            cycles: self.sched.now,
+            pc: self.cpu.regs.pc,
+            secure: self.cpu.regs.sec == Sec::Secure,
         };
-        let text = self.disasm_at(pc);
-        let text = text.as_deref().unwrap_or("<unreadable>");
-        format!("{:>12} {sec} {pc:08x}: {text}", self.sched.now)
+        self.format_step(&step)
     }
 
-    fn disasm_at(&mut self, pc: u32) -> Option<String> {
+    /// The trace lines ([`trace_line`](Self::trace_line)) of the last [`RECENT_STEPS`] CPU
+    /// steps, oldest first; fewer if fewer have run. The last line is the most recent step:
+    /// after a lockup, the instruction (or exception entry) that locked up.
+    ///
+    /// Only the cycle count, security state and PC are recorded as the machine runs; the
+    /// instruction is disassembled from memory now, so code that was overwritten since shows
+    /// its new contents.
+    pub fn recent_trace(&self) -> Vec<String> {
+        self.recent.iter().map(|s| self.format_step(s)).collect()
+    }
+
+    fn format_step(&self, step: &RecentStep) -> String {
+        let sec = if step.secure { 'S' } else { 'N' };
+        let text = self.disasm_at(step.pc);
+        let text = text.as_deref().unwrap_or("<unreadable>");
+        format!("{:>12} {sec} {:08x}: {text}", step.cycles, step.pc)
+    }
+
+    fn disasm_at(&self, pc: u32) -> Option<String> {
         let hw1 = self.bus.peek(pc, 2)? as u16;
         let (instr, len) = if is_32bit(hw1) {
             let hw2 = self.bus.peek(pc.wrapping_add(2), 2)? as u16;
@@ -236,6 +298,11 @@ impl Machine {
     fn step_cpu(&mut self) -> Option<StopReason> {
         self.stopped_at = None;
         let pc = self.cpu.regs.pc;
+        self.recent.push(RecentStep {
+            cycles: self.sched.now,
+            pc,
+            secure: self.cpu.regs.sec == Sec::Secure,
+        });
         self.bus.pc_hint = pc;
         let stop = match self.cpu.step(&mut self.bus) {
             StepResult::Executed { cycles } => {

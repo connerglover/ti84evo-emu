@@ -451,6 +451,53 @@ fn trace_line_shows_the_next_instruction() {
 }
 
 #[test]
+fn recent_trace_holds_the_last_64_steps() {
+    let mut m = looping().boot();
+    assert!(m.recent_trace().is_empty(), "nothing has run yet");
+
+    // Each step adds the line `--trace` prints before it.
+    let mut expected = Vec::new();
+    for _ in 0..3 {
+        expected.push(m.trace_line());
+        m.step();
+    }
+    assert_eq!(m.recent_trace(), expected);
+
+    // A longer run keeps only the last 64 steps, oldest first.
+    let mut traced = Vec::new();
+    let stop = m.run_with(1_000, |m| {
+        traced.push(m.trace_line());
+        ControlFlow::Continue(())
+    });
+    assert_eq!(stop, StopReason::CycleLimit);
+    assert!(traced.len() > 64);
+    assert_eq!(m.recent_trace(), traced[traced.len() - 64..]);
+}
+
+#[test]
+fn recent_trace_ends_at_the_lockup() {
+    // As in `lockup_reported`: `udf` in the reset handler, and again in HardFault.
+    let mut p = Payload::new();
+    p.vector(1, CODE)
+        .vector(HARDFAULT, 0x210)
+        .code(CODE, &[UDF0])
+        .code(0x210, &[UDF0]);
+    let mut m = p.boot();
+    assert_eq!(m.run(1_000_000), StopReason::Lockup { pc: addr(0x210) });
+    let recent = m.recent_trace();
+    assert!(
+        recent[0].ends_with(" S 100b0600: udf #0"),
+        "first step: {recent:?}"
+    );
+    assert!(
+        recent
+            .last()
+            .is_some_and(|l| l.ends_with(" S 100b0610: udf #0")),
+        "last step is the one that locked up: {recent:?}"
+    );
+}
+
+#[test]
 fn image_outside_flash_is_an_error() {
     // Ruling R16: placement is checked before the memory map is built, so a slot past the
     // 8 MiB flash is an `ImageError`, not a panic.

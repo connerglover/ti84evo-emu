@@ -131,8 +131,8 @@ impl MemoryMap {
 
     /// Read `width` (1, 2 or 4) bytes for a debugger. Only RAM and ROM can be peeked: devices
     /// return `None` because reading a register can have side effects, and unmapped space
-    /// returns `None` without being logged.
-    pub fn peek(&mut self, addr: u32, width: u8) -> Option<u32> {
+    /// returns `None` without being logged. Reads change nothing, so this takes `&self`.
+    pub fn peek(&self, addr: u32, width: u8) -> Option<u32> {
         if !matches!(width, 1 | 2 | 4) {
             return None;
         }
