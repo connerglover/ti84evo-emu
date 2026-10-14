@@ -77,8 +77,10 @@ fn skip_tlvs(bytes: &[u8], img_end: usize) -> usize {
 }
 
 impl McubootImage {
-    /// Offset just past this image's header, payload and TLV areas.
-    pub(crate) fn end_with_tlvs(&self, pkg_bytes: &[u8]) -> usize {
+    /// Package offset just past this image's header, payload and TLV areas
+    /// (`pkg_bytes` is [`Package::bytes`]): the end of what
+    /// [`Layout::place`](crate::Layout::place) copies into the slot.
+    pub fn end_with_tlvs(&self, pkg_bytes: &[u8]) -> usize {
         skip_tlvs(pkg_bytes, self.body.end)
     }
 }

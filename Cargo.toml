@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/armv8m", "crates/evo-core", "crates/evo-hw", "crates/evo-image"]
+members = ["crates/armv8m", "crates/evo-core", "crates/evo-hw", "crates/evo-image", "apps/evo-cli"]
 
 [workspace.package]
 edition = "2024"
@@ -12,3 +12,4 @@ serde_json = "1"
 log = "0.4"
 thiserror = "2"
 zip = { version = "9", default-features = false, features = ["deflate"] }
+clap = { version = "4.6", features = ["derive"] }
