@@ -683,6 +683,25 @@ pub enum Instr {
         rotate: u8,
         signed: bool,
     },
+    /// `SG`: Secure gateway, the entry point of a Non-secure callable function.
+    Sg,
+    /// `BXNS rm`: branch and exchange, to Non-secure state when `rm` bit 0 is clear (Secure
+    /// state only).
+    Bxns {
+        rm: Reg,
+    },
+    /// `BLXNS rm`: call, Non-secure when `rm` bit 0 is clear (Secure state only).
+    Blxns {
+        rm: Reg,
+    },
+    /// `TT`/`TTT`/`TTA`/`TTAT rd, rn`: test target. `alt` (A) queries the Non-secure MPU from
+    /// Secure state, `unpriv` (T) unprivileged permissions.
+    Tt {
+        rd: Reg,
+        rn: Reg,
+        alt: bool,
+        unpriv: bool,
+    },
     Undefined {
         raw: u32,
     },

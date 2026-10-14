@@ -211,6 +211,7 @@ fn sysm_name(sysm: u8, mask: Option<u8>) -> String {
         0x92 => "BASEPRI_MAX_NS".to_string(),
         0x93 => "FAULTMASK_NS".to_string(),
         0x94 => "CONTROL_NS".to_string(),
+        0x98 => "SP_NS".to_string(),
         _ => format!("{sysm:#x}"),
     }
 }
@@ -500,6 +501,21 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
         }
         Instr::Bx { rm } => format!("bx {}", r(rm)),
         Instr::Blx { rm } => format!("blx {}", r(rm)),
+        Instr::Bxns { rm } => format!("bxns {}", r(rm)),
+        Instr::Blxns { rm } => format!("blxns {}", r(rm)),
+        Instr::Sg => "sg".to_string(),
+        Instr::Tt {
+            rd,
+            rn,
+            alt,
+            unpriv,
+        } => format!(
+            "tt{}{} {}, {}",
+            if alt { "a" } else { "" },
+            if unpriv { "t" } else { "" },
+            r(rd),
+            r(rn)
+        ),
         Instr::It { firstcond, mask } => it_text(firstcond, mask),
         Instr::LoadImm {
             rt,

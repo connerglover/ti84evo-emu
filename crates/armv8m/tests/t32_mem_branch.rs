@@ -580,6 +580,8 @@ fn msr_ns_from_nonsecure_is_ignored() {
     // msr MSP_NS, r0 ; mrs r1, MSP_NS
     let code = [0xF380, 0x8888, 0xF3EF, 0x8188];
     let (mut cpu, mut bus) = cpu_with_code(&code);
+    // SAU_CTRL.ALLNS: memory is Non-secure, so Non-secure code may execute from it.
+    cpu.ppb_write32(0xE000_EDD0, 0b10);
     cpu.regs.sec = Sec::NonSecure;
     cpu.regs.msp.ns = 0x2000_0100;
     cpu.regs.msp.s = 0x2000_0200;

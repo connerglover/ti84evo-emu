@@ -284,6 +284,12 @@ fn special_data(hw: u16) -> Instr {
             rm,
             setflags: false,
         },
+        // BXNS / BLXNS: 0100 0111 L Rm 100 (SP and PC are UNPREDICTABLE).
+        _ if hw & 7 == 0b100 => match rm {
+            13 | 15 => Instr::Undefined { raw: u32::from(hw) },
+            _ if hw & 0x80 == 0 => Instr::Bxns { rm },
+            _ => Instr::Blxns { rm },
+        },
         _ if hw & 7 != 0 => Instr::Undefined { raw: u32::from(hw) },
         _ if hw & 0x80 == 0 => Instr::Bx { rm },
         _ => Instr::Blx { rm },

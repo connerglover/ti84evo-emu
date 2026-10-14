@@ -4,8 +4,9 @@ use super::Flow;
 use crate::cpu::Cpu;
 use crate::exception::Fault;
 use crate::instr::{HintOp, Instr};
-use crate::regs::Sec;
+use crate::regs::{Registers, Sec};
 use crate::scs::PRIORITY_MASK;
+use crate::scs::sau::Attr;
 
 /// `CPACR.CPn` grants access: 0b01 privileged only, 0b11 full.
 fn cp_enabled(cpu: &Cpu, cp: u32) -> bool {
@@ -20,13 +21,16 @@ fn cp_enabled(cpu: &Cpu, cp: u32) -> bool {
 const APSR_NZCVQ: u32 = 0xF800_0000;
 const APSR_GE: u32 = 0x000F_0000;
 
+/// `SP_NS`: the Non-secure stack pointer of the current mode (Secure state only).
+const SYSM_SP_NS: u8 = 0x98;
+
 /// Resolve a SYSm value to the bank it addresses and its unbanked number. The `_NS` aliases
-/// (0x88..=0x94) reach the Non-Secure bank from Secure state and do not exist otherwise;
-/// everything numbered 8 and up is privileged-only except reads of CONTROL.
+/// (0x88..=0x94 and SP_NS, 0x98) reach the Non-Secure bank from Secure state and do not exist
+/// otherwise; everything numbered 8 and up is privileged-only except reads of CONTROL.
 fn resolve_sysm(cpu: &Cpu, sysm: u8, write: bool) -> Option<(Sec, u8)> {
     let sec = cpu.regs.sec;
     let (bank, base) = if sysm & 0x80 != 0 {
-        if sec != Sec::Secure || !(0x88..=0x94).contains(&sysm) {
+        if sec != Sec::Secure || !((0x88..=0x94).contains(&sysm) || sysm == SYSM_SP_NS) {
             return None;
         }
         (Sec::NonSecure, sysm & 0x7F)
@@ -35,6 +39,11 @@ fn resolve_sysm(cpu: &Cpu, sysm: u8, write: bool) -> Option<(Sec, u8)> {
     };
     // CONTROL (20) can be read, but not written, without privilege.
     (base < 8 || cpu.is_privileged() || (!write && base == 20)).then_some((bank, base))
+}
+
+/// Whether `SP_NS`, the Non-secure stack pointer of the current mode, is PSP_NS.
+fn sp_ns_is_psp(r: &Registers) -> bool {
+    !r.handler_mode() && r.control.ns & 0b10 != 0
 }
 
 /// `MRS`: unknown, inaccessible or reserved registers read as zero.
@@ -66,6 +75,8 @@ fn read_sysreg(cpu: &Cpu, sysm: u8) -> u32 {
         17 | 18 => u32::from(*r.basepri.get(bank)),
         19 => u32::from(*r.faultmask.get(bank)),
         20 => *r.control.get(bank),
+        _ if sysm == SYSM_SP_NS && sp_ns_is_psp(r) => r.psp.ns,
+        _ if sysm == SYSM_SP_NS => r.msp.ns,
         _ => 0,
     }
 }
@@ -119,17 +130,81 @@ fn write_sysreg(cpu: &mut Cpu, sysm: u8, mask: u8, v: u32) {
         }
         20 => {
             let old = *r.control.get(bank);
-            // nPRIV, SPSEL and FPCA; SFPA (bit 3) exists only in the Secure bank. SPSEL is
-            // read-only in Handler mode.
-            let keep = if bank == Sec::Secure { 0xF } else { 0x7 };
-            let mut new = v & keep;
+            // nPRIV and SPSEL are banked. Without an FPU, FPCA (which is not banked) and SFPA
+            // are RES0. SPSEL is read-only in Handler mode.
+            let mut new = v & 0b11;
             if handler {
                 new = (new & !2) | (old & 2);
             }
             *r.control.get_mut(bank) = new;
         }
+        _ if sysm == SYSM_SP_NS && sp_ns_is_psp(r) => r.psp.ns = v & !3,
+        _ if sysm == SYSM_SP_NS => r.msp.ns = v & !3,
         _ => {}
     }
+}
+
+/// The `TT` response word for `addr`. Secure state sees the security attribution (S, SAU and
+/// IDAU regions, NSR/NSRW); everyone sees the MPU permissions (R/RW) of the current security
+/// state's MPU, or of the Non-secure MPU for `alt` (TTA/TTAT), at the current privilege or
+/// unprivileged for `unpriv` (TTT/TTAT). The MPU region number is reported to privileged code
+/// and for `alt`.
+fn tt_response(cpu: &Cpu, addr: u32, alt: bool, unpriv: bool) -> u32 {
+    const MRVALID: u32 = 1 << 16;
+    const SRVALID: u32 = 1 << 17;
+    const R: u32 = 1 << 18;
+    const RW: u32 = 1 << 19;
+    const NSR: u32 = 1 << 20;
+    const NSRW: u32 = 1 << 21;
+    const S: u32 = 1 << 22;
+    const IRVALID: u32 = 1 << 23;
+
+    let secure = cpu.regs.sec == Sec::Secure;
+    let mut resp = 0;
+    let mut addr_secure = false;
+    if secure {
+        let a = cpu.attribution(addr);
+        if let Some(r) = a.sregion {
+            resp |= (u32::from(r) << 8) | SRVALID;
+        }
+        if let Some(r) = a.iregion {
+            resp |= (u32::from(r) << 24) | IRVALID;
+        }
+        addr_secure = a.attr != Attr::NonSecure;
+        if addr_secure {
+            resp |= S;
+        }
+    }
+    let mpu_sec = match (alt, cpu.regs.sec) {
+        (false, sec) => sec,
+        (true, Sec::Secure) => Sec::NonSecure,
+        (true, Sec::NonSecure) => Sec::Secure,
+    };
+    let privileged = !unpriv && (cpu.regs.handler_mode() || cpu.regs.control.get(mpu_sec) & 1 == 0);
+    let negative = cpu.execution_priority() < 0;
+    let (read, write, region) = cpu
+        .scs
+        .mpu
+        .get(mpu_sec)
+        .permissions(addr, privileged, negative);
+    if let Some(r) = region
+        && (cpu.is_privileged() || alt)
+    {
+        resp |= u32::from(r) | MRVALID;
+    }
+    if read {
+        resp |= R;
+        if secure && !addr_secure {
+            resp |= NSR;
+        }
+    }
+    if write {
+        resp |= RW;
+        if secure && !addr_secure {
+            resp |= NSRW;
+        }
+    }
+    resp
 }
 
 /// Execute a system instruction; `None` if `instr` is not one.
@@ -174,6 +249,33 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
         }
         Instr::Mrs { rd, sysm } => {
             let v = read_sysreg(cpu, sysm);
+            cpu.set_reg(rd, v);
+            Flow::Next
+        }
+        // SG from Non-secure state (only reachable in a Non-secure callable region: anywhere
+        // else in Secure memory the fetch faults INVEP) enters Secure state and clears LR[0],
+        // so that the Secure function returns to Non-secure state with BXNS LR. Elsewhere,
+        // and in Secure state, it is a NOP.
+        Instr::Sg => {
+            if cpu.regs.sec == Sec::NonSecure
+                && cpu.security_of(cpu.regs.pc) == Attr::NonSecureCallable
+            {
+                cpu.regs.lr &= !1;
+                cpu.regs.sec = Sec::Secure;
+            }
+            Flow::Next
+        }
+        // TTA/TTAT are UNDEFINED in Non-secure state.
+        Instr::Tt { alt: true, .. } if cpu.regs.sec != Sec::Secure => {
+            Flow::Fault(Fault::UndefInstr)
+        }
+        Instr::Tt {
+            rd,
+            rn,
+            alt,
+            unpriv,
+        } => {
+            let v = tt_response(cpu, cpu.reg(rn), alt, unpriv);
             cpu.set_reg(rd, v);
             Flow::Next
         }

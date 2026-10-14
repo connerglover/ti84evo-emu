@@ -1,5 +1,6 @@
 //! Memory Protection Unit registers (one instance per security state). The registers are
-//! stored so firmware can program and read them back; the protection itself is not enforced.
+//! stored so firmware can program and read them back, and `TT` reports the permissions they
+//! describe; the protection itself is not enforced on accesses.
 
 use serde::{Deserialize, Serialize};
 
@@ -7,6 +8,13 @@ use serde::{Deserialize, Serialize};
 pub const REGIONS: usize = 8;
 /// `MPU_TYPE`: DREGION = 8, unified.
 pub const TYPE: u32 = (REGIONS as u32) << 8;
+
+// MPU_CTRL fields.
+const CTRL_ENABLE: u32 = 1 << 0;
+const CTRL_HFNMIENA: u32 = 1 << 1;
+const CTRL_PRIVDEFENA: u32 = 1 << 2;
+/// Region addresses have 32-byte granularity.
+const GRANULE: u32 = 0x1F;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mpu {
@@ -28,6 +36,48 @@ impl Mpu {
             (self.rnr & !3) + alias
         } as usize;
         (r < REGIONS).then_some(r)
+    }
+
+    /// Data access permissions at `addr` as `TT` reports them: `(read, write, region)`.
+    /// `negative_priority` is true while executing at a priority below 0 (HardFault, NMI), where
+    /// the MPU is bypassed unless `HFNMIENA` is set. The default memory map grants everything
+    /// except unprivileged access to the PPB.
+    pub fn permissions(
+        &self,
+        addr: u32,
+        privileged: bool,
+        negative_priority: bool,
+    ) -> (bool, bool, Option<u8>) {
+        let ppb = (0xE000_0000..=0xE00F_FFFF).contains(&addr);
+        if self.ctrl & CTRL_ENABLE == 0
+            || ppb
+            || (negative_priority && self.ctrl & CTRL_HFNMIENA == 0)
+        {
+            let ok = privileged || !ppb;
+            return (ok, ok, None);
+        }
+        let mut hits = (0..REGIONS).filter(|&r| {
+            let rlar = self.rlar[r];
+            rlar & 1 != 0 && self.rbar[r] & !GRANULE <= addr && addr <= rlar | GRANULE
+        });
+        match (hits.next(), hits.next()) {
+            (Some(r), None) => {
+                // RBAR.AP: 00 RW privileged, 01 RW any, 10 RO privileged, 11 RO any.
+                let (read, write) = match (self.rbar[r] >> 1) & 3 {
+                    0b00 => (privileged, privileged),
+                    0b01 => (true, true),
+                    0b10 => (privileged, false),
+                    _ => (true, false),
+                };
+                (read, write, Some(r as u8))
+            }
+            // Overlapping regions: no access.
+            (Some(_), Some(_)) => (false, false, None),
+            (None, _) => {
+                let background = privileged && self.ctrl & CTRL_PRIVDEFENA != 0;
+                (background, background, None)
+            }
+        }
     }
 
     /// Read the register at offset `off` from `MPU_TYPE` (0xE000_ED90); `None` if unimplemented.

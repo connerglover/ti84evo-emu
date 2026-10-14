@@ -10,6 +10,7 @@ use crate::exec::{self, Flow};
 use crate::instr::Instr;
 use crate::regs::{Registers, Sec};
 use crate::scs::Scs;
+use crate::scs::sau::{Attr, Idau, IdauHandle, SecAttr};
 
 /// Outcome of one `Cpu::step`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +34,9 @@ pub struct Cpu {
     pub scs: Scs,
     /// While locked up: the priority the lockup is held at (see `locked_up`).
     pub(crate) lockup: Option<i32>,
+    /// The SoC's attribution unit (configuration: kept across reset, not serialized).
+    #[serde(skip)]
+    idau: IdauHandle,
 }
 
 impl Default for Cpu {
@@ -48,18 +52,27 @@ fn execute_never(addr: u32) -> bool {
 }
 
 /// UNPREDICTABLE instructions inside an IT block, which this implementation makes UNDEFINED:
-/// conditional branches, CBZ/CBNZ, CPS and IT anywhere in a block, and instructions that write
-/// the PC anywhere but last.
+/// conditional branches, CBZ/CBNZ, CPS, IT and SG anywhere in a block, and instructions that
+/// write the PC anywhere but last.
 fn unpredictable_in_it(instr: &Instr, last: bool) -> bool {
     match *instr {
-        Instr::BCond { .. } | Instr::Cbz { .. } | Instr::Cps { .. } | Instr::It { .. } => true,
+        Instr::BCond { .. }
+        | Instr::Cbz { .. }
+        | Instr::Cps { .. }
+        | Instr::It { .. }
+        | Instr::Sg => true,
         _ => !last && writes_pc(instr),
     }
 }
 
 fn writes_pc(instr: &Instr) -> bool {
     match *instr {
-        Instr::B { .. } | Instr::Bl { .. } | Instr::Bx { .. } | Instr::Blx { .. } => true,
+        Instr::B { .. }
+        | Instr::Bl { .. }
+        | Instr::Bx { .. }
+        | Instr::Blx { .. }
+        | Instr::Bxns { .. }
+        | Instr::Blxns { .. } => true,
         Instr::Tb { .. } => true,
         Instr::Pop { regs } | Instr::Ldm { regs, .. } | Instr::Ldmdb { regs, .. } => {
             regs & 0x8000 != 0
@@ -93,14 +106,17 @@ impl Cpu {
             exclusive: None,
             scs: Scs::default(),
             lockup: None,
+            idau: IdauHandle::default(),
         }
     }
 
     /// Reset: VTOR takes its reset value (see `set_vtor`, default 0), then MSP_S and PC are
-    /// loaded from the Secure vector table.
+    /// loaded from the Secure vector table. The installed IDAU is kept; the SAU resets disabled.
     pub fn reset(&mut self, bus: &mut impl Bus) {
         let init_vtor = self.scs.scb.init_vtor;
+        let idau = self.idau.clone();
         *self = Self::new();
+        self.idau = idau;
         self.scs.scb.init_vtor = init_vtor;
         self.scs.scb.vtor = init_vtor;
         let acc = self.access(AccessKind::Read);
@@ -110,6 +126,40 @@ impl Cpu {
             self.regs.pc = pc & !1;
             self.regs.xpsr.t = pc & 1 != 0;
         }
+    }
+
+    /// Install the SoC's IDAU (default: `DefaultIdau`, address bit 28 set is Secure).
+    pub fn set_idau(&mut self, idau: Box<dyn Idau>) {
+        self.idau = IdauHandle::new(idau);
+    }
+
+    /// Security attribution of `addr`: the SAU combined with the IDAU (most secure wins); the
+    /// system space from `0xE000_0000` is `Exempt`.
+    pub fn security_of(&self, addr: u32) -> Attr {
+        self.attribution(addr).attr
+    }
+
+    /// `SecurityCheck()` for `addr`, with the region numbers `TT` reports.
+    pub(crate) fn attribution(&self, addr: u32) -> SecAttr {
+        self.scs.sau.check(addr, self.idau.get())
+    }
+
+    /// The attributes of a data access to `addr` by security state `from` (`acc.secure` is
+    /// replaced): Non-secure memory is accessed Non-secure even from Secure state, exempt memory
+    /// in state `from`. `None` when Non-secure state reaches Secure or Non-secure callable
+    /// memory, which is a SecureFault AUVIOL.
+    pub(crate) fn attribute(&self, addr: u32, acc: Access, from: Sec) -> Option<Access> {
+        let secure = match self.security_of(addr) {
+            Attr::Exempt => from == Sec::Secure,
+            Attr::NonSecure => false,
+            Attr::Secure | Attr::NonSecureCallable => {
+                if from == Sec::NonSecure {
+                    return None;
+                }
+                true
+            }
+        };
+        Some(Access { secure, ..acc })
     }
 
     /// Handler mode, or Thread mode with CONTROL.nPRIV clear.
@@ -126,12 +176,45 @@ impl Cpu {
         }
     }
 
-    /// Fetch and decode the instruction at `addr`.
+    /// Fetch and decode the instruction at `addr` for execution. The fetch's security is the
+    /// attribution of `addr`, which must match the current security state: Non-secure code may
+    /// enter Secure memory only at an `SG` in a Non-secure callable region (else INVEP), and
+    /// Secure code reaches Non-secure memory only through BXNS/BLXNS (else INVTRAN).
     fn fetch(&self, bus: &mut impl Bus, addr: u32) -> Result<(Instr, u8), Fault> {
+        let attr = self.security_of(addr);
+        let sec = self.regs.sec;
+        match (sec, attr) {
+            (Sec::NonSecure, Attr::Secure) => return Err(Fault::InvEp),
+            (Sec::Secure, Attr::NonSecure) => return Err(Fault::InvTran),
+            _ => {}
+        }
         if execute_never(addr) {
             return Err(Fault::IAccViol);
         }
-        let acc = self.access(AccessKind::Fetch);
+        let secure = match attr {
+            Attr::Exempt => sec == Sec::Secure,
+            Attr::NonSecure => false,
+            Attr::Secure | Attr::NonSecureCallable => true,
+        };
+        let decoded = self.read_instr(bus, addr, secure)?;
+        if sec == Sec::NonSecure && attr == Attr::NonSecureCallable && decoded.0 != Instr::Sg {
+            return Err(Fault::InvEp);
+        }
+        Ok(decoded)
+    }
+
+    /// Read and decode the instruction at `addr` with a fetch of security `secure`.
+    fn read_instr(
+        &self,
+        bus: &mut impl Bus,
+        addr: u32,
+        secure: bool,
+    ) -> Result<(Instr, u8), Fault> {
+        let acc = Access {
+            kind: AccessKind::Fetch,
+            secure,
+            privileged: self.is_privileged(),
+        };
         let hw1 = bus.read16(addr, acc).map_err(|_| Fault::IBusErr)?;
         if is_32bit(hw1) {
             let hw2 = bus
@@ -143,9 +226,14 @@ impl Cpu {
         }
     }
 
-    /// Fetch and decode the instruction at `addr`; returns it with its length (2 or 4).
+    /// Fetch and decode the instruction at `addr`; returns it with its length (2 or 4). Unlike
+    /// execution this ignores the security state (a debugger view), but not Execute Never.
     pub fn decode_at(&self, bus: &mut impl Bus, addr: u32) -> Option<(Instr, u8)> {
-        self.fetch(bus, addr).ok()
+        if execute_never(addr) {
+            return None;
+        }
+        let secure = self.security_of(addr) != Attr::NonSecure;
+        self.read_instr(bus, addr, secure).ok()
     }
 
     /// Value of register `n` as read by an instruction (PC reads as address + 4).
@@ -180,13 +268,24 @@ impl Cpu {
     }
 
     /// `BXWritePC` / `LoadWritePC`: in Handler mode an EXC_RETURN value (0xFF00_0000 and up)
-    /// requests an exception return, which `step` performs; otherwise an interworking branch.
-    pub(crate) fn bx_write_pc(&mut self, addr: u32) -> Flow {
-        // Task 8: FNC_RETURN (0xFEFF_FFxx) from Secure state returns from a Non-secure call.
+    /// requests an exception return, and in either mode an FNC_RETURN value (0xFE00_0000 and
+    /// up) a function return from a BLXNS call; `step` performs both. Otherwise an
+    /// interworking branch. With `allow_ns` (BXNS) a target with bit 0 clear continues in
+    /// Non-secure state (in Thumb state: bit 0 selects the security state instead).
+    pub(crate) fn bx_write_pc(&mut self, addr: u32, allow_ns: bool) -> Flow {
         if self.regs.handler_mode() && addr >> 24 == 0xFF {
             return Flow::ExcReturn(addr);
         }
-        self.blx_write_pc(addr);
+        if addr >> 24 == 0xFE {
+            return Flow::FncReturn;
+        }
+        if allow_ns && addr & 1 == 0 {
+            self.regs.sec = Sec::NonSecure;
+            self.regs.xpsr.t = true;
+            self.regs.pc = addr;
+        } else {
+            self.blx_write_pc(addr);
+        }
         Flow::Branched
     }
 
@@ -281,6 +380,14 @@ impl Cpu {
         } else {
             Flow::Next
         };
+        // A branch to FNC_RETURN completes only if the function return does.
+        let flow = match flow {
+            Flow::FncReturn => match self.function_return(bus) {
+                Ok(()) => Flow::Branched,
+                Err(f) => Flow::Fault(f),
+            },
+            flow => flow,
+        };
         match flow {
             Flow::Fault(f) => return self.fault(f),
             // Intercepted above; kept for completeness.
@@ -288,7 +395,8 @@ impl Cpu {
             Flow::Next | Flow::Sleep | Flow::Svc(_) => {
                 self.regs.pc = pc.wrapping_add(u32::from(len));
             }
-            Flow::Branched | Flow::ExcReturn(_) => {}
+            // FncReturn was turned into Branched or Fault above.
+            Flow::Branched | Flow::ExcReturn(_) | Flow::FncReturn => {}
         }
         if in_it {
             self.it_advance();

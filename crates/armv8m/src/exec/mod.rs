@@ -29,6 +29,9 @@ pub(crate) enum Flow {
     /// PC was written with an EXC_RETURN value in Handler mode: `Cpu::step` performs the
     /// exception return.
     ExcReturn(u32),
+    /// PC was written with an FNC_RETURN value: `Cpu::step` performs the function return (PC
+    /// is unchanged until it does).
+    FncReturn,
 }
 
 /// Execute `instr`. `suppress_flags` is true for 16-bit encodings inside an IT block.
@@ -118,7 +121,9 @@ pub(crate) fn execute(
         | Instr::Bl { .. }
         | Instr::Cbz { .. }
         | Instr::Bx { .. }
-        | Instr::Blx { .. } => branch::execute(cpu, instr),
+        | Instr::Blx { .. }
+        | Instr::Bxns { .. }
+        | Instr::Blxns { .. } => branch::execute(cpu, bus, instr),
         Instr::It { .. }
         | Instr::Svc { .. }
         | Instr::Bkpt { .. }
@@ -128,7 +133,9 @@ pub(crate) fn execute(
         | Instr::Msr { .. }
         | Instr::Mrs { .. }
         | Instr::Barrier { .. }
-        | Instr::Coprocessor { .. } => sys::execute(cpu, instr),
+        | Instr::Coprocessor { .. }
+        | Instr::Sg
+        | Instr::Tt { .. } => sys::execute(cpu, instr),
         // Intercepted in `Cpu::step` before execution.
         Instr::Undefined { .. } => None,
     };
@@ -148,6 +155,8 @@ pub(crate) fn extra_cycles(instr: &Instr) -> u32 {
         // The taken-branch cycle of POP {.., pc} is part of its N-register cost.
         Instr::Pop { regs } => regs.count_ones() - u32::from(regs & 0x8000 != 0),
         Instr::Ldrd { .. } | Instr::Strd { .. } => 1,
+        // The return address and partial xPSR it may push.
+        Instr::Blxns { .. } => 2,
         // 4 cycles in total.
         Instr::Div { .. } => 3,
         _ => 0,

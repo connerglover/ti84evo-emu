@@ -7,8 +7,15 @@
 use super::t32::{field, gp};
 use crate::instr::{Instr, MemSize};
 
-/// Load/store multiple, dual, exclusive, acquire/release and table branch: `1110 100x xxxx`.
+/// `SG` (shares its space with the LDRD literal-with-writeback encoding, which does not exist).
+const SG: u32 = 0xE97F;
+
+/// Load/store multiple, dual, exclusive, acquire/release, table branch, SG and TT:
+/// `1110 100x xxxx`.
 pub(super) fn multiple_dual_exclusive(h1: u32, h2: u32) -> Option<Instr> {
+    if h1 == SG && h2 == SG {
+        return Some(Instr::Sg);
+    }
     let p = h1 >> 8 & 1 != 0;
     let u = h1 >> 7 & 1 != 0;
     let w = h1 >> 5 & 1 != 0;
@@ -87,12 +94,27 @@ fn dual(h1: u32, h2: u32, (p, u, w): (bool, bool, bool), load: bool) -> Option<I
     })
 }
 
-/// LDREX / STREX (word).
+/// TT / TTT / TTA / TTAT: `1110 1000 0100 Rn | 1111 Rd A T 000000`.
+fn test_target(h1: u32, h2: u32) -> Option<Instr> {
+    let rn = field(h1, 0, 4) as u8;
+    let rd = field(h2, 8, 4) as u8;
+    (rn != 15 && gp(rd) && field(h2, 0, 6) == 0).then_some(Instr::Tt {
+        rd,
+        rn,
+        alt: h2 & 0x80 != 0,
+        unpriv: h2 & 0x40 != 0,
+    })
+}
+
+/// LDREX / STREX (word), and TT (the STREX space with `Rt == 15`).
 fn exclusive_word(h1: u32, h2: u32, load: bool) -> Option<Instr> {
     let rn = field(h1, 0, 4) as u8;
     let rt = field(h2, 12, 4) as u8;
     let rd = field(h2, 8, 4) as u8;
     let imm = field(h2, 0, 8) * 4;
+    if !load && rt == 15 {
+        return test_target(h1, h2);
+    }
     if rn == 15 || !gp(rt) {
         return None;
     }

@@ -1,12 +1,16 @@
 //! Exception model: priorities, entry (stacking), return (unstacking), tail-chaining, fault
-//! escalation and lockup. Follows the ARMv8-M pseudocode (`ExceptionEntry`, `PushStack`,
-//! `ExceptionTaken`, `ExceptionReturn`, `PopStack`, `ExecutionPriority`) for a single security
-//! state; the places where the Security Extension adds behaviour are marked `Task 8`.
+//! escalation, lockup, and the Security Extension's state transitions (secure stacking with the
+//! additional state context, register clearing, `FunctionReturn`). Follows the ARMv8-M
+//! pseudocode (`ExceptionEntry`, `PushStack`, `PushCalleeStack`, `ExceptionTaken`,
+//! `ExceptionReturn`, `PopStack`, `FunctionReturn`, `ExecutionPriority`).
 
 use crate::bus::{Access, AccessKind, Bus};
 use crate::cpu::Cpu;
 use crate::regs::{Sec, Xpsr};
 use crate::scs::nvic::irqs;
+use crate::scs::sau::{
+    SFSR_AUVIOL, SFSR_INVEP, SFSR_INVER, SFSR_INVIS, SFSR_INVTRAN, SFSR_SFARVALID,
+};
 use crate::scs::{PRIORITY_MASK, scb};
 
 /// Exception numbers.
@@ -36,8 +40,17 @@ const EXC_RETURN_FTYPE: u32 = 1 << 4;
 const EXC_RETURN_DCRS: u32 = 1 << 5;
 const EXC_RETURN_S: u32 = 1 << 6;
 
+/// LR value after BLXNS: a branch to it returns from the Non-secure function (no FP context).
+pub(crate) const FNC_RETURN: u32 = 0xFEFF_FFFF;
+/// Integrity signature at the bottom of the additional state context (no FP context).
+const INTEGRITY_SIGNATURE: u32 = 0xFEFA_125B;
+
 /// Size of the basic (integer-only) stack frame.
 const FRAME_SIZE: u32 = 0x20;
+/// Size of the additional state context: signature, reserved word, r4-r11.
+const CALLEE_FRAME_SIZE: u32 = 0x28;
+/// Size of the BLXNS frame: return address and partial xPSR.
+pub(crate) const FNC_FRAME_SIZE: u32 = 8;
 
 /// A synchronous fault, with the fault status it records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +61,9 @@ pub(crate) enum Fault {
     InvState,
     /// UsageFault INVPC: invalid EXC_RETURN or exception return integrity check failure.
     InvPc,
+    /// UsageFault INVPC raised to Secure state: a function return (FNC_RETURN) whose stacked
+    /// partial xPSR does not match the current mode.
+    SecureInvPc,
     /// UsageFault NOCP: coprocessor instruction with the coprocessor absent or disabled.
     NoCp,
     /// UsageFault STKOF: stack limit violation.
@@ -66,6 +82,18 @@ pub(crate) enum Fault {
     UnstkErr,
     /// MemManage IACCVIOL: instruction fetch from an Execute Never region.
     IAccViol,
+    /// SecureFault INVEP: Non-secure code entered Secure memory other than at an `SG` in a
+    /// Non-secure callable region.
+    InvEp,
+    /// SecureFault INVIS: the integrity signature of the additional state context is wrong.
+    InvIs,
+    /// SecureFault INVER: Non-secure software attempted an invalid exception return to Secure.
+    InvEr,
+    /// SecureFault AUVIOL: Non-secure access to Secure memory; `Some(addr)` is recorded in SFAR
+    /// (data accesses), `None` for stacking.
+    AuViol(Option<u32>),
+    /// SecureFault INVTRAN: Secure code reached Non-secure memory without BXNS/BLXNS.
+    InvTran,
 }
 
 /// What an exception return did, for `Cpu::step`.
@@ -78,7 +106,7 @@ pub(crate) enum ReturnOutcome {
 }
 
 /// Exceptions that have a separate instance per security state.
-fn is_banked(num: u16) -> bool {
+pub(crate) fn is_banked(num: u16) -> bool {
     matches!(
         num,
         HARDFAULT | MEMMANAGE | USAGEFAULT | SVCALL | PENDSV | SYSTICK
@@ -137,6 +165,11 @@ impl Cpu {
         }
     }
 
+    /// `IsActiveForState()`: exception `num` is active as an exception of security state `sec`.
+    fn is_active_for_state(&self, num: u16, sec: Sec) -> bool {
+        self.exc_active(num, sec) && self.exc_target(num, sec) == sec
+    }
+
     /// Number of active exceptions (both security states).
     pub(crate) fn active_count(&self) -> u32 {
         let scb = &self.scs.scb;
@@ -151,10 +184,35 @@ impl Cpu {
                 .sum::<u32>()
     }
 
-    /// Security state an external interrupt targets.
-    fn irq_target(&self, _irq: usize) -> Sec {
-        // Task 8: ITNS routes the IRQ to Non-secure state (`self.scs.nvic.targets_secure`).
-        Sec::Secure
+    /// Security state an external interrupt targets (`NVIC_ITNS`).
+    fn irq_target(&self, irq: usize) -> Sec {
+        if self.scs.nvic.targets_secure(irq) {
+            Sec::Secure
+        } else {
+            Sec::NonSecure
+        }
+    }
+
+    /// Security state exception `num` targets. Banked exceptions target the state of the copy
+    /// they are pending or active in (`copy`); NMI and BusFault target Non-secure state only
+    /// with `AIRCR.BFHFNMINS`; SecureFault and DebugMonitor are Secure; IRQs follow ITNS.
+    pub(crate) fn exc_target(&self, num: u16, copy: Sec) -> Sec {
+        match num {
+            NMI | BUSFAULT if self.scs.scb.bfhfnmins => Sec::NonSecure,
+            NMI | BUSFAULT | SECUREFAULT | DEBUGMONITOR => Sec::Secure,
+            16.. => self.irq_target(usize::from(num - 16)),
+            _ => copy,
+        }
+    }
+
+    /// The HardFault a fault targeting `sec` escalates to: the Secure HardFault, unless
+    /// `AIRCR.BFHFNMINS` gives Non-secure state its own.
+    fn hardfault_target(&self, sec: Sec) -> Sec {
+        if self.scs.scb.bfhfnmins {
+            sec
+        } else {
+            Sec::Secure
+        }
     }
 
     /// Whether exception `num` (for `sec`) may be taken when pending.
@@ -188,8 +246,8 @@ impl Cpu {
         p as i32
     }
 
-    /// `ExceptionPriority()`: the priority of exception `num` for `sec`; `group` selects the
-    /// group priority (used for preemption) rather than the full value (used for ordering).
+    /// `ExceptionPriority()`: the priority of exception `num` targeting `sec`; `group` selects
+    /// the group priority (used for preemption) rather than the full value (used for ordering).
     pub(crate) fn exception_priority(&self, num: u16, sec: Sec, group: bool) -> i32 {
         let raw = match num {
             1 => return -4,
@@ -214,10 +272,11 @@ impl Cpu {
     /// FAULTMASK of both security states. 256 when nothing applies.
     pub(crate) fn execution_priority(&self) -> i32 {
         let mut highest = 256;
-        for sec in [Sec::Secure, Sec::NonSecure] {
-            let active = *self.scs.scb.active.get(sec);
+        for copy in [Sec::Secure, Sec::NonSecure] {
+            let active = *self.scs.scb.active.get(copy);
             for num in 1..16 {
                 if active & (1 << num) != 0 {
+                    let sec = self.exc_target(num, copy);
                     highest = highest.min(self.exception_priority(num, sec, true));
                 }
             }
@@ -257,8 +316,8 @@ impl Cpu {
         highest.min(boosted)
     }
 
-    /// The highest-priority pending and enabled exception, ignoring the execution priority
-    /// (lowest priority value first, then lowest exception number).
+    /// The highest-priority pending and enabled exception and the state it targets, ignoring
+    /// the execution priority (lowest priority value first, then lowest exception number).
     pub(crate) fn highest_pending(&self) -> Option<(u16, Sec)> {
         let mut best: Option<(i32, u16, Sec)> = None;
         let mut consider = |p: i32, num: u16, sec: Sec| {
@@ -266,9 +325,10 @@ impl Cpu {
                 best = Some((p, num, sec));
             }
         };
-        for sec in [Sec::Secure, Sec::NonSecure] {
-            let pending = *self.scs.scb.pending.get(sec);
+        for copy in [Sec::Secure, Sec::NonSecure] {
+            let pending = *self.scs.scb.pending.get(copy);
             for num in 1..16 {
+                let sec = self.exc_target(num, copy);
                 if pending & (1 << num) != 0 && self.exc_enabled(num, sec) {
                     consider(self.exception_priority(num, sec, false), num, sec);
                 }
@@ -298,42 +358,53 @@ impl Cpu {
 
     // ---- Faults ----
 
-    /// Record `fault`'s status bits and return the exception that handles it.
-    fn record_fault(&mut self, fault: Fault) -> u16 {
-        let sec = self.regs.sec;
-        let scb = &mut self.scs.scb;
-        let usage = |scb: &mut scb::Scb, bit: u16| {
-            *scb.ufsr.get_mut(sec) |= bit;
-            USAGEFAULT
-        };
+    fn usage_fault(&mut self, sec: Sec, bit: u16) -> (u16, Sec) {
+        *self.scs.scb.ufsr.get_mut(sec) |= bit;
+        (USAGEFAULT, sec)
+    }
+
+    fn bus_fault(&mut self, bits: u8) -> (u16, Sec) {
+        self.scs.scb.bfsr |= bits;
+        (BUSFAULT, self.exc_target(BUSFAULT, Sec::Secure))
+    }
+
+    fn secure_fault(&mut self, bits: u32) -> (u16, Sec) {
+        self.scs.sau.sfsr |= bits;
+        (SECUREFAULT, Sec::Secure)
+    }
+
+    /// Record `fault`'s status bits and return the exception that handles it and the security
+    /// state that exception targets.
+    fn record_fault(&mut self, fault: Fault) -> (u16, Sec) {
+        let cur = self.regs.sec;
         match fault {
-            Fault::UndefInstr => usage(scb, scb::UFSR_UNDEFINSTR),
-            Fault::InvState => usage(scb, scb::UFSR_INVSTATE),
-            Fault::InvPc => usage(scb, scb::UFSR_INVPC),
-            Fault::NoCp => usage(scb, scb::UFSR_NOCP),
-            Fault::StkOf => usage(scb, scb::UFSR_STKOF),
-            Fault::Unaligned => usage(scb, scb::UFSR_UNALIGNED),
-            Fault::DivByZero => usage(scb, scb::UFSR_DIVBYZERO),
-            Fault::IBusErr => {
-                scb.bfsr |= scb::BFSR_IBUSERR;
-                BUSFAULT
-            }
+            Fault::UndefInstr => self.usage_fault(cur, scb::UFSR_UNDEFINSTR),
+            Fault::InvState => self.usage_fault(cur, scb::UFSR_INVSTATE),
+            Fault::InvPc => self.usage_fault(cur, scb::UFSR_INVPC),
+            Fault::SecureInvPc => self.usage_fault(Sec::Secure, scb::UFSR_INVPC),
+            Fault::NoCp => self.usage_fault(cur, scb::UFSR_NOCP),
+            Fault::StkOf => self.usage_fault(cur, scb::UFSR_STKOF),
+            Fault::Unaligned => self.usage_fault(cur, scb::UFSR_UNALIGNED),
+            Fault::DivByZero => self.usage_fault(cur, scb::UFSR_DIVBYZERO),
+            Fault::IBusErr => self.bus_fault(scb::BFSR_IBUSERR),
             Fault::PreciseErr(addr) => {
-                scb.bfsr |= scb::BFSR_PRECISERR | scb::BFSR_BFARVALID;
-                scb.bfar = addr;
-                BUSFAULT
+                self.scs.scb.bfar = addr;
+                self.bus_fault(scb::BFSR_PRECISERR | scb::BFSR_BFARVALID)
             }
-            Fault::StkErr => {
-                scb.bfsr |= scb::BFSR_STKERR;
-                BUSFAULT
-            }
-            Fault::UnstkErr => {
-                scb.bfsr |= scb::BFSR_UNSTKERR;
-                BUSFAULT
-            }
+            Fault::StkErr => self.bus_fault(scb::BFSR_STKERR),
+            Fault::UnstkErr => self.bus_fault(scb::BFSR_UNSTKERR),
             Fault::IAccViol => {
-                *scb.mmfsr.get_mut(sec) |= scb::MMFSR_IACCVIOL;
-                MEMMANAGE
+                *self.scs.scb.mmfsr.get_mut(cur) |= scb::MMFSR_IACCVIOL;
+                (MEMMANAGE, cur)
+            }
+            Fault::InvEp => self.secure_fault(SFSR_INVEP),
+            Fault::InvIs => self.secure_fault(SFSR_INVIS),
+            Fault::InvEr => self.secure_fault(SFSR_INVER),
+            Fault::InvTran => self.secure_fault(SFSR_INVTRAN),
+            Fault::AuViol(None) => self.secure_fault(SFSR_AUVIOL),
+            Fault::AuViol(Some(addr)) => {
+                self.scs.sau.sfar = addr;
+                self.secure_fault(SFSR_AUVIOL | SFSR_SFARVALID)
             }
         }
     }
@@ -341,9 +412,13 @@ impl Cpu {
     /// Raise a synchronous fault: record its status and pend its exception (escalated as
     /// needed). Returns false when the processor must lock up.
     pub(crate) fn raise_fault(&mut self, fault: Fault) -> bool {
-        log::debug!("fault {fault:?} at pc {:#010x}", self.regs.pc);
-        let num = self.record_fault(fault);
-        self.raise_sync(num, self.regs.sec)
+        log::debug!(
+            "fault {fault:?} at pc {:#010x} ({:?})",
+            self.regs.pc,
+            self.regs.sec
+        );
+        let (num, sec) = self.record_fault(fault);
+        self.raise_sync(num, sec)
     }
 
     /// Pend synchronous exception `num` for `sec`. A configurable exception that is disabled or
@@ -358,7 +433,11 @@ impl Cpu {
             self.scs.scb.hfsr |= scb::HFSR_FORCED;
             target = HARDFAULT;
         }
-        // Task 8: HardFault targets Secure state unless AIRCR.BFHFNMINS is set.
+        let sec = if target == HARDFAULT {
+            self.hardfault_target(sec)
+        } else {
+            sec
+        };
         if target == HARDFAULT && self.exception_priority(HARDFAULT, sec, true) >= exec {
             return false;
         }
@@ -395,6 +474,44 @@ impl Cpu {
         }
     }
 
+    // ---- Stack accesses ----
+
+    /// Write one word of a stack frame that belongs to security state `sec`. The access has
+    /// the frame's security; a Non-secure frame reaching Secure memory is a SecureFault AUVIOL.
+    pub(crate) fn stack_write(
+        &self,
+        bus: &mut impl Bus,
+        addr: u32,
+        v: u32,
+        sec: Sec,
+        privileged: bool,
+    ) -> Result<(), Fault> {
+        let acc = Access {
+            kind: AccessKind::Write,
+            secure: sec == Sec::Secure,
+            privileged,
+        };
+        let acc = self.attribute(addr, acc, sec).ok_or(Fault::AuViol(None))?;
+        bus.write32(addr, v, acc).map_err(|_| Fault::StkErr)
+    }
+
+    /// Read one word of a stack frame that belongs to security state `sec` (see `stack_write`).
+    fn stack_read(
+        &self,
+        bus: &mut impl Bus,
+        addr: u32,
+        sec: Sec,
+        privileged: bool,
+    ) -> Result<u32, Fault> {
+        let acc = Access {
+            kind: AccessKind::Read,
+            secure: sec == Sec::Secure,
+            privileged,
+        };
+        let acc = self.attribute(addr, acc, sec).ok_or(Fault::AuViol(None))?;
+        bus.read32(addr, acc).map_err(|_| Fault::UnstkErr)
+    }
+
     // ---- Entry ----
 
     /// Take the highest-priority pending exception if it preempts the current execution
@@ -425,9 +542,9 @@ impl Cpu {
         self.exception_taken(bus, num, sec);
     }
 
-    /// `PushStack`: write the basic frame below the current SP (8-byte aligned, recording the
-    /// realignment in xPSR bit 9) and set LR to the EXC_RETURN describing it. Returns the
-    /// derived fault, if stacking failed.
+    /// `PushStack`: write the basic frame below the current SP of the current security state
+    /// (8-byte aligned, recording the realignment in xPSR bit 9) and set LR to the EXC_RETURN
+    /// describing it. Returns the derived fault, if stacking failed.
     fn push_stack(&mut self, bus: &mut impl Bus) -> Option<Fault> {
         let sec = self.regs.sec;
         let thread = !self.regs.handler_mode();
@@ -458,17 +575,11 @@ impl Cpu {
             derived = Some(Fault::StkOf);
             limit
         } else {
-            let acc = Access {
-                kind: AccessKind::Write,
-                secure: sec == Sec::Secure,
-                privileged: self.is_privileged(),
-            };
+            let privileged = self.is_privileged();
             for (i, &w) in words.iter().enumerate() {
-                if bus
-                    .write32(frame.wrapping_add(4 * i as u32), w, acc)
-                    .is_err()
-                {
-                    derived.get_or_insert(Fault::StkErr);
+                let addr = frame.wrapping_add(4 * i as u32);
+                if let Err(f) = self.stack_write(bus, addr, w, sec, privileged) {
+                    derived.get_or_insert(f);
                 }
             }
             frame
@@ -494,11 +605,64 @@ impl Cpu {
         derived
     }
 
-    /// `ExceptionTaken`: fetch the vector and enter the handler of `num` for `sec`. LR already
-    /// holds the EXC_RETURN value (from `push_stack`, or kept across a tail-chain).
+    /// The Secure stack pointer (as a mutable reference) and its limit for the frame that the
+    /// EXC_RETURN value `exc_return` describes.
+    fn secure_frame_sp(&mut self, exc_return: u32) -> (&mut u32, u32) {
+        let r = &mut self.regs;
+        if exc_return & EXC_RETURN_MODE != 0 && exc_return & EXC_RETURN_SPSEL != 0 {
+            (&mut r.psp.s, r.psplim.s)
+        } else {
+            (&mut r.msp.s, r.msplim.s)
+        }
+    }
+
+    /// `PushCalleeStack`: push the additional state context (integrity signature, a reserved
+    /// word, r4-r11) below the basic frame on the Secure stack that LR (EXC_RETURN) describes.
+    /// On failure nothing changes but memory: SP and LR still describe the basic frame alone.
+    fn push_callee_stack(&mut self, bus: &mut impl Bus) -> Option<Fault> {
+        let lr = self.regs.lr;
+        let privileged = lr & EXC_RETURN_MODE == 0 || self.regs.control.s & 1 == 0;
+        let (sp, limit) = self.secure_frame_sp(lr);
+        let frame = sp.wrapping_sub(CALLEE_FRAME_SIZE);
+        if frame < limit {
+            return Some(Fault::StkOf);
+        }
+        let r = &self.regs.r;
+        let mut words = [INTEGRITY_SIGNATURE, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        words[2..].copy_from_slice(&r[4..12]);
+        for (i, &w) in words.iter().enumerate() {
+            let addr = frame.wrapping_add(4 * i as u32);
+            if let Err(f) = self.stack_write(bus, addr, w, Sec::Secure, privileged) {
+                return Some(f);
+            }
+        }
+        *self.secure_frame_sp(lr).0 = frame;
+        None
+    }
+
+    /// `ExceptionTaken`: fetch the vector and enter the handler of `num` targeting `sec`. LR
+    /// already holds the EXC_RETURN value (from `push_stack`, or kept across a tail-chain).
     fn exception_taken(&mut self, bus: &mut impl Bus, num: u16, sec: Sec) {
-        // Task 8: entering a handler in the other security state pushes the additional state
-        // context, clears registers and uses that state's banked registers.
+        // A Non-secure handler over a Secure background: the callee-saved registers go on the
+        // Secure stack with an integrity signature (once; DCRS = 0 records that they are there).
+        let both = EXC_RETURN_S | EXC_RETURN_DCRS;
+        if sec == Sec::NonSecure && self.regs.lr & both == both {
+            if let Some(fault) = self.push_callee_stack(bus) {
+                // A derived exception: taken instead when it preempts. (The Non-secure handler
+                // cannot be entered without the context, so otherwise the processor locks up.)
+                if !self.raise_fault(fault) {
+                    self.enter_lockup(Some((num, sec)));
+                    return;
+                }
+                match self.preemptable_pending() {
+                    Some(next) if next != (num, sec) => self.exception_taken(bus, next.0, next.1),
+                    _ => self.enter_lockup(Some((num, sec))),
+                }
+                return;
+            }
+            self.regs.lr &= !EXC_RETURN_DCRS;
+        }
+
         let vtor = *self.scs.scb.vtor.get(sec);
         let acc = Access {
             kind: AccessKind::Read,
@@ -512,24 +676,40 @@ impl Cpu {
                 log::warn!("vector read for exception {num} at {addr:#010x} failed: {e:?}");
                 self.scs.scb.hfsr |= scb::HFSR_VECTTBL;
                 // The original exception stays pending; HardFault is taken in its place.
+                let hf = self.hardfault_target(sec);
                 if num == HARDFAULT
-                    || self.exception_priority(HARDFAULT, sec, true) >= self.execution_priority()
+                    || self.exception_priority(HARDFAULT, hf, true) >= self.execution_priority()
                 {
                     self.enter_lockup(Some((num, sec)));
                 } else {
-                    self.exception_taken(bus, HARDFAULT, sec);
+                    self.exception_taken(bus, HARDFAULT, hf);
                 }
                 return;
             }
         };
+
+        // Leaving Secure state for a Non-secure handler: the Secure register contents must not
+        // be visible. r4-r11 are only cleared when they are saved on the stack.
+        if sec == Sec::NonSecure && self.regs.sec == Sec::Secure {
+            let r = &mut self.regs.r;
+            r[..4].fill(0);
+            r[12] = 0;
+            if self.regs.lr & EXC_RETURN_DCRS == 0 {
+                r[4..12].fill(0);
+            }
+            let x = &mut self.regs.xpsr;
+            (x.n, x.z, x.c, x.v, x.q, x.ge) = (false, false, false, false, false, 0);
+        }
+
         self.regs.lr = (self.regs.lr & !EXC_RETURN_ES) | u32::from(sec == Sec::Secure);
+        self.regs.sec = sec;
         let x = &mut self.regs.xpsr;
         x.exception = num;
         x.it = 0;
         // A vector with bit 0 clear faults INVSTATE on the handler's first instruction.
         x.t = vector & 1 != 0;
         self.regs.pc = vector & !1;
-        // Handler mode always uses the main stack; SPSEL, FPCA and SFPA are cleared.
+        // Handler mode always uses the main stack: SPSEL of the handler's state is cleared.
         *self.regs.control.get_mut(sec) &= 1;
         self.set_exc_pending(num, sec, false);
         self.set_exc_active(num, sec, true);
@@ -546,23 +726,31 @@ impl Cpu {
         bus: &mut impl Bus,
         exc_return: u32,
     ) -> ReturnOutcome {
-        let sec = self.regs.sec;
+        let cur = self.regs.sec;
         let num = self.regs.xpsr.exception;
-        let target = if exc_return & EXC_RETURN_ES != 0 {
+        // ES: the security state of the exception being returned from. S: that of the
+        // background (and of the stack holding its frame).
+        let es = exc_return & EXC_RETURN_ES != 0;
+        let exc_sec = if es { Sec::Secure } else { Sec::NonSecure };
+        let to_secure = exc_return & EXC_RETURN_S != 0;
+        let frame_sec = if to_secure {
             Sec::Secure
         } else {
             Sec::NonSecure
         };
         let to_thread = exc_return & EXC_RETURN_MODE != 0;
         let spsel = exc_return & EXC_RETURN_SPSEL != 0;
-        // Task 8: ES/S different from the current state, DCRS = 0 (additional state context)
-        // and FNC_RETURN are security state transitions; until then they are invalid.
+        let dcrs = exc_return & EXC_RETURN_DCRS != 0;
+
+        // Non-secure software can neither return from a Secure exception nor return to Secure
+        // state without the additional state context pushed when it was entered.
+        if cur == Sec::NonSecure && (es || (to_secure && dcrs)) {
+            log::warn!("invalid exception return {exc_return:#010x} from Non-secure state");
+            return self.return_fault(bus, exc_return, Fault::InvEr);
+        }
         let valid = exc_return & 0x00FF_FF82 == 0x00FF_FF80
-            && exc_return & (EXC_RETURN_DCRS | EXC_RETURN_FTYPE)
-                == EXC_RETURN_DCRS | EXC_RETURN_FTYPE
-            && target == sec
-            && (exc_return & EXC_RETURN_S != 0) == (sec == Sec::Secure)
-            && self.exc_active(num, target)
+            && exc_return & EXC_RETURN_FTYPE != 0
+            && self.is_active_for_state(num, exc_sec)
             && !(!to_thread && spsel)
             && (to_thread || self.active_count() > 1);
         if !valid {
@@ -571,9 +759,9 @@ impl Cpu {
         }
 
         // DeActivate.
-        self.set_exc_active(num, target, false);
+        self.set_exc_active(num, exc_sec, false);
         if num != NMI {
-            *self.regs.faultmask.get_mut(target) = false;
+            *self.regs.faultmask.get_mut(exc_sec) = false;
         }
         if num >= 16 && self.scs.nvic.level(usize::from(num - 16)) {
             self.pend_irq(usize::from(num - 16));
@@ -592,21 +780,39 @@ impl Cpu {
 
         // PopStack.
         let use_psp = to_thread && spsel;
-        let frame = if use_psp {
-            *self.regs.psp.get(sec)
+        let mut frame = if use_psp {
+            *self.regs.psp.get(frame_sec)
         } else {
-            *self.regs.msp.get(sec)
+            *self.regs.msp.get(frame_sec)
         };
-        let acc = Access {
-            kind: AccessKind::Read,
-            secure: sec == Sec::Secure,
-            privileged: !to_thread || self.regs.control.get(sec) & 1 == 0,
-        };
+        let privileged = !to_thread || self.regs.control.get(frame_sec) & 1 == 0;
+        let mut callee = None;
+        if to_secure && !dcrs {
+            let sig = match self.stack_read(bus, frame, frame_sec, privileged) {
+                Ok(v) => v,
+                Err(f) => return self.return_fault(bus, exc_return, f),
+            };
+            if sig != INTEGRITY_SIGNATURE {
+                log::warn!("exception return integrity signature {sig:#010x} at {frame:#010x}");
+                return self.return_fault(bus, exc_return, Fault::InvIs);
+            }
+            let mut regs = [0u32; 8];
+            for (i, word) in regs.iter_mut().enumerate() {
+                let addr = frame.wrapping_add(8 + 4 * i as u32);
+                match self.stack_read(bus, addr, frame_sec, privileged) {
+                    Ok(v) => *word = v,
+                    Err(f) => return self.return_fault(bus, exc_return, f),
+                }
+            }
+            callee = Some(regs);
+            frame = frame.wrapping_add(CALLEE_FRAME_SIZE);
+        }
         let mut w = [0u32; 8];
         for (i, word) in w.iter_mut().enumerate() {
-            match bus.read32(frame.wrapping_add(4 * i as u32), acc) {
+            let addr = frame.wrapping_add(4 * i as u32);
+            match self.stack_read(bus, addr, frame_sec, privileged) {
                 Ok(v) => *word = v,
-                Err(_) => return self.return_fault(bus, exc_return, Fault::UnstkErr),
+                Err(f) => return self.return_fault(bus, exc_return, f),
             }
         }
         let psr = w[7];
@@ -615,6 +821,9 @@ impl Cpu {
             log::warn!("exception return to {exc_return:#010x} with stacked xPSR {psr:#010x}");
             return self.return_fault(bus, exc_return, Fault::InvPc);
         }
+        if let Some(regs) = callee {
+            self.regs.r[4..12].copy_from_slice(&regs);
+        }
         self.regs.r[..4].copy_from_slice(&w[..4]);
         self.regs.r[12] = w[4];
         self.regs.lr = w[5];
@@ -622,14 +831,15 @@ impl Cpu {
         self.regs.xpsr = Xpsr::from_u32(psr);
         let sp = frame.wrapping_add(FRAME_SIZE) | ((psr >> 9 & 1) << 2);
         if use_psp {
-            *self.regs.psp.get_mut(sec) = sp;
+            *self.regs.psp.get_mut(frame_sec) = sp;
         } else {
-            *self.regs.msp.get_mut(sec) = sp;
+            *self.regs.msp.get_mut(frame_sec) = sp;
         }
-        let control = self.regs.control.get_mut(sec);
+        self.regs.sec = frame_sec;
+        let control = self.regs.control.get_mut(frame_sec);
         *control = (*control & !0b10) | (u32::from(spsel) << 1);
 
-        if to_thread && self.scs.scb.scr.get(sec) & scb::SCR_SLEEPONEXIT != 0 {
+        if to_thread && self.scs.scb.scr.get(cur) & scb::SCR_SLEEPONEXIT != 0 {
             return ReturnOutcome::Sleep;
         }
         ReturnOutcome::Done
@@ -656,5 +866,43 @@ impl Cpu {
         } else {
             ReturnOutcome::Done
         }
+    }
+
+    /// `FunctionReturn`: a branch to FNC_RETURN ends a Non-secure function called with BLXNS.
+    /// The return address and partial xPSR are popped from the Secure stack of the current mode
+    /// and execution continues there in Secure state. On a fault nothing changes.
+    pub(crate) fn function_return(&mut self, bus: &mut impl Bus) -> Result<(), Fault> {
+        let handler = self.regs.handler_mode();
+        let use_psp = !handler && self.regs.control.s & 0b10 != 0;
+        let frame = if use_psp {
+            self.regs.psp.s
+        } else {
+            self.regs.msp.s
+        };
+        let privileged = handler || self.regs.control.s & 1 == 0;
+        let ret = self.stack_read(bus, frame, Sec::Secure, privileged)?;
+        let psr = self.stack_read(bus, frame.wrapping_add(4), Sec::Secure, privileged)?;
+        // BLXNS from Handler mode hides the exception number as IPSR = 1; from Thread mode it
+        // stacks IPSR = 0. Anything else is not the frame of this call.
+        let saved = (psr & 0x1FF) as u16;
+        let valid = if handler {
+            self.regs.xpsr.exception == 1 && saved != 0
+        } else {
+            saved == 0
+        };
+        if !valid {
+            log::warn!("function return with stacked partial xPSR {psr:#010x}");
+            return Err(Fault::SecureInvPc);
+        }
+        let sp = frame.wrapping_add(FNC_FRAME_SIZE);
+        if use_psp {
+            self.regs.psp.s = sp;
+        } else {
+            self.regs.msp.s = sp;
+        }
+        self.regs.xpsr.exception = saved;
+        self.regs.sec = Sec::Secure;
+        self.blx_write_pc(ret);
+        Ok(())
     }
 }

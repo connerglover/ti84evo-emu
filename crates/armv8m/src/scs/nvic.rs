@@ -108,52 +108,77 @@ impl Nvic {
         !get(&self.itns, irq)
     }
 
+    /// True when Non-secure software may see IRQ `irq` (it targets Non-secure state).
+    fn ns_visible(&self, irq: usize) -> bool {
+        get(&self.itns, irq)
+    }
+
     /// Read the word at offset `off` from `NVIC_ISER0` (0xE000_E100); `None` if unimplemented.
-    pub fn read(&self, off: u32) -> Option<u32> {
+    /// Through the Non-secure view (`ns`), interrupts that target Secure state read as zero and
+    /// `ITNS` is RAZ.
+    pub fn read(&self, off: u32, ns: bool) -> Option<u32> {
         let i = ((off % 0x80) / 4) as usize;
-        let word = |w: &[u32; WORDS]| w.get(i).copied().unwrap_or(0);
+        let visible = if ns {
+            self.itns.get(i).copied().unwrap_or(0)
+        } else {
+            u32::MAX
+        };
+        let word = |w: &[u32; WORDS]| w.get(i).copied().unwrap_or(0) & visible;
         Some(match off {
             0x000..0x040 | 0x080..0x0C0 => word(&self.enabled),
             0x100..0x140 | 0x180..0x1C0 => word(&self.pending),
             0x200..0x240 => word(&self.active),
+            0x280..0x2C0 if ns => 0,
             0x280..0x2C0 => word(&self.itns),
             0x300..IPR_END => {
                 let base = (off - 0x300) as usize;
-                u32::from_le_bytes(std::array::from_fn(|k| self.priority[base + k]))
+                u32::from_le_bytes(std::array::from_fn(|k| {
+                    if ns && !self.ns_visible(base + k) {
+                        0
+                    } else {
+                        self.priority[base + k]
+                    }
+                }))
             }
             _ => return None,
         })
     }
 
     /// Write `v` (already masked to the written byte lanes `lanes`) at offset `off`. Returns
-    /// `None` if the register is unimplemented, else the IRQs that became pending.
-    pub fn write(&mut self, off: u32, v: u32, lanes: u32, prio_mask: u8) -> Option<u32> {
+    /// `None` if the register is unimplemented, else the IRQs that became pending. Through the
+    /// Non-secure view (`ns`), interrupts that target Secure state and `ITNS` are WI.
+    pub fn write(&mut self, off: u32, v: u32, lanes: u32, prio_mask: u8, ns: bool) -> Option<u32> {
         let i = ((off % 0x80) / 4) as usize;
+        let bits = if ns {
+            v & self.itns.get(i).copied().unwrap_or(0)
+        } else {
+            v
+        };
         let mut newly_pending = 0;
         match off {
-            0x000..0x040 if i < WORDS => self.enabled[i] |= v,
-            0x080..0x0C0 if i < WORDS => self.enabled[i] &= !v,
+            0x000..0x040 if i < WORDS => self.enabled[i] |= bits,
+            0x080..0x0C0 if i < WORDS => self.enabled[i] &= !bits,
             0x100..0x140 if i < WORDS => {
-                newly_pending = v & !self.pending[i];
-                self.pending[i] |= v;
+                newly_pending = bits & !self.pending[i];
+                self.pending[i] |= bits;
             }
             // A level-sensitive line that is still asserted (and not active) pends again.
             0x180..0x1C0 if i < WORDS => {
-                self.pending[i] &= !v;
-                self.pending[i] |= v & self.level[i] & !self.active[i];
+                self.pending[i] &= !bits;
+                self.pending[i] |= bits & self.level[i] & !self.active[i];
             }
-            0x280..0x2C0 if i < WORDS => {
+            0x280..0x2C0 if i < WORDS && !ns => {
                 self.itns[i] = (self.itns[i] & !lanes) | v;
             }
             0x300..IPR_END => {
                 let base = (off - 0x300) as usize;
                 for k in 0..4 {
-                    if lanes >> (8 * k) & 0xFF != 0 {
+                    if lanes >> (8 * k) & 0xFF != 0 && !(ns && !self.ns_visible(base + k)) {
                         self.priority[base + k] = (v >> (8 * k)) as u8 & prio_mask;
                     }
                 }
             }
-            // Out-of-range words of implemented banks, and IABR, are RAZ/WI.
+            // Out-of-range words of implemented banks, ITNS from Non-secure, and IABR are RAZ/WI.
             0x000..0x2C0 => {}
             _ => return None,
         }

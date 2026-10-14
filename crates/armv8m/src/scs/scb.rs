@@ -2,7 +2,8 @@
 //!
 //! Registers that the Security Extension banks are stored as `Banked`. For registers that are
 //! only partially banked (SHPR1-3, SHCSR, CCR, the fault status registers) the non-banked fields
-//! live in the Secure copy; Task 8 routes Non-secure accesses to the right copy.
+//! live in the Secure copy; the Non-secure view reaches them only where the architecture allows
+//! (mostly when `AIRCR.BFHFNMINS` hands BusFault, HardFault and NMI to Non-secure state).
 
 use serde::{Deserialize, Serialize};
 
@@ -109,6 +110,8 @@ pub struct Scb {
     pub bfar: u32,
     /// `CPACR` (stored; no coprocessors are implemented).
     pub cpacr: Banked<u32>,
+    /// `NSACR` (stored; Secure-writable, Non-secure read-only).
+    pub nsacr: u32,
 }
 
 impl Default for Scb {
@@ -137,6 +140,7 @@ impl Default for Scb {
             mmfar: Banked::default(),
             bfar: 0,
             cpacr: Banked::default(),
+            nsacr: 0,
         }
     }
 }

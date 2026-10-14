@@ -12,6 +12,9 @@ pub enum AccessKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Access {
     pub kind: AccessKind,
+    /// Security of the access after the core's attribution check (SAU/IDAU): Secure for
+    /// Secure and Non-secure callable memory (only Secure state gets that far), Non-secure for
+    /// Non-secure memory even from Secure state. Bus-side filters (MPC/PPC) check this.
     pub secure: bool,
     pub privileged: bool,
 }
@@ -20,6 +23,8 @@ pub struct Access {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BusError {
     Decode,
+    /// Rejected by a bus-side security filter (MPC/PPC). Like `Decode`, the core turns it into
+    /// a BusFault; SecureFault comes only from the core's own attribution check.
     SecureViolation,
 }
 

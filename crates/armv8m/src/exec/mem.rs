@@ -13,6 +13,8 @@ use crate::scs::scb::CCR_UNALIGN_TRP;
 enum MemFault {
     /// The bus (or the PPB) rejected the access at this address.
     Bus(BusError, u32),
+    /// Non-secure state accessed Secure (or Non-secure callable) memory at this address.
+    Secure(u32),
     /// LDM/STM/PUSH/POP, LDRD/STRD, exclusive and acquire/release accesses that are not
     /// naturally aligned, and any unaligned access while `CCR.UNALIGN_TRP` is set.
     Unaligned,
@@ -21,13 +23,26 @@ enum MemFault {
 /// The single place where a memory failure is turned into a fault.
 fn fault(cause: MemFault) -> Flow {
     Flow::Fault(match cause {
-        // Task 8: BusError::SecureViolation becomes a SecureFault (AUVIOL, SFAR).
+        // Every bus error, including `BusError::SecureViolation` (a system-level MPC/PPC
+        // rejecting the access), is a precise BusFault: on Arm systems those filters answer
+        // with a bus error, while SecureFault comes only from the core's own attribution check
+        // (`MemFault::Secure`).
         MemFault::Bus(err, addr) => {
             log::debug!("data access to {addr:#010x} failed: {err:?}");
             Fault::PreciseErr(addr)
         }
+        MemFault::Secure(addr) => {
+            log::debug!("Non-secure data access to Secure address {addr:#010x}");
+            Fault::AuViol(Some(addr))
+        }
         MemFault::Unaligned => Fault::Unaligned,
     })
+}
+
+/// Security attribution of a data access to `addr` (see `Cpu::attribute`).
+fn attribute(cpu: &Cpu, addr: u32, acc: Access) -> Result<Access, MemFault> {
+    cpu.attribute(addr, acc, cpu.regs.sec)
+        .ok_or(MemFault::Secure(addr))
 }
 
 /// True if an unaligned access of `size` at `addr` traps (`CCR.UNALIGN_TRP`).
@@ -55,21 +70,25 @@ fn read_as(
     if unaligned_trap(cpu, addr, size) {
         return Err(MemFault::Unaligned);
     }
+    // The PPB is exempt from attribution; it has its own Secure and Non-secure views.
     if is_ppb(addr) {
         return cpu
             .ppb_read(addr, size, acc)
             .map_err(|e| MemFault::Bus(e, addr));
     }
     let r = match size {
-        MemSize::Byte => bus.read8(addr, acc).map(u32::from),
-        MemSize::Half if addr & 1 == 0 => bus.read16(addr, acc).map(u32::from),
-        MemSize::Word if addr & 3 == 0 => bus.read32(addr, acc),
+        MemSize::Byte => bus.read8(addr, attribute(cpu, addr, acc)?).map(u32::from),
+        MemSize::Half if addr & 1 == 0 => {
+            bus.read16(addr, attribute(cpu, addr, acc)?).map(u32::from)
+        }
+        MemSize::Word if addr & 3 == 0 => bus.read32(addr, attribute(cpu, addr, acc)?),
         // Unaligned accesses are permitted (UNALIGN_TRP = 0); do them bytewise.
         _ => {
             let n = if size == MemSize::Half { 2 } else { 4 };
             let mut v = 0;
             for i in 0..n {
                 let a = addr.wrapping_add(i);
+                let acc = attribute(cpu, a, acc)?;
                 let b = bus.read8(a, acc).map_err(|e| MemFault::Bus(e, a))?;
                 v |= u32::from(b) << (8 * i);
             }
@@ -107,13 +126,14 @@ fn write_as(
             .map_err(|e| MemFault::Bus(e, addr));
     }
     let r = match size {
-        MemSize::Byte => bus.write8(addr, v as u8, acc),
-        MemSize::Half if addr & 1 == 0 => bus.write16(addr, v as u16, acc),
-        MemSize::Word if addr & 3 == 0 => bus.write32(addr, v, acc),
+        MemSize::Byte => bus.write8(addr, v as u8, attribute(cpu, addr, acc)?),
+        MemSize::Half if addr & 1 == 0 => bus.write16(addr, v as u16, attribute(cpu, addr, acc)?),
+        MemSize::Word if addr & 3 == 0 => bus.write32(addr, v, attribute(cpu, addr, acc)?),
         _ => {
             let n = if size == MemSize::Half { 2 } else { 4 };
             for i in 0..n {
                 let a = addr.wrapping_add(i);
+                let acc = attribute(cpu, a, acc)?;
                 bus.write8(a, (v >> (8 * i)) as u8, acc)
                     .map_err(|e| MemFault::Bus(e, a))?;
             }
@@ -134,7 +154,7 @@ fn extend(v: u32, size: MemSize, signed: bool) -> u32 {
 /// Write a loaded value; a PC destination is a `LoadWritePC` interworking branch.
 fn write_loaded(cpu: &mut Cpu, rt: u8, v: u32) -> Flow {
     if rt == 15 {
-        cpu.bx_write_pc(v)
+        cpu.bx_write_pc(v, false)
     } else {
         cpu.set_reg(rt, v);
         Flow::Next

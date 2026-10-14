@@ -1,9 +1,14 @@
-//! System Control Space: the memory-mapped NVIC, SCB, SysTick and MPU registers, and the rest
-//! of the Private Peripheral Bus (PPB, `0xE000_0000..=0xE00F_FFFF`), which the CPU handles
+//! System Control Space: the memory-mapped NVIC, SCB, SysTick, MPU and SAU registers, and the
+//! rest of the Private Peripheral Bus (PPB, `0xE000_0000..=0xE00F_FFFF`), which the CPU handles
 //! itself before the `Bus`.
+//!
+//! Every access goes through a security *view* (`Sec`): software sees the copy of the banked
+//! registers for its own security state, and Secure software reaches the Non-secure view through
+//! the Non-secure alias at `0xE002_0000..=0xE002_FFFF` (RAZ/WI from Non-secure state).
 
 pub mod mpu;
 pub mod nvic;
+pub mod sau;
 pub mod scb;
 pub mod systick;
 
@@ -11,11 +16,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::bus::{Access, BusError};
 use crate::cpu::Cpu;
+use crate::exception::{BUSFAULT, HARDFAULT, NMI, PENDSV, SYSTICK as SYSTICK_EXC, is_banked};
 use crate::instr::MemSize;
 use crate::regs::{Banked, Sec};
 
 pub use mpu::Mpu;
 pub use nvic::Nvic;
+pub use sau::Sau;
 pub use scb::Scb;
 pub use systick::SysTick;
 
@@ -26,6 +33,11 @@ pub const PRIORITY_MASK: u8 = !(0xFF >> PRIORITY_BITS);
 
 pub const PPB_START: u32 = 0xE000_0000;
 pub const PPB_END: u32 = 0xE00F_FFFF;
+
+/// Non-secure alias of `0xE000_0000..=0xE000_FFFF`, accessible from Secure state only.
+const NS_ALIAS_START: u32 = 0xE002_0000;
+const NS_ALIAS_END: u32 = 0xE002_FFFF;
+const NS_ALIAS_OFFSET: u32 = 0x0002_0000;
 
 const SCS_START: u32 = 0xE000_E000;
 const SCS_END: u32 = 0xE000_EFFF;
@@ -49,8 +61,11 @@ const HFSR: u32 = 0xE000_ED2C;
 const MMFAR: u32 = 0xE000_ED34;
 const BFAR: u32 = 0xE000_ED38;
 const CPACR: u32 = 0xE000_ED88;
+const NSACR: u32 = 0xE000_ED8C;
 const MPU: u32 = 0xE000_ED90;
 const MPU_END: u32 = 0xE000_EDC7;
+const SAU: u32 = 0xE000_EDD0;
+const SAU_END: u32 = 0xE000_EDE8;
 const STIR: u32 = 0xE000_EF00;
 
 /// `ICTR.INTLINESNUM`: (number of IRQs / 32) - 1.
@@ -61,6 +76,9 @@ const SHPR_IMPLEMENTED: [bool; 12] = [
     true, true, true, true, false, false, false, true, true, false, true, true,
 ];
 
+/// `NSACR` bits: CP0-CP7, CP10, CP11.
+const NSACR_MASK: u32 = 0x0CFF;
+
 /// System Control Space state.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scs {
@@ -68,6 +86,7 @@ pub struct Scs {
     pub scb: Scb,
     pub systick: Banked<SysTick>,
     pub mpu: Banked<Mpu>,
+    pub sau: Sau,
     /// `ACTLR` (stored).
     pub actlr: u32,
     /// `CPPWR` (stored).
@@ -77,6 +96,16 @@ pub struct Scs {
 /// True for addresses the CPU handles itself instead of the `Bus`.
 pub fn is_ppb(addr: u32) -> bool {
     (PPB_START..=PPB_END).contains(&addr)
+}
+
+/// The register word and security view that an access from security state `from` to PPB word
+/// `word` reaches; `None` for the Non-secure alias accessed from Non-secure state (RAZ/WI).
+fn ppb_view(word: u32, from: Sec) -> Option<(u32, Sec)> {
+    if (NS_ALIAS_START..=NS_ALIAS_END).contains(&word) {
+        (from == Sec::Secure).then_some((word - NS_ALIAS_OFFSET, Sec::NonSecure))
+    } else {
+        Some((word, from))
+    }
 }
 
 fn size_bytes(size: MemSize) -> u32 {
@@ -104,9 +133,11 @@ impl Cpu {
         if addr & (n - 1) != 0 || !acc.privileged {
             return Err(BusError::Decode);
         }
-        let word = addr & !3;
+        let Some((word, view)) = ppb_view(addr & !3, self.regs.sec) else {
+            return Ok(0);
+        };
         let shift = 8 * (addr & 3);
-        let v = self.scs_read(word);
+        let v = self.scs_read(word, view);
         Ok(if n == 4 {
             v
         } else {
@@ -124,33 +155,46 @@ impl Cpu {
         acc: Access,
     ) -> Result<(), BusError> {
         let n = size_bytes(size);
-        let sec = self.regs.sec;
-        let user_stir =
-            addr == STIR && n == 4 && self.scs.scb.ccr.get(sec) & scb::CCR_USERSETMPEND != 0;
+        let view = ppb_view(addr & !3, self.regs.sec);
+        let user_stir = view.is_some_and(|(word, sec)| {
+            word == STIR && n == 4 && self.scs.scb.ccr.get(sec) & scb::CCR_USERSETMPEND != 0
+        });
         if addr & (n - 1) != 0 || !(acc.privileged || user_stir) {
             return Err(BusError::Decode);
         }
-        let word = addr & !3;
+        let Some((word, view)) = view else {
+            return Ok(());
+        };
         if n == 4 {
-            self.scs_write(word, v, u32::MAX);
+            self.scs_write(word, v, u32::MAX, view);
         } else if byte_accessible(word) {
             let shift = 8 * (addr & 3);
             let lanes = ((1u32 << (8 * n)) - 1) << shift;
-            self.scs_write(word, (v << shift) & lanes, lanes);
+            self.scs_write(word, (v << shift) & lanes, lanes, view);
         } else {
             log::warn!("PPB: {n}-byte write of {v:#x} to {addr:#010x} ignored (word access only)");
         }
         Ok(())
     }
 
-    /// Host (debugger/test) read of a PPB word: privileged, current security state, no fault.
-    pub fn ppb_read32(&mut self, addr: u32) -> u32 {
-        self.scs_read(addr & !3)
+    /// The view a host access uses: the current security state's, except that the Non-secure
+    /// alias always shows the Non-secure view.
+    fn host_view(&self, addr: u32) -> (u32, Sec) {
+        let word = addr & !3;
+        ppb_view(word, self.regs.sec).unwrap_or((word - NS_ALIAS_OFFSET, Sec::NonSecure))
     }
 
-    /// Host (debugger/test) write of a PPB word: privileged, current security state, no fault.
+    /// Host (debugger/test) read of a PPB word: privileged, no fault, in the current security
+    /// state's view; the Non-secure alias (`0xE002_xxxx`) always reads the Non-secure view.
+    pub fn ppb_read32(&mut self, addr: u32) -> u32 {
+        let (word, view) = self.host_view(addr);
+        self.scs_read(word, view)
+    }
+
+    /// Host (debugger/test) write of a PPB word, with the views of `ppb_read32`.
     pub fn ppb_write32(&mut self, addr: u32, v: u32) {
-        self.scs_write(addr & !3, v, u32::MAX);
+        let (word, view) = self.host_view(addr);
+        self.scs_write(word, v, u32::MAX, view);
     }
 
     /// Consume a latched `AIRCR.SYSRESETREQ` (the machine resets the system when it sees one).
@@ -165,128 +209,186 @@ impl Cpu {
         *self.scs.scb.init_vtor.get_mut(sec) = v;
     }
 
-    /// Read the PPB word at `word`; unimplemented registers read as zero with a warning.
-    fn scs_read(&mut self, word: u32) -> u32 {
+    /// Read the PPB word at `word` in view `view`; unimplemented registers read as zero with a
+    /// warning.
+    fn scs_read(&mut self, word: u32, view: Sec) -> u32 {
         let v = if (SCS_START..=SCS_END).contains(&word) {
-            self.scs_reg_read(word)
+            self.scs_reg_read(word, view)
         } else {
             None
         };
         v.unwrap_or_else(|| {
             log::warn!(
-                "PPB: read of unimplemented register {word:#010x} (pc {:#010x})",
+                "PPB: read of unimplemented register {word:#010x} ({view:?} view, pc {:#010x})",
                 self.regs.pc
             );
             0
         })
     }
 
-    /// Write the PPB word at `word`; `v` is already masked to the byte `lanes` being written.
-    fn scs_write(&mut self, word: u32, v: u32, lanes: u32) {
-        let done = (SCS_START..=SCS_END).contains(&word) && self.scs_reg_write(word, v, lanes);
+    /// Write the PPB word at `word` in view `view`; `v` is already masked to the byte `lanes`
+    /// being written.
+    fn scs_write(&mut self, word: u32, v: u32, lanes: u32, view: Sec) {
+        let done =
+            (SCS_START..=SCS_END).contains(&word) && self.scs_reg_write(word, v, lanes, view);
         if !done {
             log::warn!(
-                "PPB: write of {v:#x} to unimplemented register {word:#010x} (pc {:#010x})",
+                "PPB: write of {v:#x} to unimplemented register {word:#010x} ({view:?} view, \
+                 pc {:#010x})",
                 self.regs.pc
             );
         }
     }
 
-    fn scs_reg_read(&mut self, word: u32) -> Option<u32> {
-        let sec = self.regs.sec;
+    /// True when view `view` reaches the non-banked BusFault/NMI state: always from Secure,
+    /// from Non-secure only while `AIRCR.BFHFNMINS` hands those exceptions to Non-secure state.
+    fn sees_bf_nmi(&self, view: Sec) -> bool {
+        view == Sec::Secure || self.scs.scb.bfhfnmins
+    }
+
+    /// Which copy of the SHPR byte for exception `4 + k` view `view` reaches, if any.
+    fn shpr_copy(&self, k: usize, view: Sec) -> Option<Sec> {
+        let num = 4 + k as u16;
+        if !SHPR_IMPLEMENTED[k] {
+            None
+        } else if is_banked(num) {
+            Some(view)
+        } else if view == Sec::Secure || (num == BUSFAULT && self.scs.scb.bfhfnmins) {
+            Some(Sec::Secure)
+        } else {
+            // SecureFault and DebugMonitor priorities are RAZ/WI from Non-secure.
+            None
+        }
+    }
+
+    fn scs_reg_read(&mut self, word: u32, view: Sec) -> Option<u32> {
+        let secure = view == Sec::Secure;
+        let bf = self.sees_bf_nmi(view);
         let scb = &self.scs.scb;
         Some(match word {
             ICTR => ICTR_VALUE,
             ACTLR => self.scs.actlr,
             CPPWR => self.scs.cppwr,
-            SYSTICK..=0xE000_E01C => self.scs.systick.get_mut(sec).read(word - SYSTICK),
-            NVIC..=NVIC_END => return self.scs.nvic.read(word - NVIC),
+            SYSTICK..=0xE000_E01C => self.scs.systick.get_mut(view).read(word - SYSTICK),
+            NVIC..=NVIC_END => return self.scs.nvic.read(word - NVIC, !secure),
             CPUID => scb::CPUID,
-            ICSR => self.icsr(),
-            VTOR => *scb.vtor.get(sec),
+            ICSR => self.icsr(view),
+            VTOR => *scb.vtor.get(view),
             AIRCR => {
-                (scb::VECTKEYSTAT << 16)
-                    | (u32::from(scb.pris) << 14)
+                // PRIS and SYSRESETREQS are RAZ from Non-secure; BFHFNMINS is readable.
+                let mut v = (scb::VECTKEYSTAT << 16)
                     | (u32::from(scb.bfhfnmins) << 13)
-                    | (u32::from(*scb.prigroup.get(sec)) << 8)
-                    | (u32::from(scb.sysresetreqs) << 3)
+                    | (u32::from(*scb.prigroup.get(view)) << 8);
+                if secure {
+                    v |= (u32::from(scb.pris) << 14) | (u32::from(scb.sysresetreqs) << 3);
+                }
+                v
             }
-            SCR => *scb.scr.get(sec),
-            CCR => *scb.ccr.get(sec),
+            SCR => *scb.scr.get(view),
+            CCR => *scb.ccr.get(view),
             SHPR1..=SHPR3 => {
                 let base = (word - SHPR1) as usize;
-                u32::from_le_bytes(std::array::from_fn(|k| scb.shpr.get(sec)[base + k]))
+                u32::from_le_bytes(std::array::from_fn(|k| {
+                    self.shpr_copy(base + k, view)
+                        .map_or(0, |copy| scb.shpr.get(copy)[base + k])
+                }))
             }
-            SHCSR => self.shcsr(),
+            SHCSR => self.shcsr(view),
             CFSR => {
-                u32::from(*scb.mmfsr.get(sec))
-                    | (u32::from(scb.bfsr) << 8)
-                    | (u32::from(*scb.ufsr.get(sec)) << 16)
+                let bfsr = if bf { scb.bfsr } else { 0 };
+                u32::from(*scb.mmfsr.get(view))
+                    | (u32::from(bfsr) << 8)
+                    | (u32::from(*scb.ufsr.get(view)) << 16)
             }
             HFSR => scb.hfsr,
-            MMFAR => *scb.mmfar.get(sec),
-            BFAR => scb.bfar,
-            CPACR => *scb.cpacr.get(sec),
-            MPU..=MPU_END => return self.scs.mpu.get(sec).read(word - MPU),
+            MMFAR => *scb.mmfar.get(view),
+            BFAR if bf => scb.bfar,
+            BFAR => 0,
+            CPACR => *scb.cpacr.get(view),
+            NSACR => scb.nsacr,
+            MPU..=MPU_END => return self.scs.mpu.get(view).read(word - MPU),
+            // The SAU and SFSR/SFAR are RAZ/WI from Non-secure.
+            SAU..=SAU_END if secure => return self.scs.sau.read(word - SAU),
+            SAU..=SAU_END => 0,
             STIR => 0,
             _ => return None,
         })
     }
 
     /// Returns false for unimplemented registers.
-    fn scs_reg_write(&mut self, word: u32, v: u32, lanes: u32) -> bool {
-        let sec = self.regs.sec;
+    fn scs_reg_write(&mut self, word: u32, v: u32, lanes: u32, view: Sec) -> bool {
+        let secure = view == Sec::Secure;
+        let bf = self.sees_bf_nmi(view);
         match word {
             ICTR | CPUID => {}
             ACTLR => self.scs.actlr = v,
             CPPWR => self.scs.cppwr = v,
-            SYSTICK..=0xE000_E01C => self.scs.systick.get_mut(sec).write(word - SYSTICK, v),
+            SYSTICK..=0xE000_E01C => self.scs.systick.get_mut(view).write(word - SYSTICK, v),
             NVIC..=NVIC_END => {
-                let Some(newly) = self.scs.nvic.write(word - NVIC, v, lanes, PRIORITY_MASK) else {
+                let nvic = &mut self.scs.nvic;
+                let Some(newly) = nvic.write(word - NVIC, v, lanes, PRIORITY_MASK, !secure) else {
                     return false;
                 };
                 if newly != 0 {
                     self.on_irq_pended();
                 }
             }
-            ICSR => self.write_icsr(v),
-            VTOR => *self.scs.scb.vtor.get_mut(sec) = v & !0x7F,
-            AIRCR => self.write_aircr(v),
+            ICSR => self.write_icsr(v, view),
+            VTOR => *self.scs.scb.vtor.get_mut(view) = v & !0x7F,
+            AIRCR => self.write_aircr(v, view),
             SCR => {
-                let mask = if sec == Sec::Secure {
+                // SLEEPDEEPS is Secure-only.
+                let mask = if secure {
                     scb::SCR_WRITABLE
                 } else {
                     scb::SCR_WRITABLE & !(1 << 3)
                 };
-                *self.scs.scb.scr.get_mut(sec) = v & mask;
+                *self.scs.scb.scr.get_mut(view) = v & mask;
             }
             CCR => {
-                *self.scs.scb.ccr.get_mut(sec) = (v & scb::CCR_WRITABLE) | scb::CCR_RESET;
+                *self.scs.scb.ccr.get_mut(view) = (v & scb::CCR_WRITABLE) | scb::CCR_RESET;
             }
             SHPR1..=SHPR3 => {
                 let base = (word - SHPR1) as usize;
-                let shpr = self.scs.scb.shpr.get_mut(sec);
                 for k in 0..4 {
-                    if lanes >> (8 * k) & 0xFF != 0 && SHPR_IMPLEMENTED[base + k] {
-                        shpr[base + k] = (v >> (8 * k)) as u8 & PRIORITY_MASK;
+                    if lanes >> (8 * k) & 0xFF == 0 {
+                        continue;
+                    }
+                    if let Some(copy) = self.shpr_copy(base + k, view) {
+                        self.scs.scb.shpr.get_mut(copy)[base + k] =
+                            (v >> (8 * k)) as u8 & PRIORITY_MASK;
                     }
                 }
             }
-            SHCSR => self.write_shcsr(v),
+            SHCSR => self.write_shcsr(v, view),
             CFSR => {
                 let scb = &mut self.scs.scb;
-                *scb.mmfsr.get_mut(sec) &= !(v as u8);
-                scb.bfsr &= !((v >> 8) as u8);
-                *scb.ufsr.get_mut(sec) &= !((v >> 16) as u16);
+                *scb.mmfsr.get_mut(view) &= !(v as u8);
+                if bf {
+                    scb.bfsr &= !((v >> 8) as u8);
+                }
+                *scb.ufsr.get_mut(view) &= !((v >> 16) as u16);
             }
             HFSR => self.scs.scb.hfsr &= !v,
-            MMFAR => *self.scs.scb.mmfar.get_mut(sec) = v,
-            BFAR => self.scs.scb.bfar = v,
-            CPACR => *self.scs.scb.cpacr.get_mut(sec) = v & 0x00F0_FFFF,
-            MPU..=MPU_END => return self.scs.mpu.get_mut(sec).write(word - MPU, v),
+            MMFAR => *self.scs.scb.mmfar.get_mut(view) = v,
+            BFAR => {
+                if bf {
+                    self.scs.scb.bfar = v;
+                }
+            }
+            CPACR => *self.scs.scb.cpacr.get_mut(view) = v & 0x00F0_FFFF,
+            NSACR => {
+                if secure {
+                    self.scs.scb.nsacr = v & NSACR_MASK;
+                }
+            }
+            MPU..=MPU_END => return self.scs.mpu.get_mut(view).write(word - MPU, v),
+            SAU..=SAU_END if secure => return self.scs.sau.write(word - SAU, v),
+            SAU..=SAU_END => {}
             STIR => {
+                // Non-secure software can only pend interrupts that target Non-secure state.
                 let irq = (v & 0x1FF) as usize;
-                if irq < nvic::NUM_IRQS {
+                if irq < nvic::NUM_IRQS && (secure || !self.scs.nvic.targets_secure(irq)) {
                     self.pend_irq(irq);
                 }
             }
@@ -295,8 +397,7 @@ impl Cpu {
         true
     }
 
-    fn icsr(&self) -> u32 {
-        let sec = self.regs.sec;
+    fn icsr(&self, view: Sec) -> u32 {
         let mut v = u32::from(self.regs.xpsr.exception) & 0x1FF;
         if self.active_count() <= 1 {
             v |= 1 << 11; // RETTOBASE
@@ -307,96 +408,113 @@ impl Cpu {
         if self.scs.nvic.pending.iter().any(|&w| w != 0) {
             v |= 1 << 22; // ISRPENDING
         }
-        if self.exc_pending(15, sec) {
+        if self.exc_pending(SYSTICK_EXC, view) {
             v |= 1 << 26; // PENDSTSET
         }
-        if self.exc_pending(14, sec) {
+        if self.exc_pending(PENDSV, view) {
             v |= 1 << 28; // PENDSVSET
         }
-        if self.exc_pending(2, sec) {
+        if self.sees_bf_nmi(view) && self.exc_pending(NMI, view) {
             v |= 1 << 31; // PENDNMISET
         }
         v
     }
 
-    fn write_icsr(&mut self, v: u32) {
-        let sec = self.regs.sec;
-        // Task 8: PENDNMISET/CLR from Non-secure only when AIRCR.BFHFNMINS is set.
-        if v & (1 << 31) != 0 {
-            self.set_exc_pending(2, sec, true);
-        } else if v & (1 << 30) != 0 {
-            self.set_exc_pending(2, sec, false);
+    fn write_icsr(&mut self, v: u32, view: Sec) {
+        // PENDNMISET/CLR are WI from Non-secure unless NMI targets Non-secure state.
+        if self.sees_bf_nmi(view) {
+            if v & (1 << 31) != 0 {
+                self.set_exc_pending(NMI, view, true);
+            } else if v & (1 << 30) != 0 {
+                self.set_exc_pending(NMI, view, false);
+            }
         }
         if v & (1 << 28) != 0 {
-            self.set_exc_pending(14, sec, true);
+            self.set_exc_pending(PENDSV, view, true);
         } else if v & (1 << 27) != 0 {
-            self.set_exc_pending(14, sec, false);
+            self.set_exc_pending(PENDSV, view, false);
         }
         if v & (1 << 26) != 0 {
-            self.set_exc_pending(15, sec, true);
+            self.set_exc_pending(SYSTICK_EXC, view, true);
         } else if v & (1 << 25) != 0 {
-            self.set_exc_pending(15, sec, false);
+            self.set_exc_pending(SYSTICK_EXC, view, false);
         }
     }
 
-    fn write_aircr(&mut self, v: u32) {
+    fn write_aircr(&mut self, v: u32, view: Sec) {
         if v >> 16 != scb::VECTKEY {
             return;
         }
-        let sec = self.regs.sec;
         let scb = &mut self.scs.scb;
-        *scb.prigroup.get_mut(sec) = (v >> 8 & 7) as u8;
-        if sec == Sec::Secure {
+        *scb.prigroup.get_mut(view) = (v >> 8 & 7) as u8;
+        if view == Sec::Secure {
             scb.pris = v & (1 << 14) != 0;
             scb.bfhfnmins = v & (1 << 13) != 0;
             scb.sysresetreqs = v & (1 << 3) != 0;
         }
-        if v & (1 << 2) != 0 && (sec == Sec::Secure || !scb.sysresetreqs) {
+        if v & (1 << 2) != 0 && (view == Sec::Secure || !scb.sysresetreqs) {
             log::info!("AIRCR.SYSRESETREQ written (pc {:#010x})", self.regs.pc);
             scb.sysresetreq = true;
         }
     }
 
-    fn shcsr(&self) -> u32 {
-        let sec = self.regs.sec;
+    /// Whether view `view` sees the SHCSR state bits of exception `num`: the Secure view sees
+    /// all of them; the Non-secure view sees the banked exceptions, and BusFault and NMI only
+    /// with `AIRCR.BFHFNMINS` (never SecureFault or DebugMonitor).
+    fn shcsr_visible(&self, num: u16, view: Sec) -> bool {
+        view == Sec::Secure
+            || is_banked(num)
+            || (matches!(num, BUSFAULT | NMI) && self.sees_bf_nmi(view))
+    }
+
+    fn shcsr(&self, view: Sec) -> u32 {
         let scb = &self.scs.scb;
-        let mut v = scb.shcsr_ena.get(sec) & (scb::MEMFAULTENA | scb::USGFAULTENA)
-            | scb.shcsr_ena.s & (scb::BUSFAULTENA | scb::SECUREFAULTENA);
+        let mut v = scb.shcsr_ena.get(view) & (scb::MEMFAULTENA | scb::USGFAULTENA);
+        if view == Sec::Secure {
+            v |= scb.shcsr_ena.s & (scb::BUSFAULTENA | scb::SECUREFAULTENA);
+        } else if scb.bfhfnmins {
+            v |= scb.shcsr_ena.s & scb::BUSFAULTENA;
+        }
         for (bit, num, pending) in scb::SHCSR_STATE_BITS {
+            if !self.shcsr_visible(num, view) {
+                continue;
+            }
             let set = if pending {
-                self.exc_pending(num, sec)
+                self.exc_pending(num, view)
             } else {
-                self.exc_active(num, sec)
+                self.exc_active(num, view)
             };
             if set {
                 v |= 1 << bit;
             }
         }
-        if self.exc_pending(3, sec) {
+        if self.exc_pending(HARDFAULT, view) {
             v |= scb::SHCSR_HARDFAULTPENDED;
         }
         v
     }
 
-    fn write_shcsr(&mut self, v: u32) {
-        let sec = self.regs.sec;
+    fn write_shcsr(&mut self, v: u32, view: Sec) {
         let banked = scb::MEMFAULTENA | scb::USGFAULTENA;
-        let scb = &mut self.scs.scb;
-        *scb.shcsr_ena.get_mut(sec) = v & banked;
-        if sec == Sec::Secure {
-            scb.shcsr_ena.s |= v & (scb::BUSFAULTENA | scb::SECUREFAULTENA);
+        let bfhfnmins = self.scs.scb.bfhfnmins;
+        let ena = &mut self.scs.scb.shcsr_ena;
+        *ena.get_mut(view) = v & banked;
+        if view == Sec::Secure {
+            ena.s |= v & (scb::BUSFAULTENA | scb::SECUREFAULTENA);
+        } else if bfhfnmins {
+            ena.s = (ena.s & !scb::BUSFAULTENA) | (v & scb::BUSFAULTENA);
         }
         // The active and pending bits are writable (used by context-switching software), except
         // NMIACT and HARDFAULTACT.
         for (bit, num, pending) in scb::SHCSR_STATE_BITS {
-            if matches!(num, 2 | 3) {
+            if matches!(num, NMI | HARDFAULT) || !self.shcsr_visible(num, view) {
                 continue;
             }
             let set = v & (1 << bit) != 0;
             if pending {
-                self.set_exc_pending(num, sec, set);
+                self.set_exc_pending(num, view, set);
             } else {
-                self.set_exc_active(num, sec, set);
+                self.set_exc_active(num, view, set);
             }
         }
     }
@@ -446,7 +564,7 @@ impl Cpu {
     pub fn tick_systick(&mut self, cycles: u32) {
         for sec in [Sec::Secure, Sec::NonSecure] {
             if self.scs.systick.get_mut(sec).tick(cycles) {
-                self.set_exc_pending(15, sec, true);
+                self.set_exc_pending(SYSTICK_EXC, sec, true);
             }
         }
     }
