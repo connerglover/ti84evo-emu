@@ -24,6 +24,10 @@ pub struct Cpu {
     pub regs: Registers,
     /// Event register set by SEV and consumed by WFE.
     pub event: bool,
+    /// Local exclusive monitor: the address of the open LDREX reservation, if any. Cleared by
+    /// CLREX and by every STREX.
+    // Task 7: also clear this on exception entry and exception return.
+    pub exclusive: Option<u32>,
     /// Cycles charged on top of the base cost by the current instruction (per-step scratch).
     #[serde(skip)]
     pub(crate) extra_cycles: u32,
@@ -46,6 +50,7 @@ impl Cpu {
         Self {
             regs,
             event: false,
+            exclusive: None,
             extra_cycles: 0,
         }
     }

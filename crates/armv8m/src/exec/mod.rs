@@ -83,9 +83,22 @@ pub(crate) fn execute(
         | Instr::Push { .. }
         | Instr::Pop { .. }
         | Instr::Ldm { .. }
-        | Instr::Stm { .. } => mem::execute(cpu, bus, instr),
+        | Instr::Stm { .. }
+        | Instr::LoadUnpriv { .. }
+        | Instr::StoreUnpriv { .. }
+        | Instr::Ldrd { .. }
+        | Instr::Strd { .. }
+        | Instr::Ldmdb { .. }
+        | Instr::Stmdb { .. }
+        | Instr::Ldrex { .. }
+        | Instr::Strex { .. }
+        | Instr::Lda { .. }
+        | Instr::Stl { .. }
+        | Instr::Clrex
+        | Instr::Tb { .. } => mem::execute(cpu, bus, instr),
         Instr::B { .. }
         | Instr::BCond { .. }
+        | Instr::Bl { .. }
         | Instr::Cbz { .. }
         | Instr::Bx { .. }
         | Instr::Blx { .. } => branch::execute(cpu, instr),
@@ -93,7 +106,12 @@ pub(crate) fn execute(
         | Instr::Svc { .. }
         | Instr::Bkpt { .. }
         | Instr::Cps { .. }
-        | Instr::Hint(_) => sys::execute(cpu, instr),
+        | Instr::Hint(_)
+        | Instr::Preload { .. }
+        | Instr::Msr { .. }
+        | Instr::Mrs { .. }
+        | Instr::Barrier { .. }
+        | Instr::Coprocessor { .. } => sys::execute(cpu, instr),
         // Intercepted in `Cpu::step` before execution.
         Instr::Undefined { .. } => None,
     };

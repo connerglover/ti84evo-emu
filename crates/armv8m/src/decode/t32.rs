@@ -1,19 +1,21 @@
-//! 32-bit Thumb decode: data processing, multiply and divide.
+//! 32-bit Thumb decode: data processing, multiply and divide. Loads/stores and
+//! coprocessor space live in `t32_mem`, branches and system instructions in `t32_branch`.
 //!
 //! Encodings the ARM ARM marks UNPREDICTABLE for SP/PC operands decode to
 //! `Instr::Undefined`. The exceptions are the forms where SP is architecturally valid
 //! (SP-based ADD/SUB, and a SP base for CMP/CMN only; TST/TEQ reject SP) and the `Rd == 15`
 //! encodings that are the compare/test aliases (CMP/CMN/TST/TEQ).
 
+use super::{t32_branch, t32_mem};
 use crate::bits::{SRType, decode_imm_shift, thumb_expand_imm_c};
 use crate::instr::{AluOp, Instr, LongMulKind, RevKind, Shift};
 
 /// Operand register that is neither SP nor PC.
-fn gp(r: u8) -> bool {
+pub(super) fn gp(r: u8) -> bool {
     r != 13 && r != 15
 }
 
-fn field(v: u32, lsb: u32, width: u32) -> u32 {
+pub(super) fn field(v: u32, lsb: u32, width: u32) -> u32 {
     (v >> lsb) & ((1 << width) - 1)
 }
 
@@ -28,11 +30,21 @@ pub fn decode32(hw1: u16, hw2: u16) -> Instr {
                 plain_imm(h1, h2)
             }
         }
-        0b11101 if hw1 >> 9 == 0b1110101 => shifted_reg(h1, h2),
+        0b11110 => t32_branch::branch_misc(h1, h2),
+        0b11101 => match hw1 >> 9 {
+            0b1110101 => shifted_reg(h1, h2),
+            0b1110100 => t32_mem::multiple_dual_exclusive(h1, h2),
+            _ => Some(Instr::Coprocessor {
+                raw: (h1 << 16) | h2,
+            }),
+        },
         0b11111 => match hw1 >> 8 {
             0xFA => register_ops(h1, h2),
             0xFB => multiply(h1, h2),
-            _ => None,
+            0xF8 | 0xF9 => t32_mem::load_store_single(h1, h2),
+            _ => Some(Instr::Coprocessor {
+                raw: (h1 << 16) | h2,
+            }),
         },
         _ => None,
     };

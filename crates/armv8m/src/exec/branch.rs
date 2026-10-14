@@ -16,6 +16,10 @@ fn branch_rel(cpu: &mut Cpu, offset: u32) -> Flow {
 pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
     let flow = match *instr {
         Instr::B { imm } => branch_rel(cpu, imm as u32),
+        Instr::Bl { imm } => {
+            cpu.regs.lr = cpu.regs.pc.wrapping_add(4) | 1;
+            branch_rel(cpu, imm as u32)
+        }
         Instr::BCond { cond, imm } => {
             if condition_holds(cond, &cpu.regs.xpsr) {
                 branch_rel(cpu, imm as u32)

@@ -1,7 +1,7 @@
 //! Disassembly in GNU/UAL syntax (lowercase, `sp`/`lr`/`pc` names).
 
 use crate::bits::SRType;
-use crate::instr::{AluOp, HintOp, Instr, LongMulKind, MemSize, Reg, RevKind, Shift};
+use crate::instr::{AluOp, BarrierKind, HintOp, Instr, LongMulKind, MemSize, Reg, RevKind, Shift};
 
 const COND: [&str; 16] = [
     "eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al", "nv",
@@ -127,6 +127,95 @@ fn mem_reg_text(name: &str, rt: Reg, rn: Reg, rm: Reg, shift: u8) -> String {
 /// Branch target for an offset relative to `PC + 4`.
 fn branch_target(addr: u32, off: i32) -> u32 {
     addr.wrapping_add(4).wrapping_add(off as u32)
+}
+
+/// `[rn, #+/-imm]` with the zero offset elided.
+fn addr_imm(rn: Reg, v: u32, add: bool) -> String {
+    match (v, add) {
+        (0, true) => format!("[{}]", r(rn)),
+        (_, true) => format!("[{}, #{v}]", r(rn)),
+        (_, false) => format!("[{}, #-{v}]", r(rn)),
+    }
+}
+
+/// Dual load/store operand text after the two registers.
+fn dual_text(
+    name: &str,
+    (rt, rt2, rn): (Reg, Reg, Reg),
+    v: u32,
+    mode: (bool, bool, bool),
+) -> String {
+    let (index, add, wback) = mode;
+    let sign = if add { "" } else { "-" };
+    let regs = format!("{name} {}, {}", r(rt), r(rt2));
+    match (index, wback) {
+        (true, false) => format!("{regs}, {}", addr_imm(rn, v, add)),
+        (true, true) => format!("{regs}, [{}, #{sign}{v}]!", r(rn)),
+        (false, _) => format!("{regs}, [{}], #{sign}{v}", r(rn)),
+    }
+}
+
+/// `b` / `h` / empty suffix of the exclusive and acquire/release mnemonics.
+fn sz(size: MemSize) -> &'static str {
+    size_suffix(size, false)
+}
+
+/// Name of a special register for MSR/MRS; `mask` adds the APSR field suffix (MSR only).
+fn sysm_name(sysm: u8, mask: Option<u8>) -> String {
+    let apsr_suffix = || match mask {
+        Some(2) => "_nzcvq",
+        Some(1) => "_g",
+        Some(3) => "_nzcvqg",
+        _ => "",
+    };
+    match sysm {
+        0 => format!("APSR{}", apsr_suffix()),
+        1 => format!("IAPSR{}", apsr_suffix()),
+        2 => format!("EAPSR{}", apsr_suffix()),
+        3 => format!("XPSR{}", apsr_suffix()),
+        5 => "IPSR".to_string(),
+        6 => "EPSR".to_string(),
+        7 => "IEPSR".to_string(),
+        8 => "MSP".to_string(),
+        9 => "PSP".to_string(),
+        10 => "MSPLIM".to_string(),
+        11 => "PSPLIM".to_string(),
+        16 => "PRIMASK".to_string(),
+        17 => "BASEPRI".to_string(),
+        18 => "BASEPRI_MAX".to_string(),
+        19 => "FAULTMASK".to_string(),
+        20 => "CONTROL".to_string(),
+        0x88 => "MSP_NS".to_string(),
+        0x89 => "PSP_NS".to_string(),
+        0x8A => "MSPLIM_NS".to_string(),
+        0x8B => "PSPLIM_NS".to_string(),
+        0x90 => "PRIMASK_NS".to_string(),
+        0x91 => "BASEPRI_NS".to_string(),
+        0x92 => "BASEPRI_MAX_NS".to_string(),
+        0x93 => "FAULTMASK_NS".to_string(),
+        0x94 => "CONTROL_NS".to_string(),
+        _ => format!("{sysm:#x}"),
+    }
+}
+
+fn barrier_text(kind: BarrierKind, option: u8) -> String {
+    let name = match kind {
+        BarrierKind::Dsb => "dsb",
+        BarrierKind::Dmb => "dmb",
+        BarrierKind::Isb => "isb",
+    };
+    let opt = match option {
+        0xF => "sy".to_string(),
+        0xE => "st".to_string(),
+        0xB => "ish".to_string(),
+        0xA => "ishst".to_string(),
+        0x7 => "nsh".to_string(),
+        0x6 => "nshst".to_string(),
+        0x3 => "osh".to_string(),
+        0x2 => "oshst".to_string(),
+        n => format!("#{n:#x}"),
+    };
+    format!("{name} {opt}")
 }
 
 fn it_text(firstcond: u8, mask: u8) -> String {
@@ -405,7 +494,7 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
             add,
             wback,
         } => {
-            let name = format!("ldr{}", size_suffix(size, signed));
+            let name = format!("ldr{}{}", size_suffix(size, signed), w(len));
             mem_imm_text(&name, rt, rn, v, index, add, wback)
         }
         Instr::StoreImm {
@@ -417,7 +506,7 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
             add,
             wback,
         } => {
-            let name = format!("str{}", size_suffix(size, false));
+            let name = format!("str{}{}", size_suffix(size, false), w(len));
             mem_imm_text(&name, rt, rn, v, index, add, wback)
         }
         Instr::LoadReg {
@@ -428,7 +517,7 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
             size,
             signed,
         } => {
-            let name = format!("ldr{}", size_suffix(size, signed));
+            let name = format!("ldr{}{}", size_suffix(size, signed), w(len));
             mem_reg_text(&name, rt, rn, rm, shift)
         }
         Instr::StoreReg {
@@ -438,29 +527,149 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
             shift,
             size,
         } => {
-            let name = format!("str{}", size_suffix(size, false));
+            let name = format!("str{}{}", size_suffix(size, false), w(len));
             mem_reg_text(&name, rt, rn, rm, shift)
         }
         Instr::LdrLit { rt, imm: v, add } => {
             let sign = if add { "" } else { "-" };
             if v == 0 && add {
-                format!("ldr {}, [pc]", r(rt))
+                format!("ldr{} {}, [pc]", w(len), r(rt))
             } else {
-                format!("ldr {}, [pc, #{sign}{v}]", r(rt))
+                format!("ldr{} {}, [pc, #{sign}{v}]", w(len), r(rt))
             }
         }
-        Instr::Push { regs } => format!("push {}", reg_list(regs)),
-        Instr::Pop { regs } => format!("pop {}", reg_list(regs)),
+        Instr::Push { regs } => format!("push{} {}", w(len), reg_list(regs)),
+        Instr::Pop { regs } => format!("pop{} {}", w(len), reg_list(regs)),
         Instr::Ldm { rn, regs, wback } => {
-            format!("ldmia {}{}, {}", r(rn), bang(wback), reg_list(regs))
+            format!(
+                "ldmia{} {}{}, {}",
+                w(len),
+                r(rn),
+                bang(wback),
+                reg_list(regs)
+            )
         }
         Instr::Stm { rn, regs, wback } => {
-            format!("stmia {}{}, {}", r(rn), bang(wback), reg_list(regs))
+            format!(
+                "stmia{} {}{}, {}",
+                w(len),
+                r(rn),
+                bang(wback),
+                reg_list(regs)
+            )
         }
-        Instr::B { imm: off } => format!("b {:#x}", branch_target(addr, off)),
+        Instr::Ldmdb { rn, regs, wback } => {
+            format!("ldmdb {}{}, {}", r(rn), bang(wback), reg_list(regs))
+        }
+        Instr::Stmdb { rn, regs, wback } => {
+            format!("stmdb {}{}, {}", r(rn), bang(wback), reg_list(regs))
+        }
+        Instr::LoadUnpriv {
+            rt,
+            rn,
+            imm: v,
+            size,
+            signed,
+        } => format!(
+            "ldr{}t {}, {}",
+            size_suffix(size, signed),
+            r(rt),
+            addr_imm(rn, v, true)
+        ),
+        Instr::StoreUnpriv {
+            rt,
+            rn,
+            imm: v,
+            size,
+        } => format!(
+            "str{}t {}, {}",
+            size_suffix(size, false),
+            r(rt),
+            addr_imm(rn, v, true)
+        ),
+        Instr::Ldrd {
+            rt,
+            rt2,
+            rn,
+            imm: v,
+            index,
+            add,
+            wback,
+        } => dual_text("ldrd", (rt, rt2, rn), v, (index, add, wback)),
+        Instr::Strd {
+            rt,
+            rt2,
+            rn,
+            imm: v,
+            index,
+            add,
+            wback,
+        } => dual_text("strd", (rt, rt2, rn), v, (index, add, wback)),
+        Instr::Ldrex {
+            rt,
+            rn,
+            imm: v,
+            size,
+            acquire,
+        } => format!(
+            "ld{}ex{} {}, {}",
+            if acquire { "a" } else { "r" },
+            sz(size),
+            r(rt),
+            addr_imm(rn, v, true)
+        ),
+        Instr::Strex {
+            rd,
+            rt,
+            rn,
+            imm: v,
+            size,
+            release,
+        } => format!(
+            "st{}ex{} {}, {}, {}",
+            if release { "l" } else { "r" },
+            sz(size),
+            r(rd),
+            r(rt),
+            addr_imm(rn, v, true)
+        ),
+        Instr::Lda { rt, rn, size } => format!("lda{} {}, [{}]", sz(size), r(rt), r(rn)),
+        Instr::Stl { rt, rn, size } => format!("stl{} {}, [{}]", sz(size), r(rt), r(rn)),
+        Instr::Clrex => "clrex".to_string(),
+        Instr::Tb { rn, rm, half } => {
+            if half {
+                format!("tbh [{}, {}, lsl #1]", r(rn), r(rm))
+            } else {
+                format!("tbb [{}, {}]", r(rn), r(rm))
+            }
+        }
+        Instr::Preload {
+            instr: pli,
+            rn,
+            rm,
+            shift,
+            imm: v,
+            add,
+        } => {
+            let name = if pli { "pli" } else { "pld" };
+            match rm {
+                None => format!("{name} {}", addr_imm(rn, v, add)),
+                Some(rm) if shift == 0 => format!("{name} [{}, {}]", r(rn), r(rm)),
+                Some(rm) => format!("{name} [{}, {}, lsl #{shift}]", r(rn), r(rm)),
+            }
+        }
+        Instr::Bl { imm: off } => format!("bl {:#x}", branch_target(addr, off)),
+        Instr::Msr { sysm, rn, mask } => {
+            format!("msr {}, {}", sysm_name(sysm, Some(mask)), r(rn))
+        }
+        Instr::Mrs { rd, sysm } => format!("mrs {}, {}", r(rd), sysm_name(sysm, None)),
+        Instr::Barrier { kind, option } => barrier_text(kind, option),
+        Instr::Coprocessor { raw } => format!(".inst.w {raw:#010x} @ coprocessor"),
+        Instr::B { imm: off } => format!("b{} {:#x}", w(len), branch_target(addr, off)),
         Instr::BCond { cond, imm: off } => format!(
-            "b{} {:#x}",
+            "b{}{} {:#x}",
             COND[usize::from(cond & 15)],
+            w(len),
             branch_target(addr, off)
         ),
         Instr::Cbz {
@@ -481,14 +690,17 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
             if i { "i" } else { "" },
             if f { "f" } else { "" }
         ),
-        Instr::Hint(op) => match op {
-            HintOp::Nop => "nop",
-            HintOp::Yield => "yield",
-            HintOp::Wfe => "wfe",
-            HintOp::Wfi => "wfi",
-            HintOp::Sev => "sev",
+        Instr::Hint(op) => {
+            match op {
+                HintOp::Nop => "nop",
+                HintOp::Yield => "yield",
+                HintOp::Wfe => "wfe",
+                HintOp::Wfi => "wfi",
+                HintOp::Sev => "sev",
+            }
+            .to_string()
+                + w(len)
         }
-        .to_string(),
         Instr::Extend {
             rd,
             rm,
@@ -584,6 +796,9 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
         Instr::Undefined { raw } => match len {
             2 if raw & 0xFF00 == 0xDE00 => format!("udf #{}", raw & 0xFF),
             2 => format!(".short {raw:#06x}"),
+            4 if raw & 0xFFF0_F000 == 0xF7F0_A000 => {
+                format!("udf.w #{}", ((raw >> 4) & 0xF000) | (raw & 0xFFF))
+            }
             _ => format!(".inst.w {raw:#010x}"),
         },
     }

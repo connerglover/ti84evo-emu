@@ -71,6 +71,14 @@ pub enum HintOp {
     Sev,
 }
 
+/// Memory barrier flavours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarrierKind {
+    Dsb,
+    Dmb,
+    Isb,
+}
+
 /// A decoded instruction. Immediates are already expanded. For 16-bit forms
 /// that set flags only outside an IT block, `setflags` is `true` and the
 /// executor suppresses it inside an IT block.
@@ -434,6 +442,120 @@ pub enum Instr {
         rn: Reg,
         rm: Reg,
         signed: bool,
+    },
+    /// `LDR{B,H,SB,SH}T rt, [rn, #imm]`: load with unprivileged permissions.
+    LoadUnpriv {
+        rt: Reg,
+        rn: Reg,
+        imm: u32,
+        size: MemSize,
+        signed: bool,
+    },
+    /// `STR{B,H}T rt, [rn, #imm]`: store with unprivileged permissions.
+    StoreUnpriv {
+        rt: Reg,
+        rn: Reg,
+        imm: u32,
+        size: MemSize,
+    },
+    /// `LDRD rt, rt2, [rn, #+/-imm]` (`rn == 15` is the literal form, base `Align(PC, 4)`).
+    Ldrd {
+        rt: Reg,
+        rt2: Reg,
+        rn: Reg,
+        imm: u32,
+        index: bool,
+        add: bool,
+        wback: bool,
+    },
+    /// `STRD rt, rt2, [rn, #+/-imm]`
+    Strd {
+        rt: Reg,
+        rt2: Reg,
+        rn: Reg,
+        imm: u32,
+        index: bool,
+        add: bool,
+        wback: bool,
+    },
+    /// `LDMDB rn{!}, regs`
+    Ldmdb {
+        rn: Reg,
+        regs: u16,
+        wback: bool,
+    },
+    /// `STMDB rn{!}, regs`
+    Stmdb {
+        rn: Reg,
+        regs: u16,
+        wback: bool,
+    },
+    /// `LDREX{B,H}` / `LDAEX{B,H}`: load and open the exclusive monitor.
+    Ldrex {
+        rt: Reg,
+        rn: Reg,
+        imm: u32,
+        size: MemSize,
+        acquire: bool,
+    },
+    /// `STREX{B,H}` / `STLEX{B,H}`: `rd` receives 0 on success, 1 on failure.
+    Strex {
+        rd: Reg,
+        rt: Reg,
+        rn: Reg,
+        imm: u32,
+        size: MemSize,
+        release: bool,
+    },
+    /// `LDA{B,H}`: load-acquire.
+    Lda {
+        rt: Reg,
+        rn: Reg,
+        size: MemSize,
+    },
+    /// `STL{B,H}`: store-release.
+    Stl {
+        rt: Reg,
+        rn: Reg,
+        size: MemSize,
+    },
+    Clrex,
+    /// `TBB` / `TBH`: table branch.
+    Tb {
+        rn: Reg,
+        rm: Reg,
+        half: bool,
+    },
+    /// `PLD` / `PLI` (a no-op here): `[rn, #+/-imm]` or `[rn, rm, LSL #shift]` when `rm` is set.
+    Preload {
+        instr: bool,
+        rn: Reg,
+        rm: Option<Reg>,
+        shift: u8,
+        imm: u32,
+        add: bool,
+    },
+    /// `BL`; `imm` is the signed offset from PC + 4.
+    Bl {
+        imm: i32,
+    },
+    /// `MSR sysm, rn`; `mask` is the APSR field mask (bit 1 = NZCVQ, bit 0 = GE).
+    Msr {
+        sysm: u8,
+        rn: Reg,
+        mask: u8,
+    },
+    Mrs {
+        rd: Reg,
+        sysm: u8,
+    },
+    Barrier {
+        kind: BarrierKind,
+        option: u8,
+    },
+    /// Coprocessor space (including the FP load/stores); raises NOCP.
+    Coprocessor {
+        raw: u32,
     },
     Undefined {
         raw: u32,
