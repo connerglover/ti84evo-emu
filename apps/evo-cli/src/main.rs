@@ -72,7 +72,8 @@ enum Command {
         /// `uart2: N bytes` on stderr.
         #[arg(long)]
         uart: bool,
-        /// Feed the bytes of FILE into UART0's receiver at cycle 0.
+        /// Feed the bytes of FILE into UART0's receiver at the start of the run (after
+        /// --load-state).
         #[arg(long, value_name = "FILE")]
         uart_in: Option<PathBuf>,
         /// Keep the flash and the NOR security registers in PATH across runs: read at the
@@ -81,6 +82,17 @@ enum Command {
         /// the run ends. A failed write-back exits 1.
         #[arg(long, value_name = "PATH")]
         flash_file: Option<PathBuf>,
+        /// Restore the machine from a save state written by --save-state, after booting the
+        /// bundle (and reading --flash-file). The state must come from the same bundle; an
+        /// invalid or mismatched state is an error (exit 1) before the run starts, and the flash
+        /// file is not touched. The --max-cycles budget counts from the restored cycle.
+        #[arg(long, value_name = "FILE")]
+        load_state: Option<PathBuf>,
+        /// Write a save state of the machine to FILE when the run ends, however it ends. The
+        /// flash and the NOR security registers are not in it (see --flash-file). A failed
+        /// write exits 1.
+        #[arg(long, value_name = "FILE")]
+        save_state: Option<PathBuf>,
         /// Write the LCD image (320x240) to FILE.png as an RGB8 PNG when the run stops, or at
         /// --after. While the LCD is off, prints `screenshot: display is off` on stderr and
         /// writes nothing; the exit status is unchanged.
@@ -142,6 +154,8 @@ fn main() -> ExitCode {
             uart,
             uart_in,
             flash_file,
+            load_state,
+            save_state,
             screenshot,
             after,
             keys,
@@ -156,6 +170,8 @@ fn main() -> ExitCode {
             uart,
             uart_in,
             flash_file,
+            load_state,
+            save_state,
             screenshot,
             after,
             keys: keys.map(|k| k.0).unwrap_or_default(),
@@ -234,6 +250,8 @@ mod tests {
             uart,
             uart_in,
             flash_file,
+            load_state,
+            save_state,
             screenshot,
             after,
             keys,
@@ -242,6 +260,8 @@ mod tests {
             panic!("not run");
         };
         assert_eq!(screenshot, None);
+        assert_eq!(load_state, None);
+        assert_eq!(save_state, None);
         assert_eq!(after, None);
         assert_eq!(keys, None);
         assert_eq!(bundle, PathBuf::from("os.84b2"));
@@ -278,6 +298,10 @@ mod tests {
             "in.bin",
             "--flash-file",
             "nv.evoflash",
+            "--load-state",
+            "in.state",
+            "--save-state",
+            "out.state",
             "--screenshot",
             "s.png",
             "--after",
@@ -296,6 +320,8 @@ mod tests {
             uart,
             uart_in,
             flash_file,
+            load_state,
+            save_state,
             screenshot,
             after,
             keys,
@@ -313,6 +339,8 @@ mod tests {
         assert!(uart);
         assert_eq!(uart_in, Some(PathBuf::from("in.bin")));
         assert_eq!(flash_file, Some(PathBuf::from("nv.evoflash")));
+        assert_eq!(load_state, Some(PathBuf::from("in.state")));
+        assert_eq!(save_state, Some(PathBuf::from("out.state")));
         assert_eq!(screenshot, Some(PathBuf::from("s.png")));
         assert_eq!(after, Some(1_000));
         let on = evo_core::Key::On;

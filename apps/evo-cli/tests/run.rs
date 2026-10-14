@@ -675,6 +675,68 @@ fn cli_flash_file_write_failure_exits_1() {
     );
 }
 
+/// The cycle count of the `stop: cycle-limit` line.
+fn stop_cycles(out: &str) -> u64 {
+    out.lines()
+        .find_map(|l| l.strip_prefix("stop: cycle-limit pc="))
+        .and_then(|l| l.split("cycles=").nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_else(|| panic!("no stop line: {out}"))
+}
+
+/// A run saved with `--save-state` resumes with `--load-state`: the second run's budget
+/// counts from where the first one stopped.
+#[test]
+fn cli_save_then_load_state() {
+    let bundle = bundle_file("cli_save_then_load_state", looping());
+    let state = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cli_save_then_load_state.state");
+    let _ = std::fs::remove_file(&state);
+    let c1 = stop_cycles(&stdout(
+        evo_cli()
+            .arg("run")
+            .arg(&bundle)
+            .args(["--max-cycles", "1000", "--save-state"])
+            .arg(&state),
+        0,
+    ));
+    assert!(state.exists(), "state written");
+    let c2 = stop_cycles(&stdout(
+        evo_cli()
+            .arg("run")
+            .arg(&bundle)
+            .args(["--max-cycles", "1000", "--load-state"])
+            .arg(&state),
+        0,
+    ));
+    // The overshoot bound covers the longest instruction.
+    assert!((c1 + 1000..=c1 + 1010).contains(&c2), "c1={c1} c2={c2}");
+}
+
+/// A state file that is not a save state is reported (exit 1, naming the path) before the run
+/// starts, and the flash file is not touched.
+#[test]
+fn cli_bad_state_file_exits_1() {
+    let bundle = bundle_file("cli_bad_state_file", looping());
+    let state = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cli_bad_state_file.state");
+    std::fs::write(&state, b"not a save state").expect("write");
+    let flash = flash_file("cli_bad_state_file");
+    let out = evo_cli()
+        .arg("run")
+        .arg(&bundle)
+        .args(["--max-cycles", "1000", "--flash-file"])
+        .arg(&flash)
+        .arg("--load-state")
+        .arg(&state)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("cli_bad_state_file.state"), "{stderr}");
+    assert!(out.stdout.is_empty(), "the run never started");
+    assert!(!flash.exists(), "flash file not written");
+}
+
 /// A guest that drops the power hold (GPIO pin 1) is reported on stderr after the run.
 #[test]
 fn cli_reports_power_off() {

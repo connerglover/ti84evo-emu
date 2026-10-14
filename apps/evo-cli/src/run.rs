@@ -28,6 +28,10 @@ pub struct RunArgs {
     pub uart_in: Option<PathBuf>,
     /// The flash file: read at the start (missing: an erased part), written back at the end.
     pub flash_file: Option<PathBuf>,
+    /// A save state to restore after booting (and reading the flash file).
+    pub load_state: Option<PathBuf>,
+    /// Where to write a save state when the run ends.
+    pub save_state: Option<PathBuf>,
     /// Where to write the screenshot PNG.
     pub screenshot: Option<PathBuf>,
     /// Cycles from the start of the run at which to take the screenshot; `None`: at the stop.
@@ -149,6 +153,16 @@ pub fn main(args: RunArgs) -> ExitCode {
         },
         None => None,
     };
+    let state = match &args.load_state {
+        Some(path) => match fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                eprintln!("evo-cli: {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
     let mut machine = match Machine::from_bundle_nv(&bundle, &Layout::EVO_7_1, nv) {
         Ok(m) => m,
         Err(e) => {
@@ -156,6 +170,14 @@ pub fn main(args: RunArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // A state that does not fit is an input error too: reported before the run, with the flash
+    // file untouched.
+    if let (Some(path), Some(bytes)) = (&args.load_state, &state)
+        && let Err(e) = machine.load_state(bytes)
+    {
+        eprintln!("evo-cli: {}: {e}", path.display());
+        return ExitCode::FAILURE;
+    }
     if let Some(bytes) = &uart_in {
         machine.inject_uart_rx(UartPort::Uart0, bytes);
     }
@@ -163,6 +185,16 @@ pub fn main(args: RunArgs) -> ExitCode {
     if machine.take_power_off() {
         eprintln!("power: off (GPIO pin 1 released)");
     }
+    let code = match &args.save_state {
+        Some(path) => match write_state(path, &machine.save_state()) {
+            Ok(()) => code,
+            Err(e) => {
+                eprintln!("evo-cli: {}: {e}", path.display());
+                ExitCode::FAILURE
+            }
+        },
+        None => code,
+    };
     // However the run ended (stop, lockup, GDB session end, a trace cut short, an output
     // error), the flash goes back to the file.
     match &args.flash_file {
@@ -175,6 +207,19 @@ pub fn main(args: RunArgs) -> ExitCode {
         },
         None => code,
     }
+}
+
+/// `--save-state PATH`: write `bytes` through a temporary file next to `path`, so a failed write
+/// never leaves a half-written state under the final name.
+fn write_state(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let res = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// `--flash-file PATH`: the saved state, `None` (start erased) if there is no file yet. An

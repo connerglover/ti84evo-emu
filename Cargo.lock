@@ -457,8 +457,10 @@ dependencies = [
  "evo-image",
  "gdbstub",
  "log",
+ "postcard",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 

@@ -157,6 +157,15 @@ impl Cpu {
         }
     }
 
+    /// Replace all processor state with `saved` (e.g. a `Cpu` decoded from a save state, which
+    /// carries the default IDAU), keeping the IDAU installed in `self`: the IDAU is the SoC's
+    /// configuration, not state.
+    pub fn restore_from(&mut self, saved: Cpu) {
+        let idau = std::mem::take(&mut self.idau);
+        *self = saved;
+        self.idau = idau;
+    }
+
     /// Install the SoC's IDAU (default: `DefaultIdau`, address bit 28 set is Secure).
     pub fn set_idau(&mut self, idau: Box<dyn Idau>) {
         self.idau = IdauHandle::new(idau);

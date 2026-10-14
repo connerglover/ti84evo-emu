@@ -37,6 +37,12 @@
 //! The machine remembers the last [`RECENT_STEPS`] CPU steps (cycle count, security state and
 //! PC; three stores per step) and formats them only when asked
 //! ([`Machine::recent_trace`]), e.g. to show how the guest reached a lockup.
+//!
+//! # Save states
+//!
+//! [`Machine::save_state`] / [`Machine::load_state`] (in [`crate::state`]): CPU, scheduler,
+//! SRAM, devices and the unmapped log, tied to the bundle the machine booted. Flash and the
+//! NOR security registers are not in a save state; they persist in the flash file.
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -50,7 +56,7 @@ use evo_hw::{DevCtx, Device, MemoryMap, ResetKind, UnmappedAccess, UnmappedKind}
 use evo_image::{Bundle, ImageError, Layout};
 use serde::{Deserialize, Serialize};
 
-use crate::{EventKind, Scheduler};
+use crate::{EventKind, Scheduler, state};
 
 pub use evo_hw::CPU_HZ;
 
@@ -86,7 +92,7 @@ struct RecentStep {
 
 /// Ring buffer of the last [`RECENT_STEPS`] CPU steps.
 #[derive(Default)]
-struct RecentSteps {
+pub(crate) struct RecentSteps {
     /// Up to `RECENT_STEPS` entries; once full, `next` is the oldest.
     steps: Vec<RecentStep>,
     /// Where the next step is written once `steps` is full.
@@ -147,17 +153,21 @@ pub struct Machine {
     /// System resets performed (AIRCR.SYSRESETREQ) since boot.
     pub resets: u64,
     /// `VTOR_S` at boot, reloaded by every system reset.
-    boot_vtor: u32,
+    pub(crate) boot_vtor: u32,
     /// Set while the CPU sleeps, with what put it to sleep.
-    sleep: Option<SleepKind>,
+    pub(crate) sleep: Option<SleepKind>,
     /// The breakpoint the last `run` stopped at, which the next `run` steps over.
-    stopped_at: Option<u32>,
+    pub(crate) stopped_at: Option<u32>,
     /// The device IRQ lines (`bus.irq_lines()`) last passed to the NVIC.
     #[serde(default)]
-    applied_irqs: u64,
+    pub(crate) applied_irqs: u64,
     /// Debugging aid, not machine state: not saved, and empty after a restore.
     #[serde(skip)]
-    recent: RecentSteps,
+    pub(crate) recent: RecentSteps,
+    /// Fingerprint of the OS this machine booted (`state::bundle_id`); a save state carries
+    /// it and loads only on a machine with the same one.
+    #[serde(default)]
+    pub(crate) bundle_id: [u8; 32],
 }
 
 impl Machine {
@@ -217,6 +227,7 @@ impl Machine {
             stopped_at: None,
             applied_irqs: 0,
             recent: RecentSteps::default(),
+            bundle_id: state::bundle_id(&pkg.bytes, layout.secure_slot_base, layout.ns_slot_base),
         };
         if let Some(nv) = &nv {
             m.with_dev("spif", |s: &mut Spif, _| {
