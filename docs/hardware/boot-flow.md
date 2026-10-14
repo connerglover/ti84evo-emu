@@ -289,6 +289,32 @@ counts are recorded here as each one passes.
 | milestone | what it shows | cycle |
 |---|---|---|
 | M1 | `Booting TF-M v2.1.1` on UART0 (steps 1–3) | 81,955,780 (first UART0 byte, without a SPIF model: the 100 ms Read-ID timeout and the SPI-device delays come first; Task 10) |
-| M2 | secure boot completes; NS hand-off at 0x0011_6D50; `Starting BSP` on UART0 | not yet recorded |
+| M2 | secure boot completes; NS hand-off at 0x0011_6D50; `Starting BSP` on UART0 | hand-off 70,784,675 (first boot, 0 resets; 70,282,729 on the second power-on from the saved NV state); `Starting BSP` by 80,784,676 (the test checks UART0 every 10 M cycles, so this is an upper bound); Task 16 |
 | M3 | the boot logo on the emulated screen | not yet recorded |
 | M4 | OS image 1 entered at 0x0044_BC90 | not yet recorded |
+
+The M1 banner now arrives by cycle 70,000,001 (same 10 M-cycle granularity): with the SPIF
+the Read-ID probe no longer times out.
+
+### M2 notes (Task 16)
+
+- **UART text.** TF-M colours parts of its log with ANSI SGR sequences, e.g. the Mbed TLS
+  line is `Init ESC[0;32mMbed TLS 3.6.2ESC[0m... ESC[0;32mcompleteESC[0m.`. The M2 checks
+  match the text with the escape sequences removed.
+- **Second power-on.** Booted again from `nv_state()` after the first boot, the secure image
+  finds the ITS layout and does not print `Creating an empty ITS flash layout.`
+- **Peripheral accesses before the hand-off that no device models yet.** The secure image
+  shows its splash before `bxns`: GPIO 0x4010_5000 (+00/+08/+10/+18; `gpio_*`
+  0x100b2ec0..0x100b2fb2, panel reset), the PL111 LCDC 0x4000_4000 (TIM0–3, UPBASE/LPBASE =
+  0x2004_8000, CONTROL = 0x312D then `|= 0x800`; `panel_on` 0x100b3200..0x100b3276) and the
+  backlight PWM 0x4010_4000 (+00 = 0xA0, +04 = 0xFF at 0x100b285a/0x100b285e). Their models
+  are Tasks 17 (GPIO) and 18 (LCDC, PWM). Until then `milestones.rs` lists these windows (both
+  aliases) in `PENDING_DEVICES`, not in `KNOWN_UNMODELLED`; the test fails once a window has
+  no unmapped access left, so the task that models the device removes its entries.
+- **First unmapped NS accesses** (BSP init, after the hand-off), in order:
+  - keypad 0x4010_3000: +04 = 0x808 (0x0015f1d8), +00 = 0x5B68_0C33 (0x0015f1e2), +08 read
+    then `= 0`, +0C read then `= 2` (0x0015f1e4..0x0015f1f2);
+  - LCDC 0x4000_4000: +18 read (0x0015f384), then TIM0 = 0x0A0A_0A38, TIM1 = 0x042D_093F,
+    TIM2 = 0x00EF_7801, TIM3 = 0, UPBASE = 0x2004_8000 (0x0015f41e..0x0015f428).
+
+  This matches the order of §3.2.
