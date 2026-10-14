@@ -6,7 +6,7 @@
 use std::ops::ControlFlow;
 
 use armv8m::Sec;
-use evo_core::{EventKind, Machine, StopReason};
+use evo_core::{EventKind, Machine, StopReason, UartPort};
 use evo_hw::{DevCtx, Device, ResetKind, StateError, UnmappedKind};
 use evo_image::testutil::secure_image_bundle;
 use evo_image::{Bundle, ImageError, Layout};
@@ -888,4 +888,28 @@ fn devices_see_system_reset() {
     let mut m = boot_with_probe(&Payload::device_test(&RESET_PROG), Probe::default());
     step_to_reset(&mut m);
     assert_eq!(probe(&m).resets, 1);
+}
+
+#[test]
+fn uart_host_api() {
+    const L_UART0: u32 = LIT + 0x20;
+    // ldr r0, =UART0 ; movs r1, #'A' ; str r1, [r0] (THR) ; ldr r2, [r0, #0x14] (LSR) ;
+    // ldr r3, [r0] (RBR) ; b .
+    let mut p = Payload::device_test(&[
+        I::Ld(0, L_UART0),
+        I::H(0x2141),
+        I::H(0x6001),
+        I::H(0x6942),
+        I::H(0x6803),
+        I::H(B_SELF),
+    ]);
+    p.word(L_UART0, 0x4010_6000);
+    let mut m = p.boot();
+    m.inject_uart_rx(UartPort::Uart0, b"z");
+    m.run(100);
+    assert_eq!(m.take_uart_tx(UartPort::Uart0), b"A");
+    assert_eq!(m.take_uart_tx(UartPort::Uart0), b"");
+    assert_eq!(m.take_uart_tx(UartPort::Uart2), b"");
+    assert_eq!(m.cpu.regs.r[2], 0x61);
+    assert_eq!(m.cpu.regs.r[3], u32::from(b'z'));
 }

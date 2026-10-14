@@ -204,7 +204,6 @@ impl Machine {
     /// Run `f` on the device called `name`, if it is a `T`: the only way host APIs reach a
     /// device. The device sees the current time, and whatever it changes (IRQ lines, pulses,
     /// events) reaches the CPU and the scheduler before this returns.
-    #[allow(dead_code)] // The first host API that drives a device arrives with the keypad/UART.
     pub(crate) fn with_dev<T: Device, R>(
         &mut self,
         name: &str,

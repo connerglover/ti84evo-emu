@@ -260,6 +260,12 @@ impl DevHarness {
         r
     }
 
+    /// Run `f` with this harness's context: for device host APIs that take a [`DevCtx`]
+    /// (e.g. injecting UART bytes), like `Machine` host APIs do through the map.
+    pub fn with_ctx<R>(&mut self, f: impl FnOnce(&mut DevCtx<'_>) -> R) -> R {
+        self.call(f)
+    }
+
     /// A read, masked to `width` like the map does.
     pub fn read(&mut self, d: &mut dyn Device, off: u32, width: u8) -> u32 {
         self.call(|ctx| d.read(off, width, ctx)) & mask(width)

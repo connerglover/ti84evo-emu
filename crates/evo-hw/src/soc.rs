@@ -5,6 +5,7 @@ use crate::dev::mpc::Mpc;
 use crate::dev::storage::Storage;
 use crate::dev::sysctl::{Cru, Spctrl};
 use crate::dev::timer::Timer;
+use crate::dev::uart::Uart16550;
 
 /// Name of the flash buffer (the `MemoryMap` ROM a flash controller writes through
 /// `DevCtx::buffer_mut`).
@@ -33,4 +34,7 @@ pub fn attach(map: &mut MemoryMap) {
     );
     // TIMER (timer.md): 3 down-counters; the firmware uses the NS alias only.
     map.add_device("timer", 0x4010_1000, 0x1000, Box::new(Timer::new()));
+    // UARTs (uart.md §1, §8): the firmware uses the NS aliases only.
+    map.add_device("uart0", 0x4010_6000, 0x1000, Box::new(Uart16550::new(17)));
+    map.add_device("uart2", 0x4010_B000, 0x1000, Box::new(Uart16550::new(27)));
 }
