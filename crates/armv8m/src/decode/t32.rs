@@ -2,8 +2,8 @@
 //!
 //! Encodings the ARM ARM marks UNPREDICTABLE for SP/PC operands decode to
 //! `Instr::Undefined`. The exceptions are the forms where SP is architecturally valid
-//! (SP-based ADD/SUB, compare/test with an SP base) and the `Rd == 15` encodings that are the
-//! compare/test aliases (CMP/CMN/TST/TEQ).
+//! (SP-based ADD/SUB, and a SP base for CMP/CMN only; TST/TEQ reject SP) and the `Rd == 15`
+//! encodings that are the compare/test aliases (CMP/CMN/TST/TEQ).
 
 use crate::bits::{SRType, decode_imm_shift, thumb_expand_imm_c};
 use crate::instr::{AluOp, Instr, LongMulKind, RevKind, Shift};
@@ -100,7 +100,7 @@ fn modified_imm(h1: u32, h2: u32) -> Option<Instr> {
         })
     };
     match op {
-        0b0000 if rd == 15 => (s && rn != 15).then_some(Instr::TstImm { rn, imm, carry }),
+        0b0000 if rd == 15 => (s && gp(rn)).then_some(Instr::TstImm { rn, imm, carry }),
         0b0000 => alu(AluOp::And),
         0b0001 => alu(AluOp::Bic),
         0b0010 if rn == 15 => gp(rd).then_some(Instr::MovImm {
@@ -117,7 +117,7 @@ fn modified_imm(h1: u32, h2: u32) -> Option<Instr> {
             carry,
         }),
         0b0011 => alu(AluOp::Orn),
-        0b0100 if rd == 15 => (s && rn != 15).then_some(Instr::TeqImm { rn, imm, carry }),
+        0b0100 if rd == 15 => (s && gp(rn)).then_some(Instr::TeqImm { rn, imm, carry }),
         0b0100 => alu(AluOp::Eor),
         0b1000 if rd == 15 => (s && rn != 15).then_some(Instr::CmnImm { rn, imm }),
         0b1000 => arith(false),
@@ -271,7 +271,7 @@ fn shifted_reg(h1: u32, h2: u32) -> Option<Instr> {
     let compare = rd == 15 && s;
     let cmp_ok = rn != 15 && gp(rm);
     match op {
-        0b0000 if compare => cmp_ok.then_some(Instr::TstReg { rn, rm, shift }),
+        0b0000 if compare => (gp(rn) && gp(rm)).then_some(Instr::TstReg { rn, rm, shift }),
         0b0000 => alu(AluOp::And),
         0b0001 => alu(AluOp::Bic),
         // ORR with Rn == 15 is MOV / shift-by-immediate / RRX.
@@ -284,7 +284,7 @@ fn shifted_reg(h1: u32, h2: u32) -> Option<Instr> {
             setflags: s,
         }),
         0b0011 => alu(AluOp::Orn),
-        0b0100 if compare => cmp_ok.then_some(Instr::TeqReg { rn, rm, shift }),
+        0b0100 if compare => (gp(rn) && gp(rm)).then_some(Instr::TeqReg { rn, rm, shift }),
         0b0100 => alu(AluOp::Eor),
         0b0110 => {
             // PKHBT / PKHTB: S == 0, bit 4 == 0, type is 00 (BT) or 10 (TB).
@@ -301,23 +301,27 @@ fn shifted_reg(h1: u32, h2: u32) -> Option<Instr> {
             })
         }
         0b1000 if compare => cmp_ok.then_some(Instr::CmnReg { rn, rm, shift }),
-        0b1000 => (addsub_regs_ok(rd, rn) && gp(rm)).then_some(Instr::AddReg {
-            rd,
-            rn,
-            rm,
-            shift,
-            setflags: s,
-        }),
+        0b1000 => {
+            (addsub_regs_ok(rd, rn) && gp(rm) && sp_shift_ok(rd, shift)).then_some(Instr::AddReg {
+                rd,
+                rn,
+                rm,
+                shift,
+                setflags: s,
+            })
+        }
         0b1010 => alu(AluOp::Adc),
         0b1011 => alu(AluOp::Sbc),
         0b1101 if compare => cmp_ok.then_some(Instr::CmpReg { rn, rm, shift }),
-        0b1101 => (addsub_regs_ok(rd, rn) && gp(rm)).then_some(Instr::SubReg {
-            rd,
-            rn,
-            rm,
-            shift,
-            setflags: s,
-        }),
+        0b1101 => {
+            (addsub_regs_ok(rd, rn) && gp(rm) && sp_shift_ok(rd, shift)).then_some(Instr::SubReg {
+                rd,
+                rn,
+                rm,
+                shift,
+                setflags: s,
+            })
+        }
         0b1110 => (gp(rd) && gp(rn) && gp(rm)).then_some(Instr::RsbReg {
             rd,
             rn,
@@ -492,4 +496,9 @@ fn multiply(h1: u32, h2: u32) -> Option<Instr> {
         (0b110, 0b0110) => long(LongMulKind::Umaal),
         _ => None,
     }
+}
+
+/// ADD/SUB (register) with `Rd == SP` require `LSL #0..=3`.
+fn sp_shift_ok(rd: u8, shift: Shift) -> bool {
+    rd != 13 || (shift.ty == SRType::Lsl && shift.amount <= 3)
 }

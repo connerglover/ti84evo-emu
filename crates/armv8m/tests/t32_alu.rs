@@ -510,7 +510,13 @@ fn extends_clz_rbit_rev_sel() {
 #[test]
 fn unpredictable_sp_pc_operands_are_undefined() {
     // and r13, r0, #1 ; sdiv r13, r1, r2
-    for code in [[0xF000u16, 0x0D01], [0xFB91, 0xFDF2]] {
+    for code in [
+        [0xF000u16, 0x0D01],
+        [0xFB91, 0xFDF2],
+        [0xF01D, 0x0F01],
+        [0xEA9D, 0x0F01],
+        [0xEB0D, 0x0D50],
+    ] {
         let (mut cpu, mut bus) = cpu_with_code(&code);
         let (instr, len) = cpu.decode_at(&mut bus, 0x100).unwrap();
         assert!(matches!(instr, Instr::Undefined { .. }), "{code:x?}");
@@ -521,4 +527,12 @@ fn unpredictable_sp_pc_operands_are_undefined() {
         decode32(0xF000, 0x0D01),
         Instr::Undefined { raw: 0xF000_0D01 }
     ));
+}
+
+#[test]
+fn sp_rd_register_add_shift_limits() {
+    // add.w sp, sp, r0, lsl #2 accepted; lsr #1 (EB0D 0D50) is Undefined (checked above).
+    let (cpu, t) = exec1([0xEB0D, 0x0D80], |c| c.regs.r[0] = 1);
+    assert_eq!(t, "add.w sp, sp, r0, lsl #2");
+    assert_eq!(cpu.regs.sp(), 0x2000_1004);
 }
