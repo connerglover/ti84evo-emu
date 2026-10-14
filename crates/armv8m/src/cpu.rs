@@ -11,6 +11,7 @@ use crate::instr::Instr;
 use crate::regs::{Registers, Sec};
 use crate::scs::Scs;
 use crate::scs::sau::{Attr, Idau, IdauHandle, SecAttr};
+use crate::scs::scb::CCR_STKOFHFNMIGN;
 
 /// Outcome of one `Cpu::step`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +50,10 @@ pub struct Cpu {
     pub scs: Scs,
     /// While locked up: the priority the lockup is held at (see `locked_up`).
     pub(crate) lockup: Option<i32>,
+    /// Set by `write_reg` when an instruction's SP write violated the stack limit; `step` turns
+    /// it into a STKOF UsageFault. Only meaningful within one instruction.
+    #[serde(skip)]
+    pub(crate) sp_violation: bool,
     /// The SoC's attribution unit (configuration: kept across reset, not serialized).
     #[serde(skip)]
     idau: IdauHandle,
@@ -124,6 +129,7 @@ impl Cpu {
             exclusive: None,
             scs: Scs::default(),
             lockup: None,
+            sp_violation: false,
             idau: IdauHandle::default(),
         }
     }
@@ -274,6 +280,34 @@ impl Cpu {
         }
     }
 
+    /// `ViolatesSPLim(LookUpSP(), value)`: `value` is below the limit of the stack pointer in
+    /// use (MSPLIM in Handler mode or with CONTROL.SPSEL = 0, else PSPLIM, of the current
+    /// security state). With `CCR.STKOFHFNMIGN` set, a negative execution priority (HardFault,
+    /// NMI, FAULTMASK) ignores the limit.
+    pub(crate) fn violates_sp_lim(&self, value: u32) -> bool {
+        let r = &self.regs;
+        let sec = r.sec;
+        let limit = if !r.handler_mode() && r.control.get(sec) & 0b10 != 0 {
+            *r.psplim.get(sec)
+        } else {
+            *r.msplim.get(sec)
+        };
+        value < limit
+            && !(self.scs.scb.ccr.get(sec) & CCR_STKOFHFNMIGN != 0 && self.execution_priority() < 0)
+    }
+
+    /// A register write by an instruction. A write to SP is checked against the stack limit
+    /// (`RSPCheck[]` / the SP setter): on a violation SP keeps its value and `sp_violation`
+    /// makes `step` raise a STKOF UsageFault for the instruction. Writes from outside the
+    /// instruction stream (a debugger, MSR MSP/PSP) use `set_reg` and are not checked.
+    pub(crate) fn write_reg(&mut self, n: u8, v: u32) {
+        if n == 13 && self.violates_sp_lim(v & !3) {
+            self.sp_violation = true;
+        } else {
+            self.set_reg(n, v);
+        }
+    }
+
     /// `BranchWritePC`: no interworking.
     pub fn branch_write_pc(&mut self, addr: u32) {
         self.regs.pc = addr & !1;
@@ -392,10 +426,17 @@ impl Cpu {
 
         let executes = !in_it || condition_holds(it >> 4, &self.regs.xpsr);
         // 16-bit "S" forms do not set flags inside an IT block.
+        self.sp_violation = false;
         let flow = if executes {
             exec::execute(self, bus, &instr, in_it && len == 2)
         } else {
             Flow::Next
+        };
+        // An SP write below the stack limit (`write_reg`) faults the instruction.
+        let flow = if std::mem::take(&mut self.sp_violation) {
+            Flow::Fault(Fault::StkOf)
+        } else {
+            flow
         };
         // A branch to FNC_RETURN completes only if the function return does.
         let flow = match flow {

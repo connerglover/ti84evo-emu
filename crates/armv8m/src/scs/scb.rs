@@ -22,6 +22,8 @@ pub const CCR_RESET: u32 = 0x0000_0201;
 pub const CCR_USERSETMPEND: u32 = 1 << 1;
 pub const CCR_UNALIGN_TRP: u32 = 1 << 3;
 pub const CCR_DIV_0_TRP: u32 = 1 << 4;
+/// Stack limit violations are ignored at a negative execution priority (HardFault, NMI).
+pub const CCR_STKOFHFNMIGN: u32 = 1 << 10;
 /// Writable CCR bits: USERSETMPEND, UNALIGN_TRP, DIV_0_TRP, BFHFNMIGN, STKOFHFNMIGN, DC, IC, BP.
 pub const CCR_WRITABLE: u32 = (1 << 1) | (1 << 3) | (1 << 4) | (1 << 8) | (1 << 10) | (7 << 16);
 

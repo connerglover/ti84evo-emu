@@ -1221,3 +1221,115 @@ fn corrupt_stacked_ipsr_is_invpc_not_a_panic() {
     assert_eq!(ipsr(&cpu), 3);
     assert_eq!(cpu.ppb_read32(CFSR), INVPC);
 }
+
+// ---- Stack limit checks on instruction SP writes (ViolatesSPLim) ----
+
+/// MSPLIM sits one basic frame below SP0, so the STKOF UsageFault itself can still be stacked.
+const LIMIT: u32 = SP0 - 0x20;
+
+/// A Secure Thread CPU on MSP = SP0 with MSPLIM = `LIMIT`, UsageFault enabled and handled at
+/// 0x400, running `code` at 0x100.
+fn stklim_cpu(code: &[u16]) -> (Cpu, FlatBus) {
+    let (mut cpu, mut bus) = cpu_with_code(code);
+    handler(&mut bus, 6, 0x400, &[B_SELF]);
+    cpu.ppb_write32(SHCSR, USGFAULTENA);
+    cpu.regs.msplim.s = LIMIT;
+    (cpu, bus)
+}
+
+/// Step the instruction at 0x100 and require a precise STKOF UsageFault: the frame (with the
+/// faulting instruction's address) is the only thing written, and SP was not moved by the
+/// instruction.
+fn expect_stkof(cpu: &mut Cpu, bus: &mut FlatBus) {
+    executed(cpu.step(bus));
+    assert_eq!(ipsr(cpu), 6, "UsageFault");
+    assert_eq!(cpu.ppb_read32(CFSR), STKOF);
+    assert_eq!(
+        cpu.regs.msp.s,
+        SP0 - 0x20,
+        "only the exception frame moved MSP"
+    );
+    assert_eq!(
+        frame(cpu, bus)[6],
+        0x100,
+        "stacked PC is the faulting instruction"
+    );
+    for a in (LIMIT - 0x40..LIMIT).step_by(4) {
+        assert_eq!(ram(bus, a), 0, "nothing stored below the limit at {a:#x}");
+    }
+}
+
+#[test]
+fn push_below_msplim_is_stkof() {
+    // push {r0-r7, lr}: 36 bytes, 4 below the limit.
+    let (mut cpu, mut bus) = stklim_cpu(&[0xB5FF]);
+    for i in 0..8 {
+        cpu.regs.r[i] = 0xA0 + i as u32;
+    }
+    expect_stkof(&mut cpu, &mut bus);
+
+    // stmdb sp!, {r0-r8} (PUSH.W) likewise.
+    let (mut cpu, mut bus) = stklim_cpu(&[0xE92D, 0x01FF]);
+    cpu.regs.r[0] = 0xA0;
+    expect_stkof(&mut cpu, &mut bus);
+
+    // push {r0-r7}: exactly down to the limit is allowed.
+    let (mut cpu, mut bus) = stklim_cpu(&[0xB4FF]);
+    executed(cpu.step(&mut bus));
+    assert_eq!((ipsr(&cpu), cpu.regs.sp()), (0, LIMIT));
+    assert_eq!(cpu.ppb_read32(CFSR), 0);
+}
+
+#[test]
+fn sub_sp_below_limit_is_stkof() {
+    // sub sp, #64
+    let (mut cpu, mut bus) = stklim_cpu(&[0xB090]);
+    expect_stkof(&mut cpu, &mut bus);
+
+    // subs sp, sp, #64: the faulting instruction does not set the flags either (C would be 1).
+    let (mut cpu, mut bus) = stklim_cpu(&[0xF1BD, 0x0D40]);
+    expect_stkof(&mut cpu, &mut bus);
+    assert_eq!(
+        frame(&cpu, &bus)[7] & 0xF000_0000,
+        0,
+        "stacked NZCV unchanged"
+    );
+
+    // In Thread mode with CONTROL.SPSEL = 1 the limit is PSPLIM (MSPLIM does not apply).
+    let (mut cpu, mut bus) = stklim_cpu(&[0xB090, 0xB090]);
+    const PSP: u32 = SP0 + 0x800;
+    cpu.regs.control.s = 0b10;
+    cpu.regs.psp.s = PSP;
+    cpu.regs.psplim.s = PSP - 0x60;
+    cpu.regs.msplim.s = PSP;
+    executed(cpu.step(&mut bus));
+    assert_eq!((ipsr(&cpu), cpu.regs.psp.s), (0, PSP - 0x40));
+    executed(cpu.step(&mut bus));
+    assert_eq!(ipsr(&cpu), 6);
+    assert_eq!(cpu.ppb_read32(CFSR), STKOF);
+    assert_eq!(cpu.regs.psp.s, PSP - 0x60, "frame on PSP; SP not moved");
+}
+
+#[test]
+fn str_with_sp_writeback_below_limit_is_stkof() {
+    // str r0, [sp, #-40]!
+    let (mut cpu, mut bus) = stklim_cpu(&[0xF84D, 0x0D28]);
+    cpu.regs.r[0] = 0xDEAD_BEEF;
+    expect_stkof(&mut cpu, &mut bus);
+
+    // ldr r0, [sp, #-40]! : the load does not complete either.
+    let (mut cpu, mut bus) = stklim_cpu(&[0xF85D, 0x0D28]);
+    cpu.regs.r[0] = 0x1234;
+    expect_stkof(&mut cpu, &mut bus);
+    assert_eq!(frame(&cpu, &bus)[0], 0x1234, "r0 not loaded");
+}
+
+#[test]
+fn msr_msp_is_exempt_from_the_stack_limit() {
+    // msr msp, r0 ; nop
+    let (mut cpu, mut bus) = stklim_cpu(&[0xF380, 0x8808, NOP]);
+    cpu.regs.r[0] = LIMIT - 0x100;
+    executed(cpu.step(&mut bus));
+    assert_eq!((ipsr(&cpu), cpu.regs.msp.s), (0, LIMIT - 0x100));
+    assert_eq!(cpu.ppb_read32(CFSR), 0);
+}

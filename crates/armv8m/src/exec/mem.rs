@@ -156,7 +156,7 @@ fn write_loaded(cpu: &mut Cpu, rt: u8, v: u32) -> Flow {
     if rt == 15 {
         cpu.bx_write_pc(v, false)
     } else {
-        cpu.set_reg(rt, v);
+        cpu.write_reg(rt, v);
         Flow::Next
     }
 }
@@ -256,14 +256,84 @@ fn commit_loads(cpu: &mut Cpu, vals: Vec<(u8, u32)>) -> Flow {
         if r == 15 {
             flow = write_loaded(cpu, 15, v);
         } else {
-            cpu.set_reg(r, v);
+            cpu.write_reg(r, v);
         }
     }
     flow
 }
 
+/// The SP value a load/store with SP writeback (PUSH/POP, LDM/STM/LDMDB/STMDB, LDR/STR/LDRD/
+/// STRD with `Rn == SP`) writes, if it is one.
+fn sp_writeback(cpu: &Cpu, instr: &Instr) -> Option<u32> {
+    let sp = cpu.reg(13);
+    let size = |regs: u16| 4 * regs.count_ones();
+    match *instr {
+        Instr::Push { regs }
+        | Instr::Stmdb {
+            rn: 13,
+            regs,
+            wback: true,
+        }
+        | Instr::Ldmdb {
+            rn: 13,
+            regs,
+            wback: true,
+        } => Some(sp.wrapping_sub(size(regs))),
+        Instr::Pop { regs }
+        | Instr::Stm {
+            rn: 13,
+            regs,
+            wback: true,
+        }
+        | Instr::Ldm {
+            rn: 13,
+            regs,
+            wback: true,
+        } => Some(sp.wrapping_add(size(regs))),
+        Instr::LoadImm {
+            rn: 13,
+            imm,
+            add,
+            wback: true,
+            ..
+        }
+        | Instr::StoreImm {
+            rn: 13,
+            imm,
+            add,
+            wback: true,
+            ..
+        }
+        | Instr::Ldrd {
+            rn: 13,
+            imm,
+            add,
+            wback: true,
+            ..
+        }
+        | Instr::Strd {
+            rn: 13,
+            imm,
+            add,
+            wback: true,
+            ..
+        } => Some(offset_addr(sp, imm, add)),
+        _ => None,
+    }
+}
+
 /// Execute a load/store; `None` if `instr` is not one.
 pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Option<Flow> {
+    // Stack limit (`ViolatesSPLim`): an SP writeback below the limit faults STKOF before any
+    // memory access or register write, so PUSH/STMDB never store below the limit and SP keeps
+    // its value. The architecture suppresses the stores and the SP write and raises the fault
+    // from the SP write (DDI0553 PUSH/STMDB/STR pseudocode); like QEMU (v8m_stackcheck before
+    // the accesses), this takes the fault before the instruction has any other effect.
+    if let Some(sp) = sp_writeback(cpu, instr)
+        && cpu.violates_sp_lim(sp & !3)
+    {
+        return Some(Flow::Fault(Fault::StkOf));
+    }
     let flow = match *instr {
         Instr::LoadImm {
             rt,
@@ -281,7 +351,7 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
             match read(cpu, bus, addr, size) {
                 Ok(v) => {
                     if wback {
-                        cpu.set_reg(rn, off);
+                        cpu.write_reg(rn, off);
                     }
                     write_loaded(cpu, rt, extend(v, size, signed))
                 }
@@ -303,7 +373,7 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
             match write(cpu, bus, addr, cpu.reg(rt), size) {
                 Ok(()) => {
                     if wback {
-                        cpu.set_reg(rn, off);
+                        cpu.write_reg(rn, off);
                     }
                     Flow::Next
                 }
@@ -349,7 +419,7 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
             let start = cpu.reg(13).wrapping_sub(4 * n);
             match store_multiple(cpu, bus, start, regs) {
                 Ok(_) => {
-                    cpu.set_reg(13, start);
+                    cpu.write_reg(13, start);
                     Flow::Next
                 }
                 Err(f) => f,
@@ -360,7 +430,7 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
             let sp = cpu.reg(13);
             match load_multiple(cpu, bus, sp, regs) {
                 Ok(vals) => {
-                    cpu.set_reg(13, sp.wrapping_add(4 * n));
+                    cpu.write_reg(13, sp.wrapping_add(4 * n));
                     commit_loads(cpu, vals)
                 }
                 Err(f) => f,
@@ -371,7 +441,7 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
             match load_multiple(cpu, bus, base, regs) {
                 Ok(vals) => {
                     if wback {
-                        cpu.set_reg(rn, base.wrapping_add(4 * regs.count_ones()));
+                        cpu.write_reg(rn, base.wrapping_add(4 * regs.count_ones()));
                     }
                     commit_loads(cpu, vals)
                 }
@@ -383,7 +453,7 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
             match store_multiple(cpu, bus, base, regs) {
                 Ok(end) => {
                     if wback {
-                        cpu.set_reg(rn, end);
+                        cpu.write_reg(rn, end);
                     }
                     Flow::Next
                 }
@@ -430,10 +500,10 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
             match load_dual(cpu, bus, addr) {
                 Ok((a, b)) => {
                     if wback {
-                        cpu.set_reg(rn, off);
+                        cpu.write_reg(rn, off);
                     }
-                    cpu.set_reg(rt, a);
-                    cpu.set_reg(rt2, b);
+                    cpu.write_reg(rt, a);
+                    cpu.write_reg(rt2, b);
                     Flow::Next
                 }
                 Err(f) => f,
@@ -454,7 +524,7 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
             match store_dual(cpu, bus, addr, (cpu.reg(rt), cpu.reg(rt2))) {
                 Ok(()) => {
                     if wback {
-                        cpu.set_reg(rn, off);
+                        cpu.write_reg(rn, off);
                     }
                     Flow::Next
                 }
@@ -466,7 +536,7 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
             match load_multiple(cpu, bus, start, regs) {
                 Ok(vals) => {
                     if wback {
-                        cpu.set_reg(rn, start);
+                        cpu.write_reg(rn, start);
                     }
                     commit_loads(cpu, vals)
                 }
@@ -478,7 +548,7 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
             match store_multiple(cpu, bus, start, regs) {
                 Ok(_) => {
                     if wback {
-                        cpu.set_reg(rn, start);
+                        cpu.write_reg(rn, start);
                     }
                     Flow::Next
                 }
@@ -492,7 +562,7 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
             match check_align(addr, size).and_then(|()| read(cpu, bus, addr, size).map_err(fault)) {
                 Ok(v) => {
                     cpu.exclusive = Some(addr);
-                    cpu.set_reg(rt, v);
+                    cpu.write_reg(rt, v);
                     Flow::Next
                 }
                 Err(f) => f,
@@ -516,14 +586,14 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
             if pass && let Err(e) = write(cpu, bus, addr, cpu.reg(rt), size) {
                 return Some(fault(e));
             }
-            cpu.set_reg(rd, u32::from(!pass));
+            cpu.write_reg(rd, u32::from(!pass));
             Flow::Next
         }
         Instr::Lda { rt, rn, size } => {
             let addr = cpu.reg(rn);
             match check_align(addr, size).and_then(|()| read(cpu, bus, addr, size).map_err(fault)) {
                 Ok(v) => {
-                    cpu.set_reg(rt, v);
+                    cpu.write_reg(rt, v);
                     Flow::Next
                 }
                 Err(f) => f,

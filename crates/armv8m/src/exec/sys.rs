@@ -256,7 +256,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
         }
         Instr::Mrs { rd, sysm } => {
             let v = read_sysreg(cpu, sysm);
-            cpu.set_reg(rd, v);
+            cpu.write_reg(rd, v);
             Flow::Next
         }
         // SG from Non-secure state (only reachable in a Non-secure callable region: anywhere
@@ -283,7 +283,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
             unpriv,
         } => {
             let v = tt_response(cpu, cpu.reg(rn), alt, unpriv);
-            cpu.set_reg(rd, v);
+            cpu.write_reg(rd, v);
             Flow::Next
         }
         // Single in-order core: barriers and preloads have no effect.

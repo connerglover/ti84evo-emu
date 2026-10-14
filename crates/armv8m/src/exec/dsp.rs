@@ -102,7 +102,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
             if let Some(ge) = ge {
                 cpu.regs.xpsr.ge = ge;
             }
-            cpu.set_reg(rd, res);
+            cpu.write_reg(rd, res);
         }
         Instr::SatArith {
             rd,
@@ -117,7 +117,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
             }
             let a = i64::from(cpu.reg(rm) as i32);
             let r = sat32(cpu, if sub { a - b } else { a + b });
-            cpu.set_reg(rd, r);
+            cpu.write_reg(rd, r);
         }
         Instr::MulHalf {
             rd,
@@ -130,7 +130,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
             let acc = ra.map_or(0, |r| i64::from(cpu.reg(r) as i32));
             let p = half(cpu.reg(rn), n_top) * half(cpu.reg(rm), m_top) + acc;
             let r = q_on_overflow(cpu, p);
-            cpu.set_reg(rd, r);
+            cpu.write_reg(rd, r);
         }
         Instr::MulWordHalf {
             rd,
@@ -142,7 +142,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
             let acc = ra.map_or(0, |r| i64::from(cpu.reg(r) as i32) << 16);
             let p = i64::from(cpu.reg(rn) as i32) * half(cpu.reg(rm), top) + acc;
             let r = q_on_overflow(cpu, p >> 16);
-            cpu.set_reg(rd, r);
+            cpu.write_reg(rd, r);
         }
         Instr::MulLongHalf {
             rdlo,
@@ -167,7 +167,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
             let (p1, p2) = dual_products(cpu.reg(rn), cpu.reg(rm), x);
             let acc = ra.map_or(0, |r| i64::from(cpu.reg(r) as i32));
             let r = q_on_overflow(cpu, if sub { p1 - p2 } else { p1 + p2 } + acc);
-            cpu.set_reg(rd, r);
+            cpu.write_reg(rd, r);
         }
         Instr::DualMulLong {
             rdlo,
@@ -205,7 +205,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
             if round {
                 v = v.wrapping_add(0x8000_0000);
             }
-            cpu.set_reg(rd, (v >> 32) as u32);
+            cpu.write_reg(rd, (v >> 32) as u32);
         }
         Instr::Usad8 { rd, rn, rm, ra } => {
             let (n, m) = (cpu.reg(rn).to_le_bytes(), cpu.reg(rm).to_le_bytes());
@@ -215,21 +215,21 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
                 .map(|(&a, b)| u32::from(a.abs_diff(b)))
                 .sum();
             let acc = ra.map_or(0, |r| cpu.reg(r));
-            cpu.set_reg(rd, sum.wrapping_add(acc));
+            cpu.write_reg(rd, sum.wrapping_add(acc));
         }
         Instr::Ssat16 { rd, rn, bits } => {
             let v = cpu.reg(rn);
             let (min, max) = (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1);
             let lo = sat(cpu, half(v, false), min, max) as u32 & 0xFFFF;
             let hi = sat(cpu, half(v, true), min, max) as u32 & 0xFFFF;
-            cpu.set_reg(rd, (hi << 16) | lo);
+            cpu.write_reg(rd, (hi << 16) | lo);
         }
         Instr::Usat16 { rd, rn, bits } => {
             let v = cpu.reg(rn);
             let max = (1i64 << bits) - 1;
             let lo = sat(cpu, half(v, false), 0, max) as u32;
             let hi = sat(cpu, half(v, true), 0, max) as u32;
-            cpu.set_reg(rd, (hi << 16) | lo);
+            cpu.write_reg(rd, (hi << 16) | lo);
         }
         Instr::Extend16 {
             rd,
@@ -252,7 +252,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
                 lo = lo.wrapping_add(n as u16);
                 hi = hi.wrapping_add((n >> 16) as u16);
             }
-            cpu.set_reg(rd, (u32::from(hi) << 16) | u32::from(lo));
+            cpu.write_reg(rd, (u32::from(hi) << 16) | u32::from(lo));
         }
         _ => return None,
     }
@@ -260,6 +260,6 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
 }
 
 fn set_long(cpu: &mut Cpu, rdlo: u8, rdhi: u8, v: u64) {
-    cpu.set_reg(rdlo, v as u32);
-    cpu.set_reg(rdhi, (v >> 32) as u32);
+    cpu.write_reg(rdlo, v as u32);
+    cpu.write_reg(rdhi, (v >> 32) as u32);
 }

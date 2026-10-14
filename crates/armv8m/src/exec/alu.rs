@@ -19,7 +19,7 @@ fn saturate(cpu: &mut Cpu, rd: u8, v: i64, min: i64, max: i64) -> Flow {
     if r != v {
         cpu.regs.xpsr.q = true;
     }
-    cpu.set_reg(rd, r as u32);
+    cpu.write_reg(rd, r as u32);
     Flow::Next
 }
 
@@ -40,26 +40,30 @@ fn write_rd(cpu: &mut Cpu, rd: u8, v: u32) -> Flow {
         cpu.branch_write_pc(v);
         Flow::Branched
     } else {
-        cpu.set_reg(rd, v);
+        cpu.write_reg(rd, v);
         Flow::Next
     }
 }
 
 /// Finish an add/subtract style operation producing `(result, carry, overflow)`.
+/// The register is written first: a write to SP that violates the stack limit faults the
+/// instruction, which then leaves the flags alone.
 fn arith(cpu: &mut Cpu, rd: u8, res: (u32, bool, bool), setflags: bool) -> Flow {
-    if setflags {
+    let flow = write_rd(cpu, rd, res.0);
+    if setflags && !cpu.sp_violation {
         set_nzcv(cpu, res);
     }
-    write_rd(cpu, rd, res.0)
+    flow
 }
 
 /// Finish a logical operation producing `(result, carry)`.
 fn logic(cpu: &mut Cpu, rd: u8, (v, c): (u32, bool), setflags: bool) -> Flow {
-    if setflags {
+    let flow = write_rd(cpu, rd, v);
+    if setflags && !cpu.sp_violation {
         set_nz(cpu, v);
         cpu.regs.xpsr.c = c;
     }
-    write_rd(cpu, rd, v)
+    flow
 }
 
 /// `Shift_C(R[m], shift)` with the current carry flag.
@@ -253,7 +257,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr, suppress_flags: bool) -> Opt
                 (false, true) => v as u8 as i8 as i32 as u32,
                 (false, false) => v & 0xFF,
             };
-            cpu.set_reg(rd, r);
+            cpu.write_reg(rd, r);
             Flow::Next
         }
         Instr::Rev { rd, rm, kind } => {
@@ -263,7 +267,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr, suppress_flags: bool) -> Opt
                 RevKind::Rev16 => ((v & 0x00FF_00FF) << 8) | ((v >> 8) & 0x00FF_00FF),
                 RevKind::Revsh => (v as u16).swap_bytes() as i16 as i32 as u32,
             };
-            cpu.set_reg(rd, r);
+            cpu.write_reg(rd, r);
             Flow::Next
         }
         Instr::RsbReg {
@@ -339,15 +343,15 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr, suppress_flags: bool) -> Opt
                 (false, true) => v as u8 as i8 as i32 as u32,
                 (false, false) => v & 0xFF,
             };
-            cpu.set_reg(rd, cpu.reg(rn).wrapping_add(ext));
+            cpu.write_reg(rd, cpu.reg(rn).wrapping_add(ext));
             Flow::Next
         }
         Instr::Clz { rd, rm } => {
-            cpu.set_reg(rd, cpu.reg(rm).leading_zeros());
+            cpu.write_reg(rd, cpu.reg(rm).leading_zeros());
             Flow::Next
         }
         Instr::Rbit { rd, rm } => {
-            cpu.set_reg(rd, cpu.reg(rm).reverse_bits());
+            cpu.write_reg(rd, cpu.reg(rm).reverse_bits());
             Flow::Next
         }
         Instr::Sel { rd, rn, rm } => {
@@ -361,7 +365,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr, suppress_flags: bool) -> Opt
                     m & mask
                 };
             }
-            cpu.set_reg(rd, r);
+            cpu.write_reg(rd, r);
             Flow::Next
         }
         Instr::Pkh {
@@ -379,7 +383,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr, suppress_flags: bool) -> Opt
                 let (op2, _) = shift_c(m, SRType::Lsl, amount, false);
                 (op2 & 0xFFFF_0000) | (n & 0xFFFF)
             };
-            cpu.set_reg(rd, r);
+            cpu.write_reg(rd, r);
             Flow::Next
         }
         Instr::Ssat {
@@ -416,18 +420,18 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr, suppress_flags: bool) -> Opt
             } else {
                 up >> down
             };
-            cpu.set_reg(rd, r);
+            cpu.write_reg(rd, r);
             Flow::Next
         }
         Instr::Bfi { rd, rn, lsb, width } => {
             let mask = field_mask(width) << lsb;
             let r = (cpu.reg(rd) & !mask) | ((cpu.reg(rn) << lsb) & mask);
-            cpu.set_reg(rd, r);
+            cpu.write_reg(rd, r);
             Flow::Next
         }
         Instr::Bfc { rd, lsb, width } => {
             let mask = field_mask(width) << lsb;
-            cpu.set_reg(rd, cpu.reg(rd) & !mask);
+            cpu.write_reg(rd, cpu.reg(rd) & !mask);
             Flow::Next
         }
         Instr::MulAcc {
@@ -439,7 +443,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr, suppress_flags: bool) -> Opt
         } => {
             let p = cpu.reg(rn).wrapping_mul(cpu.reg(rm));
             let a = cpu.reg(ra);
-            cpu.set_reg(
+            cpu.write_reg(
                 rd,
                 if sub {
                     a.wrapping_sub(p)
@@ -468,8 +472,8 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr, suppress_flags: bool) -> Opt
                 LongMulKind::Umlal => unsigned.wrapping_add(acc),
                 LongMulKind::Umaal => unsigned + lo + hi,
             };
-            cpu.set_reg(rdlo, r as u32);
-            cpu.set_reg(rdhi, (r >> 32) as u32);
+            cpu.write_reg(rdlo, r as u32);
+            cpu.write_reg(rdhi, (r >> 32) as u32);
             Flow::Next
         }
         Instr::Div { rd, rn, rm, signed } => {
@@ -482,7 +486,7 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr, suppress_flags: bool) -> Opt
                 (_, true) => (n as i32).wrapping_div(m as i32) as u32,
                 (_, false) => n / m,
             };
-            cpu.set_reg(rd, r);
+            cpu.write_reg(rd, r);
             Flow::Next
         }
         _ => return None,
