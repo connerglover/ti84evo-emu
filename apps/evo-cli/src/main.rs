@@ -30,7 +30,8 @@ enum Command {
         #[arg(long)]
         score_bases: bool,
     },
-    /// Boot a .84b2 bundle (images placed per Layout::EVO_7_1) and run it headless.
+    /// Boot a .84b2 bundle (images placed per Layout::EVO_7_1) and run it headless, or
+    /// under GDB.
     ///
     /// Prints `stop: <reason> pc=<hex> cycles=<n>` at the end. Exit status: 0 when the
     /// cycle budget runs out, the guest sleeps with nothing left to wake it (idle), or a
@@ -54,8 +55,15 @@ enum Command {
         /// Write the unmapped-access log as a markdown table to FILE.md.
         #[arg(long, value_name = "FILE.md")]
         unmapped_out: Option<PathBuf>,
-        /// Serve a GDB remote stub on PORT (not implemented yet).
-        #[arg(long, value_name = "PORT")]
+        /// Instead of running, serve one GDB client on 127.0.0.1:PORT (0 picks a free port;
+        /// the address is printed on stderr), with the CPU halted at reset. GDB controls the
+        /// run, so --max-cycles and tracing are not allowed. When the client detaches or
+        /// hangs up, prints `gdb: session ended pc=<hex> cycles=<n>` and exits 0.
+        #[arg(
+            long,
+            value_name = "PORT",
+            conflicts_with_all = ["max_cycles", "trace", "trace_range"]
+        )]
         gdb: Option<u16>,
     },
 }
@@ -194,8 +202,6 @@ mod tests {
             "44bc90",
             "--unmapped-out",
             "log.md",
-            "--gdb",
-            "3333",
         ])
         .expect("parse");
         let Command::Run {
@@ -215,11 +221,42 @@ mod tests {
         assert_eq!(trace_range, Some(0x100b_0000..0x100c_0000));
         assert_eq!(breaks, [0x100b_1adc, 0x0044_bc90]);
         assert_eq!(unmapped_out, Some(PathBuf::from("log.md")));
-        assert_eq!(gdb, Some(3333));
+        assert_eq!(gdb, None);
 
         assert!(Cli::try_parse_from(["evo-cli", "run"]).is_err());
         assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--break", "zz"]).is_err());
         assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--max-cycles", "-5"]).is_err());
         assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--trace-range", "9..1"]).is_err());
+    }
+
+    /// GDB drives the run: no budget and no trace, but breakpoints and the unmapped log.
+    #[test]
+    fn run_gdb_excludes_budget_and_trace() {
+        let cli = Cli::try_parse_from([
+            "evo-cli",
+            "run",
+            "os.84b2",
+            "--gdb",
+            "3333",
+            "--break",
+            "10",
+            "--unmapped-out",
+            "log.md",
+        ])
+        .expect("parse");
+        let Command::Run { gdb, breaks, .. } = cli.command else {
+            panic!("not run");
+        };
+        assert_eq!((gdb, breaks), (Some(3333), vec![0x10]));
+
+        for other in [
+            &["--trace"][..],
+            &["--trace-range", "0..10"],
+            &["--max-cycles", "5"],
+        ] {
+            let args = ["evo-cli", "run", "x", "--gdb", "3333"];
+            let parsed = Cli::try_parse_from(args.iter().chain(other));
+            assert!(parsed.is_err(), "--gdb with {other:?}");
+        }
     }
 }

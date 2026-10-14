@@ -1,9 +1,11 @@
-//! `evo-cli run`: boot a `.84b2` headless and run it until a stop condition.
+//! `evo-cli run`: boot a `.84b2` headless and run it until a stop condition, or serve it to
+//! GDB.
 
 use std::fs;
 use std::io::{self, BufWriter, Write};
+use std::net::{Ipv4Addr, TcpListener};
 use std::ops::{ControlFlow, Range};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use evo_core::{Machine, StopReason};
@@ -24,10 +26,6 @@ pub struct RunArgs {
 const EXIT_LOCKUP: u8 = 2;
 
 pub fn main(args: RunArgs) -> ExitCode {
-    if let Some(port) = args.gdb {
-        eprintln!("evo-cli: --gdb {port}: the GDB remote stub is not implemented yet");
-        return ExitCode::FAILURE;
-    }
     let bundle = match Bundle::open(&args.bundle) {
         Ok(b) => b,
         Err(e) => {
@@ -46,6 +44,9 @@ pub fn main(args: RunArgs) -> ExitCode {
     machine
         .breakpoints
         .extend(args.breaks.iter().map(|a| a & !1));
+    if let Some(port) = args.gdb {
+        return gdb(&mut machine, port, args.unmapped_out.as_deref());
+    }
 
     // Written as the run goes, in buffered blocks: a trace can be gigabytes.
     let mut out = BufWriter::new(io::stdout().lock());
@@ -72,10 +73,7 @@ pub fn main(args: RunArgs) -> ExitCode {
             .err();
     }
 
-    if let Some(path) = &args.unmapped_out
-        && let Err(e) = fs::write(path, machine.bus.log.to_markdown())
-    {
-        eprintln!("evo-cli: {}: {e}", path.display());
+    if !write_unmapped(args.unmapped_out.as_deref(), &machine) {
         return ExitCode::FAILURE;
     }
     match stdout_err {
@@ -88,7 +86,65 @@ pub fn main(args: RunArgs) -> ExitCode {
     }
 }
 
-/// The stop line, then notes on sleep, system resets and the unmapped log.
+/// `--gdb PORT`: serve one GDB client on localhost, then report where it left the machine.
+fn gdb(machine: &mut Machine, port: u16, unmapped_out: Option<&Path>) -> ExitCode {
+    // Loopback only: whoever connects controls the machine.
+    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("evo-cli: --gdb {port}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match listener.local_addr() {
+        Ok(addr) => {
+            eprintln!("evo-cli: GDB stub listening on {addr} (in GDB: target remote {addr})");
+        }
+        Err(e) => {
+            eprintln!("evo-cli: --gdb {port}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if let Err(e) = evo_core::gdb::serve(machine, listener) {
+        eprintln!("evo-cli: --gdb {port}: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let mut out = io::stdout().lock();
+    let printed = writeln!(
+        out,
+        "gdb: session ended pc=0x{:08x} cycles={}",
+        machine.cpu.regs.pc, machine.sched.now
+    )
+    .and_then(|()| notes(&mut out, machine, false))
+    .and_then(|()| out.flush());
+    if !write_unmapped(unmapped_out, machine) {
+        return ExitCode::FAILURE;
+    }
+    match printed {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => {
+            eprintln!("evo-cli: {e}");
+            ExitCode::FAILURE
+        }
+        _ => ExitCode::SUCCESS,
+    }
+}
+
+/// Write the unmapped-access log to `path`, if given; false (reported) if that fails.
+fn write_unmapped(path: Option<&Path>, m: &Machine) -> bool {
+    let Some(path) = path else {
+        return true;
+    };
+    match fs::write(path, m.bus.log.to_markdown()) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("evo-cli: {}: {e}", path.display());
+            false
+        }
+    }
+}
+
+/// The stop line, then the notes.
 fn summary(out: &mut impl Write, m: &Machine, stop: StopReason) -> io::Result<()> {
     let (reason, pc) = match stop {
         StopReason::CycleLimit => ("cycle-limit", m.cpu.regs.pc),
@@ -105,7 +161,12 @@ fn summary(out: &mut impl Write, m: &Machine, stop: StopReason) -> io::Result<()
         write!(out, " imm=0x{imm:02x}")?;
     }
     writeln!(out)?;
-    if stop == StopReason::Idle {
+    notes(out, m, stop == StopReason::Idle)
+}
+
+/// Notes on sleep (`idle`: nothing can end it), system resets and the unmapped log.
+fn notes(out: &mut impl Write, m: &Machine, idle: bool) -> io::Result<()> {
+    if idle {
         writeln!(
             out,
             "idle: the CPU is asleep (WFI/WFE) and nothing is pending or scheduled to wake it"

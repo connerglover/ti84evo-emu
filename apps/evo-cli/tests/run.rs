@@ -1,6 +1,7 @@
 //! `evo-cli run` end to end, on synthetic bundles written to the target's temp directory.
 
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -189,6 +190,70 @@ fn cli_trace_stops_when_stdout_closes() {
     // Tracing 10^12 cycles takes hours.
     let status = wait_exit(&mut child, Duration::from_secs(30), "stdout closed");
     assert_eq!(status.code(), Some(0));
+}
+
+/// Send one RSP packet in ack mode and return the reply's body (no run-length decoding).
+fn rsp(stream: &mut TcpStream, body: &str) -> String {
+    let sum = body.bytes().fold(0u8, |a, b| a.wrapping_add(b));
+    write!(stream, "${body}#{sum:02x}").expect("send");
+    let mut reply = Vec::new();
+    let mut byte = [0u8];
+    while !(reply.len() > 3 && reply[reply.len() - 3] == b'#') {
+        stream.read_exact(&mut byte).expect("receive");
+        reply.push(byte[0]);
+    }
+    stream.write_all(b"+").expect("ack");
+    let reply = String::from_utf8(reply).expect("ASCII");
+    let reply = reply.strip_prefix("+$").expect("ack, then the reply");
+    reply[..reply.len() - 3].to_string()
+}
+
+/// `--gdb 0` serves on a free localhost port, which it reports on stderr; after the client
+/// detaches, the run ends with a summary.
+#[test]
+fn cli_gdb_serves_one_client_on_localhost() {
+    let bundle = bundle_file("cli_gdb", looping());
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_evo-cli"))
+        .arg("run")
+        .arg(&bundle)
+        .args(["--gdb", "0", "--break", "0x100b0604"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn evo-cli");
+    let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
+    let mut line = String::new();
+    stderr.read_line(&mut line).expect("listening line");
+    let addr: SocketAddr = line
+        .split_whitespace()
+        .find_map(|word| word.parse().ok())
+        .unwrap_or_else(|| panic!("no address in {line:?}"));
+    assert!(addr.ip().is_loopback(), "{line}");
+
+    let mut gdb = TcpStream::connect(addr).expect("connect");
+    gdb.set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("timeout");
+    let stop = rsp(&mut gdb, "c");
+    assert!(
+        stop.starts_with("T05") && stop.contains("swbreak"),
+        "{stop}"
+    );
+    assert_eq!(rsp(&mut gdb, "D"), "OK");
+
+    let status = wait_exit(&mut child, Duration::from_secs(20), "after detach");
+    assert_eq!(status.code(), Some(0));
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut out)
+        .expect("stdout");
+    assert!(
+        out.starts_with("gdb: session ended pc=0x100b0604 cycles=2\n"),
+        "{out}"
+    );
+    assert!(out.contains("\nunmapped: 0 distinct accesses"), "{out}");
 }
 
 #[test]
