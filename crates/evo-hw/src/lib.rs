@@ -3,6 +3,7 @@
 pub mod dev;
 pub mod device;
 pub mod memmap;
+pub mod nor;
 mod region;
 pub mod soc;
 pub mod unmapped;
