@@ -1,7 +1,7 @@
 mod common;
 
 use armv8m::{Cpu, Instr, StepResult, decode32, disasm};
-use common::{FlatBus, cpu_with_code, run};
+use common::{FlatBus, cpu_with_code, run, step_hardfault};
 
 fn dis(cpu: &Cpu, bus: &mut FlatBus) -> String {
     let (instr, len) = cpu.decode_at(bus, cpu.regs.pc).expect("fetch");
@@ -521,7 +521,7 @@ fn unpredictable_sp_pc_operands_are_undefined() {
         let (instr, len) = cpu.decode_at(&mut bus, 0x100).unwrap();
         assert!(matches!(instr, Instr::Undefined { .. }), "{code:x?}");
         assert_eq!(len, 4);
-        assert_eq!(cpu.step(&mut bus), StepResult::Lockup);
+        assert_eq!(step_hardfault(&mut cpu, &mut bus), 1 << 16, "UNDEFINSTR");
     }
     assert!(matches!(
         decode32(0xF000, 0x0D01),

@@ -5,9 +5,11 @@ use serde::{Deserialize, Serialize};
 use crate::bits::condition_holds;
 use crate::bus::{Access, AccessKind, Bus};
 use crate::decode::{decode16, decode32, is_32bit};
+use crate::exception::{ENTRY_CYCLES, Fault, ReturnOutcome, SVCALL};
 use crate::exec::{self, Flow};
 use crate::instr::Instr;
 use crate::regs::{Registers, Sec};
+use crate::scs::Scs;
 
 /// Outcome of one `Cpu::step`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,18 +27,56 @@ pub struct Cpu {
     /// Event register set by SEV and consumed by WFE.
     pub event: bool,
     /// Local exclusive monitor: the address of the open LDREX reservation, if any. Cleared by
-    /// CLREX and by every STREX.
-    // Task 7: also clear this on exception entry and exception return.
+    /// CLREX, by every STREX and by exception entry and return.
     pub exclusive: Option<u32>,
-    /// Cycles charged on top of the base cost by the current instruction (per-step scratch).
-    #[serde(skip)]
-    pub(crate) extra_cycles: u32,
+    /// System Control Space (NVIC, SCB, SysTick, MPU).
+    pub scs: Scs,
+    /// Lockup state (see `locked_up`).
+    pub(crate) lockup: bool,
 }
 
 impl Default for Cpu {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Instruction fetches from these regions are Execute Never in the default memory map:
+/// Peripheral (0x4000_0000..0x6000_0000), Device and System (0xA000_0000..).
+fn execute_never(addr: u32) -> bool {
+    (0x4000_0000..0x6000_0000).contains(&addr) || addr >= 0xA000_0000
+}
+
+/// UNPREDICTABLE instructions inside an IT block, which this implementation makes UNDEFINED:
+/// conditional branches, CBZ/CBNZ, CPS and IT anywhere in a block, and instructions that write
+/// the PC anywhere but last.
+fn unpredictable_in_it(instr: &Instr, last: bool) -> bool {
+    match *instr {
+        Instr::BCond { .. } | Instr::Cbz { .. } | Instr::Cps { .. } | Instr::It { .. } => true,
+        _ => !last && writes_pc(instr),
+    }
+}
+
+fn writes_pc(instr: &Instr) -> bool {
+    match *instr {
+        Instr::B { .. } | Instr::Bl { .. } | Instr::Bx { .. } | Instr::Blx { .. } => true,
+        Instr::Tb { .. } => true,
+        Instr::Pop { regs } | Instr::Ldm { regs, .. } | Instr::Ldmdb { regs, .. } => {
+            regs & 0x8000 != 0
+        }
+        Instr::LoadImm { rt, .. } | Instr::LoadReg { rt, .. } | Instr::LdrLit { rt, .. } => {
+            rt == 15
+        }
+        Instr::MovReg { rd, .. } | Instr::AddReg { rd, .. } => rd == 15,
+        _ => false,
+    }
+}
+
+/// Result of executing (or failing to execute) one instruction.
+enum Exec {
+    Done { cycles: u32, sleep: bool },
+    Bkpt(u8),
+    Lockup,
 }
 
 impl Cpu {
@@ -51,15 +91,20 @@ impl Cpu {
             regs,
             event: false,
             exclusive: None,
-            extra_cycles: 0,
+            scs: Scs::default(),
+            lockup: false,
         }
     }
 
-    /// Load MSP_S and PC from the vector table at VTOR_S (default 0).
+    /// Reset: VTOR takes its reset value (see `set_vtor`, default 0), then MSP_S and PC are
+    /// loaded from the Secure vector table.
     pub fn reset(&mut self, bus: &mut impl Bus) {
+        let init_vtor = self.scs.scb.init_vtor;
         *self = Self::new();
+        self.scs.scb.init_vtor = init_vtor;
+        self.scs.scb.vtor = init_vtor;
         let acc = self.access(AccessKind::Read);
-        let vtor = 0;
+        let vtor = init_vtor.s;
         if let (Ok(sp), Ok(pc)) = (bus.read32(vtor, acc), bus.read32(vtor + 4, acc)) {
             self.regs.msp.s = sp & !3;
             self.regs.pc = pc & !1;
@@ -81,16 +126,26 @@ impl Cpu {
         }
     }
 
+    /// Fetch and decode the instruction at `addr`.
+    fn fetch(&self, bus: &mut impl Bus, addr: u32) -> Result<(Instr, u8), Fault> {
+        if execute_never(addr) {
+            return Err(Fault::IAccViol);
+        }
+        let acc = self.access(AccessKind::Fetch);
+        let hw1 = bus.read16(addr, acc).map_err(|_| Fault::IBusErr)?;
+        if is_32bit(hw1) {
+            let hw2 = bus
+                .read16(addr.wrapping_add(2), acc)
+                .map_err(|_| Fault::IBusErr)?;
+            Ok((decode32(hw1, hw2), 4))
+        } else {
+            Ok((decode16(hw1), 2))
+        }
+    }
+
     /// Fetch and decode the instruction at `addr`; returns it with its length (2 or 4).
     pub fn decode_at(&self, bus: &mut impl Bus, addr: u32) -> Option<(Instr, u8)> {
-        let acc = self.access(AccessKind::Fetch);
-        let hw1 = bus.read16(addr, acc).ok()?;
-        if is_32bit(hw1) {
-            let hw2 = bus.read16(addr.wrapping_add(2), acc).ok()?;
-            Some((decode32(hw1, hw2), 4))
-        } else {
-            Some((decode16(hw1), 2))
-        }
+        self.fetch(bus, addr).ok()
     }
 
     /// Value of register `n` as read by an instruction (PC reads as address + 4).
@@ -118,11 +173,21 @@ impl Cpu {
         self.regs.pc = addr & !1;
     }
 
-    /// `BXWritePC`: bit 0 selects the instruction set (T bit).
-    pub fn bx_write_pc(&mut self, addr: u32) {
-        // Task 7: EXC_RETURN values (0xFF00_0000..) start an exception return here.
+    /// `BLXWritePC`: bit 0 selects the instruction set (T bit); never an exception return.
+    pub fn blx_write_pc(&mut self, addr: u32) {
         self.regs.xpsr.t = addr & 1 != 0;
         self.regs.pc = addr & !1;
+    }
+
+    /// `BXWritePC` / `LoadWritePC`: in Handler mode an EXC_RETURN value (0xFF00_0000 and up)
+    /// requests an exception return, which `step` performs; otherwise an interworking branch.
+    pub(crate) fn bx_write_pc(&mut self, addr: u32) -> Flow {
+        // Task 8: FNC_RETURN (0xFEFF_FFxx) from Secure state returns from a Non-secure call.
+        if self.regs.handler_mode() && addr >> 24 == 0xFF {
+            return Flow::ExcReturn(addr);
+        }
+        self.blx_write_pc(addr);
+        Flow::Branched
     }
 
     /// `ITAdvance()`.
@@ -135,47 +200,125 @@ impl Cpu {
         };
     }
 
-    /// Execute one instruction.
+    /// Take a pending exception that preempts the current execution priority, else execute one
+    /// instruction (and take any exception it caused or that became pending meanwhile).
     pub fn step(&mut self, bus: &mut impl Bus) -> StepResult {
-        let pc = self.regs.pc;
-        let Some((instr, len)) = self.decode_at(bus, pc) else {
-            return self.raise_fault();
+        if self.lockup {
+            // Only an exception that preempts the locked-up priority (NMI) leaves lockup.
+            if self.preemptable_pending().is_none() {
+                return StepResult::Lockup;
+            }
+            self.lockup = false;
+        }
+        // Asynchronous exceptions that became pending between steps.
+        if self.take_pending(bus) {
+            return self.entry_result(ENTRY_CYCLES);
+        }
+        let (mut cycles, sleep) = match self.execute_one(bus) {
+            Exec::Done { cycles, sleep } => (cycles, sleep),
+            Exec::Bkpt(imm) => return StepResult::Bkpt(imm),
+            Exec::Lockup => return StepResult::Lockup,
         };
-        if matches!(instr, Instr::Undefined { .. }) {
-            return self.raise_fault();
+        self.tick_systick(cycles);
+        if self.take_pending(bus) {
+            cycles += ENTRY_CYCLES;
+            return self.entry_result(cycles);
+        }
+        if sleep {
+            StepResult::Sleep
+        } else {
+            StepResult::Executed { cycles }
+        }
+    }
+
+    fn entry_result(&self, cycles: u32) -> StepResult {
+        if self.lockup {
+            StepResult::Lockup
+        } else {
+            StepResult::Executed { cycles }
+        }
+    }
+
+    /// Raise `fault` for the instruction at PC (which stays on it).
+    fn fault(&mut self, fault: Fault) -> Exec {
+        if self.raise_fault(fault) {
+            Exec::Done {
+                cycles: 1,
+                sleep: false,
+            }
+        } else {
+            self.enter_lockup();
+            Exec::Lockup
+        }
+    }
+
+    fn execute_one(&mut self, bus: &mut impl Bus) -> Exec {
+        let pc = self.regs.pc;
+        if !self.regs.xpsr.t {
+            return self.fault(Fault::InvState);
+        }
+        let (instr, len) = match self.fetch(bus, pc) {
+            Ok(x) => x,
+            Err(f) => return self.fault(f),
+        };
+        let it = self.regs.xpsr.it;
+        let in_it = it & 0xF != 0;
+        // BKPT executes unconditionally, even when its IT condition fails.
+        if let Instr::Bkpt { imm } = instr {
+            return Exec::Bkpt(imm);
+        }
+        // An undefined instruction inside an IT block faults even when its condition fails
+        // (CONSTRAINED UNPREDICTABLE: faulting is one of the permitted behaviours).
+        if let Instr::Undefined { raw } = instr {
+            log::warn!("undefined instruction {raw:#x} at {pc:#010x}");
+            return self.fault(Fault::UndefInstr);
+        }
+        if in_it && unpredictable_in_it(&instr, it & 0xF == 0x8) {
+            log::warn!("UNPREDICTABLE {instr:?} in IT block at {pc:#010x}");
+            return self.fault(Fault::UndefInstr);
         }
 
-        let in_it = self.regs.xpsr.it & 0xF != 0;
-        let mut flow = Flow::Next;
-        self.extra_cycles = 0;
-        if !in_it || condition_holds(self.regs.xpsr.it >> 4, &self.regs.xpsr) {
-            // 16-bit "S" forms do not set flags inside an IT block.
-            flow = exec::execute(self, bus, &instr, in_it && len == 2);
-        }
+        let executes = !in_it || condition_holds(it >> 4, &self.regs.xpsr);
+        // 16-bit "S" forms do not set flags inside an IT block.
+        let flow = if executes {
+            exec::execute(self, bus, &instr, in_it && len == 2)
+        } else {
+            Flow::Next
+        };
         match flow {
-            Flow::Fault => return self.raise_fault(),
-            Flow::Bkpt(imm) => return StepResult::Bkpt(imm),
+            Flow::Fault(f) => return self.fault(f),
+            // Intercepted above; kept for completeness.
+            Flow::Bkpt(imm) => return Exec::Bkpt(imm),
             Flow::Next | Flow::Sleep | Flow::Svc(_) => {
                 self.regs.pc = pc.wrapping_add(u32::from(len));
             }
-            Flow::Branched => {}
+            Flow::Branched | Flow::ExcReturn(_) => {}
         }
         if in_it {
             self.it_advance();
         }
+        let branched = matches!(flow, Flow::Branched | Flow::ExcReturn(_));
+        let extra = if executes {
+            exec::extra_cycles(&instr)
+        } else {
+            0
+        };
+        let cycles = 1 + u32::from(branched) + extra;
+        let mut sleep = flow == Flow::Sleep;
         match flow {
-            Flow::Sleep => StepResult::Sleep,
-            // Task 7: take the SVCall exception here instead of faulting.
-            Flow::Svc(_) => self.raise_fault(),
-            _ => StepResult::Executed {
-                cycles: 1 + u32::from(flow == Flow::Branched) + self.extra_cycles,
+            Flow::Svc(_) => {
+                if !self.raise_sync(SVCALL, self.regs.sec) {
+                    self.enter_lockup();
+                    return Exec::Lockup;
+                }
+            }
+            Flow::ExcReturn(v) => match self.exception_return(bus, v) {
+                ReturnOutcome::Done => {}
+                ReturnOutcome::Sleep => sleep = true,
+                ReturnOutcome::Lockup => return Exec::Lockup,
             },
+            _ => {}
         }
-    }
-
-    /// Placeholder for faults raised by undefined or unfetchable instructions.
-    fn raise_fault(&mut self) -> StepResult {
-        // Task 7: raise UsageFault UNDEFINSTR / BusFault IBUSERR here instead of locking up.
-        StepResult::Lockup
+        Exec::Done { cycles, sleep }
     }
 }

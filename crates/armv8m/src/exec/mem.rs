@@ -3,32 +3,63 @@
 use super::Flow;
 use crate::bus::{Access, AccessKind, Bus, BusError};
 use crate::cpu::Cpu;
+use crate::exception::Fault;
 use crate::instr::{Instr, MemSize};
+use crate::scs::is_ppb;
+use crate::scs::scb::CCR_UNALIGN_TRP;
 
 /// Why a memory instruction failed.
 #[derive(Clone, Copy, Debug)]
 enum MemFault {
-    // Task 7: the BusError selects the fault status bits; unread until then.
-    Bus(#[allow(dead_code)] BusError),
+    /// The bus (or the PPB) rejected the access at this address.
+    Bus(BusError, u32),
     /// LDM/STM/PUSH/POP, LDRD/STRD, exclusive and acquire/release accesses that are not
-    /// naturally aligned.
+    /// naturally aligned, and any unaligned access while `CCR.UNALIGN_TRP` is set.
     Unaligned,
 }
 
 /// The single place where a memory failure is turned into a fault.
 fn fault(cause: MemFault) -> Flow {
-    // Task 7: choose the fault here: Bus(_) -> BusFault PRECISERR (or MemManage/SecureFault
-    // by cause), Unaligned -> UsageFault UNALIGNED.
-    match cause {
-        MemFault::Bus(_) | MemFault::Unaligned => Flow::Fault,
+    Flow::Fault(match cause {
+        // Task 8: BusError::SecureViolation becomes a SecureFault (AUVIOL, SFAR).
+        MemFault::Bus(err, addr) => {
+            log::debug!("data access to {addr:#010x} failed: {err:?}");
+            Fault::PreciseErr(addr)
+        }
+        MemFault::Unaligned => Fault::Unaligned,
+    })
+}
+
+/// True if an unaligned access of `size` at `addr` traps (`CCR.UNALIGN_TRP`).
+fn unaligned_trap(cpu: &Cpu, addr: u32, size: MemSize) -> bool {
+    let mask = match size {
+        MemSize::Byte => return false,
+        MemSize::Half => 1,
+        MemSize::Word => 3,
+    };
+    addr & mask != 0 && cpu.scs.scb.ccr.get(cpu.regs.sec) & CCR_UNALIGN_TRP != 0
+}
+
+fn read(cpu: &mut Cpu, bus: &mut impl Bus, addr: u32, size: MemSize) -> Result<u32, MemFault> {
+    let acc = cpu.access(AccessKind::Read);
+    read_as(cpu, acc, bus, addr, size)
+}
+
+fn read_as(
+    cpu: &mut Cpu,
+    acc: Access,
+    bus: &mut impl Bus,
+    addr: u32,
+    size: MemSize,
+) -> Result<u32, MemFault> {
+    if unaligned_trap(cpu, addr, size) {
+        return Err(MemFault::Unaligned);
     }
-}
-
-fn read(cpu: &Cpu, bus: &mut impl Bus, addr: u32, size: MemSize) -> Result<u32, MemFault> {
-    read_as(cpu.access(AccessKind::Read), bus, addr, size)
-}
-
-fn read_as(acc: Access, bus: &mut impl Bus, addr: u32, size: MemSize) -> Result<u32, MemFault> {
+    if is_ppb(addr) {
+        return cpu
+            .ppb_read(addr, size, acc)
+            .map_err(|e| MemFault::Bus(e, addr));
+    }
     let r = match size {
         MemSize::Byte => bus.read8(addr, acc).map(u32::from),
         MemSize::Half if addr & 1 == 0 => bus.read16(addr, acc).map(u32::from),
@@ -38,28 +69,43 @@ fn read_as(acc: Access, bus: &mut impl Bus, addr: u32, size: MemSize) -> Result<
             let n = if size == MemSize::Half { 2 } else { 4 };
             let mut v = 0;
             for i in 0..n {
-                let b = bus
-                    .read8(addr.wrapping_add(i), acc)
-                    .map_err(MemFault::Bus)?;
+                let a = addr.wrapping_add(i);
+                let b = bus.read8(a, acc).map_err(|e| MemFault::Bus(e, a))?;
                 v |= u32::from(b) << (8 * i);
             }
             Ok(v)
         }
     };
-    r.map_err(MemFault::Bus)
+    r.map_err(|e| MemFault::Bus(e, addr))
 }
 
-fn write(cpu: &Cpu, bus: &mut impl Bus, addr: u32, v: u32, size: MemSize) -> Result<(), MemFault> {
-    write_as(cpu.access(AccessKind::Write), bus, addr, v, size)
+fn write(
+    cpu: &mut Cpu,
+    bus: &mut impl Bus,
+    addr: u32,
+    v: u32,
+    size: MemSize,
+) -> Result<(), MemFault> {
+    let acc = cpu.access(AccessKind::Write);
+    write_as(cpu, acc, bus, addr, v, size)
 }
 
 fn write_as(
+    cpu: &mut Cpu,
     acc: Access,
     bus: &mut impl Bus,
     addr: u32,
     v: u32,
     size: MemSize,
 ) -> Result<(), MemFault> {
+    if unaligned_trap(cpu, addr, size) {
+        return Err(MemFault::Unaligned);
+    }
+    if is_ppb(addr) {
+        return cpu
+            .ppb_write(addr, v, size, acc)
+            .map_err(|e| MemFault::Bus(e, addr));
+    }
     let r = match size {
         MemSize::Byte => bus.write8(addr, v as u8, acc),
         MemSize::Half if addr & 1 == 0 => bus.write16(addr, v as u16, acc),
@@ -67,13 +113,14 @@ fn write_as(
         _ => {
             let n = if size == MemSize::Half { 2 } else { 4 };
             for i in 0..n {
-                bus.write8(addr.wrapping_add(i), (v >> (8 * i)) as u8, acc)
-                    .map_err(MemFault::Bus)?;
+                let a = addr.wrapping_add(i);
+                bus.write8(a, (v >> (8 * i)) as u8, acc)
+                    .map_err(|e| MemFault::Bus(e, a))?;
             }
             Ok(())
         }
     };
-    r.map_err(MemFault::Bus)
+    r.map_err(|e| MemFault::Bus(e, addr))
 }
 
 fn extend(v: u32, size: MemSize, signed: bool) -> u32 {
@@ -87,8 +134,7 @@ fn extend(v: u32, size: MemSize, signed: bool) -> u32 {
 /// Write a loaded value; a PC destination is a `LoadWritePC` interworking branch.
 fn write_loaded(cpu: &mut Cpu, rt: u8, v: u32) -> Flow {
     if rt == 15 {
-        cpu.bx_write_pc(v);
-        Flow::Branched
+        cpu.bx_write_pc(v)
     } else {
         cpu.set_reg(rt, v);
         Flow::Next
@@ -133,7 +179,7 @@ fn list(regs: u16) -> impl Iterator<Item = u8> {
 
 /// Read `regs` from consecutive words at `base` without changing any register.
 fn load_multiple(
-    cpu: &Cpu,
+    cpu: &mut Cpu,
     bus: &mut impl Bus,
     base: u32,
     regs: u16,
@@ -151,27 +197,33 @@ fn load_multiple(
 }
 
 /// Write `regs` to consecutive words from `base`; returns the address after the last word.
-fn store_multiple(cpu: &Cpu, bus: &mut impl Bus, base: u32, regs: u16) -> Result<u32, Flow> {
+fn store_multiple(cpu: &mut Cpu, bus: &mut impl Bus, base: u32, regs: u16) -> Result<u32, Flow> {
     if base & 3 != 0 {
         return Err(fault(MemFault::Unaligned));
     }
     let mut addr = base;
     for r in list(regs) {
-        write(cpu, bus, addr, cpu.reg(r), MemSize::Word).map_err(fault)?;
+        let v = cpu.reg(r);
+        write(cpu, bus, addr, v, MemSize::Word).map_err(fault)?;
         addr = addr.wrapping_add(4);
     }
     Ok(addr)
 }
 
 /// Read two consecutive words; the address must be word aligned.
-fn load_dual(cpu: &Cpu, bus: &mut impl Bus, addr: u32) -> Result<(u32, u32), Flow> {
+fn load_dual(cpu: &mut Cpu, bus: &mut impl Bus, addr: u32) -> Result<(u32, u32), Flow> {
     check_align(addr, MemSize::Word)?;
     let a = read(cpu, bus, addr, MemSize::Word).map_err(fault)?;
     let b = read(cpu, bus, addr.wrapping_add(4), MemSize::Word).map_err(fault)?;
     Ok((a, b))
 }
 
-fn store_dual(cpu: &Cpu, bus: &mut impl Bus, addr: u32, (a, b): (u32, u32)) -> Result<(), Flow> {
+fn store_dual(
+    cpu: &mut Cpu,
+    bus: &mut impl Bus,
+    addr: u32,
+    (a, b): (u32, u32),
+) -> Result<(), Flow> {
     check_align(addr, MemSize::Word)?;
     write(cpu, bus, addr, a, MemSize::Word).map_err(fault)?;
     write(cpu, bus, addr.wrapping_add(4), b, MemSize::Word).map_err(fault)
@@ -278,7 +330,6 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
             match store_multiple(cpu, bus, start, regs) {
                 Ok(_) => {
                     cpu.set_reg(13, start);
-                    cpu.extra_cycles = n;
                     Flow::Next
                 }
                 Err(f) => f,
@@ -290,8 +341,6 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
             match load_multiple(cpu, bus, sp, regs) {
                 Ok(vals) => {
                     cpu.set_reg(13, sp.wrapping_add(4 * n));
-                    // The taken-branch cycle of POP {.., pc} is part of its N-register cost.
-                    cpu.extra_cycles = if regs & 0x8000 != 0 { n - 1 } else { n };
                     commit_loads(cpu, vals)
                 }
                 Err(f) => f,
@@ -304,7 +353,6 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
                     if wback {
                         cpu.set_reg(rn, base.wrapping_add(4 * regs.count_ones()));
                     }
-                    cpu.extra_cycles = regs.count_ones();
                     commit_loads(cpu, vals)
                 }
                 Err(f) => f,
@@ -317,7 +365,6 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
                     if wback {
                         cpu.set_reg(rn, end);
                     }
-                    cpu.extra_cycles = regs.count_ones();
                     Flow::Next
                 }
                 Err(f) => f,
@@ -333,7 +380,7 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
             let mut acc = cpu.access(AccessKind::Read);
             acc.privileged = false;
             let addr = cpu.reg(rn).wrapping_add(imm);
-            match read_as(acc, bus, addr, size) {
+            match read_as(cpu, acc, bus, addr, size) {
                 Ok(v) => write_loaded(cpu, rt, extend(v, size, signed)),
                 Err(e) => fault(e),
             }
@@ -342,7 +389,8 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
             let mut acc = cpu.access(AccessKind::Write);
             acc.privileged = false;
             let addr = cpu.reg(rn).wrapping_add(imm);
-            match write_as(acc, bus, addr, cpu.reg(rt), size) {
+            let v = cpu.reg(rt);
+            match write_as(cpu, acc, bus, addr, v, size) {
                 Ok(()) => Flow::Next,
                 Err(e) => fault(e),
             }
@@ -366,7 +414,6 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
                     }
                     cpu.set_reg(rt, a);
                     cpu.set_reg(rt2, b);
-                    cpu.extra_cycles = 1;
                     Flow::Next
                 }
                 Err(f) => f,
@@ -389,7 +436,6 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
                     if wback {
                         cpu.set_reg(rn, off);
                     }
-                    cpu.extra_cycles = 1;
                     Flow::Next
                 }
                 Err(f) => f,
@@ -402,7 +448,6 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
                     if wback {
                         cpu.set_reg(rn, start);
                     }
-                    cpu.extra_cycles = regs.count_ones();
                     commit_loads(cpu, vals)
                 }
                 Err(f) => f,
@@ -415,7 +460,6 @@ pub(super) fn execute(cpu: &mut Cpu, bus: &mut impl Bus, instr: &Instr) -> Optio
                     if wback {
                         cpu.set_reg(rn, start);
                     }
-                    cpu.extra_cycles = regs.count_ones();
                     Flow::Next
                 }
                 Err(f) => f,

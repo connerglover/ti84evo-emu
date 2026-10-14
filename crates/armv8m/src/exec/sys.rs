@@ -2,8 +2,19 @@
 
 use super::Flow;
 use crate::cpu::Cpu;
+use crate::exception::Fault;
 use crate::instr::{HintOp, Instr};
 use crate::regs::Sec;
+use crate::scs::PRIORITY_MASK;
+
+/// `CPACR.CPn` grants access: 0b01 privileged only, 0b11 full.
+fn cp_enabled(cpu: &Cpu, cp: u32) -> bool {
+    match cpu.scs.scb.cpacr.get(cpu.regs.sec) >> (2 * cp) & 3 {
+        0b01 => cpu.is_privileged(),
+        0b11 => true,
+        _ => false,
+    }
+}
 
 /// APSR bits visible through `MRS`/`MSR`: N, Z, C, V, Q and GE[3:0].
 const APSR_NZCVQ: u32 = 0xF800_0000;
@@ -65,6 +76,11 @@ fn write_sysreg(cpu: &mut Cpu, sysm: u8, mask: u8, v: u32) {
         return;
     };
     let handler = cpu.regs.handler_mode();
+    let exec_priority = if base == 19 {
+        cpu.execution_priority()
+    } else {
+        0
+    };
     let r = &mut cpu.regs;
     match base {
         // The IPSR and EPSR parts of IAPSR/EAPSR/XPSR are not writable.
@@ -85,16 +101,22 @@ fn write_sysreg(cpu: &mut Cpu, sysm: u8, mask: u8, v: u32) {
         10 => *r.msplim.get_mut(bank) = v & !7,
         11 => *r.psplim.get_mut(bank) = v & !7,
         16 => *r.primask.get_mut(bank) = v & 1 != 0,
-        17 => *r.basepri.get_mut(bank) = v as u8,
+        // Only the implemented priority bits of BASEPRI exist.
+        17 => *r.basepri.get_mut(bank) = v as u8 & PRIORITY_MASK,
         // BASEPRI_MAX only ever raises the priority (lowers the number); zero is ignored.
         18 => {
+            let v = v as u8 & PRIORITY_MASK;
             let cur = r.basepri.get_mut(bank);
-            if v as u8 != 0 && (*cur == 0 || (v as u8) < *cur) {
-                *cur = v as u8;
+            if v != 0 && (*cur == 0 || v < *cur) {
+                *cur = v;
             }
         }
-        // Task 7: FAULTMASK writes are ignored at execution priority -1 or lower.
-        19 => *r.faultmask.get_mut(bank) = v & 1 != 0,
+        // FAULTMASK can only be set below execution priority -1 (not in NMI or HardFault).
+        19 => {
+            if v & 1 == 0 || exec_priority > -1 {
+                *r.faultmask.get_mut(bank) = v & 1 != 0;
+            }
+        }
         20 => {
             let old = *r.control.get(bank);
             // nPRIV, SPSEL and FPCA; SFPA (bit 3) exists only in the Secure bank. SPSEL is
@@ -126,7 +148,8 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
                 if i {
                     *cpu.regs.primask.get_mut(sec) = disable;
                 }
-                if f {
+                // CPSID f has no effect at execution priority -1 or higher.
+                if f && (!disable || cpu.execution_priority() > -1) {
                     *cpu.regs.faultmask.get_mut(sec) = disable;
                 }
             }
@@ -156,8 +179,24 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
         }
         // Single in-order core: barriers and preloads have no effect.
         Instr::Barrier { .. } | Instr::Preload { .. } => Flow::Next,
-        // Task 7: raise UsageFault NOCP instead of reporting a generic fault.
-        Instr::Coprocessor { .. } => Flow::Fault,
+        // No coprocessor is implemented. CP10/CP11 (the FPU) enabled in CPACR would mean the
+        // firmware expects an FPU: report that as UNDEFINSTR; otherwise NOCP.
+        Instr::Coprocessor { raw } => {
+            let cp = (raw >> 8) & 0xF;
+            if matches!(cp, 10 | 11) && cp_enabled(cpu, cp) {
+                log::warn!(
+                    "FPU instruction {raw:#010x} at {:#010x}: FPU not implemented",
+                    cpu.regs.pc
+                );
+                Flow::Fault(Fault::UndefInstr)
+            } else {
+                log::warn!(
+                    "coprocessor instruction {raw:#010x} at {:#010x}: NOCP",
+                    cpu.regs.pc
+                );
+                Flow::Fault(Fault::NoCp)
+            }
+        }
         _ => return None,
     };
     Some(flow)

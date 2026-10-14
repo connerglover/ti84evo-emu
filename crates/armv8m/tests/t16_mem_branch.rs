@@ -1,7 +1,7 @@
 mod common;
 
 use armv8m::{Cpu, StepResult, disasm};
-use common::{FlatBus, RAM_BASE, cpu_with_code, run};
+use common::{FlatBus, RAM_BASE, cpu_with_code, run, step_hardfault};
 
 /// Disassemble the instruction at the current PC.
 fn dis(cpu: &Cpu, bus: &mut FlatBus) -> String {
@@ -269,11 +269,12 @@ fn bus_error_and_unaligned_ldm_fault() {
     // str r0, [r1] to unmapped memory
     let (mut cpu, mut bus) = cpu_with_code(&[0x6008]);
     cpu.regs.r[1] = 0x4000_0000;
-    assert_eq!(cpu.step(&mut bus), StepResult::Lockup);
+    // PRECISERR | BFARVALID
+    assert_eq!(step_hardfault(&mut cpu, &mut bus), (1 << 9) | (1 << 15));
     // ldmia r0, {r1} with unaligned base
     let (mut cpu, mut bus) = cpu_with_code(&[0xC802]);
     cpu.regs.r[0] = RAM_BASE + 2;
-    assert_eq!(cpu.step(&mut bus), StepResult::Lockup);
+    assert_eq!(step_hardfault(&mut cpu, &mut bus), 1 << 24, "UNALIGNED");
 }
 
 #[test]

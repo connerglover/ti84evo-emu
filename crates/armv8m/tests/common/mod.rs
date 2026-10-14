@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use armv8m::{Access, Bus, BusError, Cpu};
+use armv8m::{Access, Bus, BusError, Cpu, StepResult};
 
 pub const CODE_BASE: u32 = 0x0000_0000;
 pub const RAM_BASE: u32 = 0x2000_0000;
@@ -89,4 +89,17 @@ pub fn run(cpu: &mut Cpu, bus: &mut FlatBus, n: usize) {
     for _ in 0..n {
         cpu.step(bus);
     }
+}
+
+/// Step once and require that the instruction at PC faulted into HardFault (the configurable
+/// fault handlers are disabled at reset, so every fault escalates). Returns CFSR.
+pub fn step_hardfault(cpu: &mut Cpu, bus: &mut FlatBus) -> u32 {
+    let pc = cpu.regs.pc;
+    let r = cpu.step(bus);
+    assert!(matches!(r, StepResult::Executed { .. }), "{r:?}");
+    assert_eq!(cpu.regs.xpsr.exception, 3, "expected HardFault");
+    let sp = (cpu.regs.sp() - RAM_BASE) as usize + 0x18;
+    let stacked_pc = u32::from_le_bytes(bus.ram[sp..sp + 4].try_into().unwrap());
+    assert_eq!(stacked_pc, pc, "stacked PC is the faulting instruction");
+    cpu.ppb_read32(0xE000_ED28)
 }

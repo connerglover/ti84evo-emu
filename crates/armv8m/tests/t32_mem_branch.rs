@@ -1,7 +1,9 @@
 mod common;
 
 use armv8m::{Access, Bus, BusError, Cpu, Instr, Sec, StepResult, decode32, disasm};
-use common::{FlatBus, RAM_BASE, cpu_with_code};
+use common::{FlatBus, RAM_BASE, cpu_with_code, step_hardfault};
+
+const UNALIGNED: u32 = 1 << 24;
 
 fn dis(cpu: &Cpu, bus: &mut FlatBus) -> String {
     let (instr, len) = cpu.decode_at(bus, cpu.regs.pc).expect("fetch");
@@ -100,7 +102,7 @@ fn ldr_to_pc_interworks() {
     assert_eq!(exec(&mut cpu, &mut bus), "ldr.w pc, [r1]");
     assert_eq!(cpu.regs.pc, 0x1F0);
     assert!(cpu.regs.xpsr.t);
-    // Clearing the T bit makes the next fetch an INVSTATE case for Task 7; here it just clears T.
+    // Clearing the T bit makes the next fetch fault INVSTATE (see tests/exceptions.rs).
     let (mut cpu, mut bus) = cpu_with_code(&[0xF8D1, 0xF000]);
     cpu.regs.r[1] = A;
     put(&mut bus, A, 0x1F0);
@@ -234,7 +236,7 @@ fn ldrd_strd() {
 fn ldrd_requires_word_alignment() {
     let (mut cpu, mut bus) = cpu_with_code(&[0xE9D2, 0x0100]);
     cpu.regs.r[2] = A + 2;
-    assert_eq!(cpu.step(&mut bus), StepResult::Lockup);
+    assert_eq!(step_hardfault(&mut cpu, &mut bus), UNALIGNED);
 }
 
 #[test]
@@ -397,7 +399,7 @@ fn exclusive_byte_half_and_acquire_release() {
 fn exclusive_requires_alignment() {
     let (mut cpu, mut bus) = cpu_with_code(&[0xE851, 0x3F00]);
     cpu.regs.r[1] = A + 1;
-    assert_eq!(cpu.step(&mut bus), StepResult::Lockup);
+    assert_eq!(step_hardfault(&mut cpu, &mut bus), UNALIGNED);
 }
 
 #[test]
@@ -597,12 +599,13 @@ fn msr_ns_from_nonsecure_is_ignored() {
     assert_eq!(cpu.regs.r[1], 0x2000_0F00);
     // Other _NS registers: PRIMASK_NS (0x90), BASEPRI_NS (0x91), CONTROL_NS (0x94).
     let (mut cpu, mut bus) = cpu_with_code(&[0xF380, 0x8890, 0xF380, 0x8891, 0xF380, 0x8894]);
-    cpu.regs.r[0] = 1;
+    // BASEPRI keeps only the implemented priority bits (0x20 of 0x21).
+    cpu.regs.r[0] = 0x21;
     assert_eq!(exec(&mut cpu, &mut bus), "msr PRIMASK_NS, r0");
     assert_eq!(exec(&mut cpu, &mut bus), "msr BASEPRI_NS, r0");
     assert_eq!(exec(&mut cpu, &mut bus), "msr CONTROL_NS, r0");
     assert!(cpu.regs.primask.ns && !cpu.regs.primask.s);
-    assert_eq!(cpu.regs.basepri.ns, 1);
+    assert_eq!(cpu.regs.basepri.ns, 0x20);
     assert_eq!(cpu.regs.control.ns, 1);
     assert_eq!(cpu.regs.control.s, 0);
 }
@@ -639,7 +642,7 @@ fn barriers_hints_and_udf() {
     // udf.w #0x1234
     let (mut cpu, mut bus) = cpu_with_code(&[0xF7F1, 0xA234]);
     assert_eq!(dis(&cpu, &mut bus), "udf.w #4660");
-    assert_eq!(cpu.step(&mut bus), StepResult::Lockup);
+    assert_eq!(step_hardfault(&mut cpu, &mut bus), 1 << 16, "UNDEFINSTR");
 }
 
 #[test]
@@ -654,9 +657,9 @@ fn vldr_decodes_as_coprocessor() {
             "{hw1:#x}"
         );
     }
-    // Executing it faults (NOCP once Task 7 exists) rather than being skipped.
+    // Executing it raises NOCP rather than being skipped.
     let (mut cpu, mut bus) = cpu_with_code(&[0xED90, 0x0A00]);
-    assert_eq!(cpu.step(&mut bus), StepResult::Lockup);
+    assert_eq!(step_hardfault(&mut cpu, &mut bus), 1 << 19, "NOCP");
 }
 
 // ---- UNPREDICTABLE / UNDEFINED encodings ----

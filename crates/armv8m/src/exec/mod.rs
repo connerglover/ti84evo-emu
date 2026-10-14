@@ -8,6 +8,7 @@ mod sys;
 
 use crate::bus::Bus;
 use crate::cpu::Cpu;
+use crate::exception::Fault;
 use crate::instr::Instr;
 
 /// What an instruction did to control flow.
@@ -23,8 +24,11 @@ pub(crate) enum Flow {
     Bkpt(u8),
     /// SVC: PC advances, then the exception is requested.
     Svc(u8),
-    /// The instruction faulted (undefined, or a memory access failed); PC stays.
-    Fault,
+    /// The instruction faulted; PC stays on it.
+    Fault(Fault),
+    /// PC was written with an EXC_RETURN value in Handler mode: `Cpu::step` performs the
+    /// exception return.
+    ExcReturn(u32),
 }
 
 /// Execute `instr`. `suppress_flags` is true for 16-bit encodings inside an IT block.
@@ -130,5 +134,22 @@ pub(crate) fn execute(
     };
     // A group executor that does not recognise its own variant is a decoder/executor
     // mismatch: treat it as an undefined instruction rather than silently skipping it.
-    flow.unwrap_or(Flow::Fault)
+    flow.unwrap_or(Flow::Fault(Fault::UndefInstr))
+}
+
+/// Cycles an executed instruction costs beyond the base cycle and the taken-branch cycle.
+pub(crate) fn extra_cycles(instr: &Instr) -> u32 {
+    match *instr {
+        Instr::Push { regs }
+        | Instr::Ldm { regs, .. }
+        | Instr::Stm { regs, .. }
+        | Instr::Ldmdb { regs, .. }
+        | Instr::Stmdb { regs, .. } => regs.count_ones(),
+        // The taken-branch cycle of POP {.., pc} is part of its N-register cost.
+        Instr::Pop { regs } => regs.count_ones() - u32::from(regs & 0x8000 != 0),
+        Instr::Ldrd { .. } | Instr::Strd { .. } => 1,
+        // 4 cycles in total.
+        Instr::Div { .. } => 3,
+        _ => 0,
+    }
 }

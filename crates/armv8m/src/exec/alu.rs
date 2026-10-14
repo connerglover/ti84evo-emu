@@ -4,7 +4,9 @@ use super::Flow;
 use crate::bits::SRType;
 use crate::bits::{add_with_carry, shift_c};
 use crate::cpu::Cpu;
+use crate::exception::Fault;
 use crate::instr::{AluOp, Instr, LongMulKind, RevKind, Shift};
+use crate::scs::scb::CCR_DIV_0_TRP;
 
 /// Mask of the low `width` bits (`width` is 1..=32).
 fn field_mask(width: u8) -> u32 {
@@ -472,15 +474,15 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr, suppress_flags: bool) -> Opt
         }
         Instr::Div { rd, rn, rm, signed } => {
             let (n, m) = (cpu.reg(rn), cpu.reg(rm));
-            // Task 7: when CCR.DIV_0_TRP is set a zero divisor raises UsageFault DIVBYZERO.
+            if m == 0 && cpu.scs.scb.ccr.get(cpu.regs.sec) & CCR_DIV_0_TRP != 0 {
+                return Some(Flow::Fault(Fault::DivByZero));
+            }
             let r = match (m, signed) {
                 (0, _) => 0,
                 (_, true) => (n as i32).wrapping_div(m as i32) as u32,
                 (_, false) => n / m,
             };
             cpu.set_reg(rd, r);
-            // 4 cycles in total (`Cpu::step` charges the base cycle).
-            cpu.extra_cycles += 3;
             Flow::Next
         }
         _ => return None,

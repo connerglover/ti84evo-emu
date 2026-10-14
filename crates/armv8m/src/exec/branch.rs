@@ -36,13 +36,12 @@ pub(super) fn execute(cpu: &mut Cpu, instr: &Instr) -> Option<Flow> {
         }
         Instr::Bx { rm } => {
             let target = cpu.reg(rm);
-            cpu.bx_write_pc(target);
-            Flow::Branched
+            cpu.bx_write_pc(target)
         }
         Instr::Blx { rm } => {
             let target = cpu.reg(rm);
             cpu.regs.lr = cpu.regs.pc.wrapping_add(2) | 1;
-            cpu.bx_write_pc(target);
+            cpu.blx_write_pc(target);
             Flow::Branched
         }
         _ => return None,
