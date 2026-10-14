@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/armv8m", "crates/evo-core", "crates/evo-hw", "crates/evo-image", "apps/evo-cli"]
+members = ["crates/armv8m", "crates/evo-core", "crates/evo-hw", "crates/evo-image", "apps/evo-cli", "apps/evo-gui"]
 
 [workspace.package]
 edition = "2024"
@@ -14,3 +14,7 @@ env_logger = { version = "0.11", default-features = false }
 thiserror = "2"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 clap = { version = "4.6", features = ["derive"] }
+eframe = { version = "0.36.2", features = ["persistence"] }
+egui = { version = "0.36.2", features = ["serde"] }
+egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu", "snapshot"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
