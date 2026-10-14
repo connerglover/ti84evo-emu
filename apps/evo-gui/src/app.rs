@@ -192,8 +192,11 @@ impl EvoApp {
             dpad_down: false,
             dpad_pressed: None,
             debug: DebugPanel::new(),
-            debug_shown: false,
-            grown: false,
+            // eframe restores the saved window, which already includes the
+            // panel when it was open at quit: do not grow it again, but do
+            // give its width back when the panel closes.
+            debug_shown: opts.prefs.debug_open,
+            grown: opts.prefs.debug_open,
             grow_target: None,
             lcd: LcdView::new(),
             filter: opts.prefs.filter,

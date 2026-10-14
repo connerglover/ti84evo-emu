@@ -225,3 +225,102 @@ fn reset_to_defaults_restores_map() {
     h.run_steps(2);
     assert_eq!(h.state().prefs().keymap, Keymap::default_map());
 }
+
+// ---------------------------------------------------------------------------
+// A persisted open debug panel and eframe's window persistence.
+
+/// The `InnerSize` commands the last frame sent to the root viewport.
+fn inner_sizes(out: &egui::FullOutput) -> Vec<egui::Vec2> {
+    out.viewport_output
+        .get(&egui::ViewportId::ROOT)
+        .map(|v| {
+            v.commands
+                .iter()
+                .filter_map(|c| match c {
+                    egui::ViewportCommand::InnerSize(s) => Some(*s),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Reports `size` as the window's inner size for the next frames.
+fn report_inner(input: &mut egui::RawInput, size: egui::Vec2) {
+    input
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .inner_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size));
+}
+
+fn debug_prefs() -> Prefs {
+    Prefs {
+        debug_open: true,
+        ..Prefs::default()
+    }
+}
+
+/// Drives the app as eframe does, where the window size is known on the very
+/// first frame: eframe restored the saved window, which already includes the
+/// panel, so the app must not grow it again.
+#[test]
+fn restored_debug_panel_does_not_grow_on_first_frame() {
+    let ctx = egui::Context::default();
+    let opts = AppOptions {
+        start_paused: true,
+        prefs: debug_prefs(),
+        ..AppOptions::new(std::env::temp_dir().join("evo-gui-tests-keymap"))
+    };
+    let mut app = EvoApp::new(&ctx, Box::new(FakeBackend::new()), opts);
+    let mut frame = eframe::Frame::_new_kittest();
+    let size = egui::vec2(940.0, 960.0);
+    for n in 0..3 {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        report_inner(&mut input, size);
+        let mut out = ctx.run_ui(input, |ui| {
+            eframe::App::logic(&mut app, ui.ctx(), &mut frame);
+            eframe::App::ui(&mut app, ui, &mut frame);
+        });
+        out.textures_delta.clear();
+        assert_eq!(inner_sizes(&out), [], "frame {n} resized the window");
+    }
+    assert!(app.debug_open());
+}
+
+/// Clicks `label` and returns every `InnerSize` the following frames sent.
+fn click_collect(h: &mut Harness<'static, EvoApp>, label: &str) -> Vec<egui::Vec2> {
+    h.get_by_label(label).click();
+    let mut sizes = Vec::new();
+    for _ in 0..3 {
+        h.step();
+        sizes.extend(inner_sizes(h.output()));
+    }
+    sizes
+}
+
+#[test]
+fn restored_debug_panel_still_shrinks_and_grows_by_debug_w() {
+    use evo_gui::debug::DEBUG_W;
+    let mut h = harness_with(FakeBackend::new(), debug_prefs());
+    let wide = egui::vec2(520.0 + DEBUG_W, 960.0);
+    h.set_size(wide);
+    report_inner(h.input_mut(), wide);
+    h.step();
+    assert_eq!(inner_sizes(h.output()), [], "no grow at start");
+    // Closing gives the panel's width back.
+    let shrunk = click_collect(&mut h, "Debug panels");
+    assert_eq!(shrunk, [egui::vec2(520.0, 960.0)]);
+    assert!(!h.state().debug_open());
+    // Reopening grows by the panel's width again.
+    let narrow = egui::vec2(520.0, 960.0);
+    h.set_size(narrow);
+    report_inner(h.input_mut(), narrow);
+    h.step();
+    let grown = click_collect(&mut h, "Debug panels");
+    assert_eq!(grown, [wide]);
+    assert!(h.state().debug_open());
+}
