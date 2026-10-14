@@ -13,6 +13,7 @@ use egui::{
 use crate::backend::{CLOCK_HZ, EmuBackend, RunStatus};
 use crate::debug::{DEBUG_MIN_W, DEBUG_W, DebugPanel};
 use crate::input::{KeyAction, KeyLatch, KeyboardTracker, Keymap, Source, pc_key_label};
+use crate::keymap_window::KeymapWindow;
 use crate::keypad::geometry::{
     BODY_W, CalcTransform, KEYPAD_ORIGIN, LCD_RECT, bounds, dpad_bounds, hit_test,
 };
@@ -20,6 +21,7 @@ use crate::keypad::paint::{body_rect_to_screen, keypad_rect_to_screen, paint_bod
 use crate::keypad::{KEYS, KeyId, KeyShape, key_def};
 use crate::lcd::{LcdView, ScaleFilter};
 use crate::pacer::{FrameRunner, Pacer, SpeedMeter, WALL_BUDGET};
+use crate::prefs::{PREFS_KEY, Prefs};
 use crate::store::{Store, StoreError};
 use crate::theme::{APP_BG, HEADER_BG, LABEL_DARK, install_fonts};
 use crate::toast::{ToastKind, Toasts};
@@ -60,14 +62,17 @@ pub struct AppOptions {
     pub start_paused: bool,
     /// Where state slots, screenshots and preferences live.
     pub data_dir: PathBuf,
+    /// Preferences loaded from the last run.
+    pub prefs: Prefs,
 }
 
 impl AppOptions {
-    /// Defaults: not paused.
+    /// Defaults: not paused, default preferences.
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             start_paused: false,
             data_dir,
+            prefs: Prefs::default(),
         }
     }
 }
@@ -151,6 +156,7 @@ pub struct EvoApp {
     /// The open slot picker and where it sits.
     picker: Option<(PickerMode, Pos2)>,
     about_open: bool,
+    keymap_window: KeymapWindow,
     /// The toolbar panel as laid out in the last frame.
     toolbar_rect: Rect,
 }
@@ -167,10 +173,11 @@ impl EvoApp {
             icons: None,
             picker: None,
             about_open: false,
+            keymap_window: KeymapWindow::new(),
             toolbar_rect: Rect::NOTHING,
             data_dir: opts.data_dir,
             paused: opts.start_paused,
-            debug_open: false,
+            debug_open: opts.prefs.debug_open,
             status: RunStatus::Running,
             speed: SpeedMeter::default(),
             pacer: Pacer {
@@ -179,7 +186,7 @@ impl EvoApp {
             },
             runner: FrameRunner::new(),
             latch: KeyLatch::new(),
-            keymap: Keymap::default_map(),
+            keymap: opts.prefs.keymap,
             tracker: KeyboardTracker::default(),
             pointer_keys: BTreeSet::new(),
             dpad_down: false,
@@ -189,7 +196,7 @@ impl EvoApp {
             grown: false,
             grow_target: None,
             lcd: LcdView::new(),
-            filter: ScaleFilter::Nearest,
+            filter: opts.prefs.filter,
             transform: CalcTransform::fit(egui::Rect::ZERO),
         }
     }
@@ -233,6 +240,20 @@ impl EvoApp {
     /// How the LCD frame is scaled.
     pub fn filter(&self) -> ScaleFilter {
         self.filter
+    }
+
+    /// The preferences to save: current keymap, filter and debug-open state.
+    pub fn prefs(&self) -> Prefs {
+        Prefs {
+            keymap: self.keymap.clone(),
+            filter: self.filter,
+            debug_open: self.debug_open,
+        }
+    }
+
+    /// True while the keyboard-mapping window waits for a key to bind.
+    pub fn keymap_capturing(&self) -> bool {
+        self.keymap_window.capturing()
     }
 
     /// Writes flash to disk; a failure becomes a toast.
@@ -325,8 +346,7 @@ impl EvoApp {
                 };
             }
             Tool::Debug => self.debug_open = !self.debug_open,
-            // Task 9 opens the keyboard-mapping window here.
-            Tool::Keymap => {}
+            Tool::Keymap => self.keymap_window.toggle(),
             Tool::About => self.about_open = !self.about_open,
         }
     }
@@ -335,9 +355,11 @@ impl EvoApp {
         self.toolbar_rect = ui.max_rect();
         let icons = *self.icons.get_or_insert_with(|| drawable_icons(ui.ctx()));
         let (filter, debug_open) = (self.filter, self.debug_open);
+        let keymap_open = self.keymap_window.is_open();
         let out = toolbar_buttons(ui, &icons, |t| match t {
             Tool::Smooth => filter == ScaleFilter::Smooth,
             Tool::Debug => debug_open,
+            Tool::Keymap => keymap_open,
             _ => false,
         });
         if let (Some(tool), Some(rect)) = (out.clicked, out.clicked_rect) {
@@ -345,7 +367,8 @@ impl EvoApp {
         }
     }
 
-    /// The slot picker, About window and toasts, over everything else.
+    /// The slot picker, About and keyboard-mapping windows and toasts, over
+    /// everything else.
     fn overlays(&mut self, ctx: &egui::Context) {
         if let Some((mode, pos)) = self.picker {
             let store = &self.store;
@@ -366,6 +389,7 @@ impl EvoApp {
             }
         }
         about_window(ctx, &mut self.about_open);
+        self.keymap_window.show(ctx, &mut self.keymap);
         self.toasts.show(ctx);
     }
 
@@ -393,7 +417,9 @@ impl EvoApp {
     /// Step 1 of `logic`: PC-keyboard input.
     fn keyboard(&mut self, ctx: &egui::Context) {
         let events = ctx.input(|i| i.events.clone());
-        let typing = ctx.egui_wants_keyboard_input();
+        // `logic` runs before `ui`, so a press the mapping window captures in
+        // this frame's `ui` is already dropped here.
+        let typing = ctx.egui_wants_keyboard_input() || self.keymap_window.capturing();
         let actions = self.tracker.actions(&events, &self.keymap, typing);
         let now = self.backend.cycles();
         for action in actions {
@@ -669,8 +695,10 @@ impl eframe::App for EvoApp {
         self.sync_window(&ctx);
     }
 
-    /// Called on shutdown and periodically: writes flash to disk.
-    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+    /// Called on shutdown and periodically: writes flash to disk, then the
+    /// preferences.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.persist();
+        eframe::set_value(storage, PREFS_KEY, &self.prefs());
     }
 }

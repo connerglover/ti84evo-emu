@@ -197,3 +197,20 @@ fn snapshot_debug_panels() {
     h.run_steps(10);
     h.snapshot("debug_panels");
 }
+
+#[test]
+#[cfg_attr(
+    not(feature = "snapshots"),
+    ignore = "golden images: cargo test -p evo-gui --features snapshots"
+)]
+fn snapshot_keymap_window() {
+    use egui_kittest::kittest::Queryable;
+    let _gpu = gpu_lock();
+    let mut h = harness(FakeBackend::new());
+    h.get_by_label("Keyboard mapping").click();
+    // Move the pointer off the toolbar so no hover highlight or tooltip shows.
+    h.run_steps(3);
+    h.hover_at(egui::pos2(500.0, 950.0));
+    h.run_steps(10);
+    h.snapshot("keymap_window");
+}
