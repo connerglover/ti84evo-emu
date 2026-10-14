@@ -407,3 +407,25 @@ fn serde_skips_secregs() {
     assert_eq!(back.remaining(), 49);
     assert!(back.secregs().is_empty());
 }
+
+#[test]
+fn secreg_ops_after_restore_without_set_secregs_do_not_panic() {
+    let mut f = erased();
+    let bytes = postcard::to_stdvec(&NorFlash::new()).unwrap();
+    let mut nor: NorFlash = postcard::from_bytes(&bytes).unwrap();
+    assert!(nor.secregs().is_empty());
+    // 0x48 read gives ERASED.
+    assert_eq!(read(&mut nor, 0x48, 0x1000, 4, &mut f), vec![0xFF; 4]);
+    // 0x44 erase with WEL is a no-op and still clears WEL.
+    cmd(&mut nor, 0x06, 0, &mut f);
+    cmd(&mut nor, 0x44, 0x2000, &mut f);
+    assert_eq!(nor.sr1 & WEL, 0);
+    // 0x42 program with WEL is a no-op and still completes and clears WEL.
+    cmd(&mut nor, 0x06, 0, &mut f);
+    assert_eq!(nor.begin(0x42, 0x3000, 2, &mut f), DataPhase::Write);
+    assert!(!nor.write_byte(0x00, &mut f));
+    assert!(nor.write_byte(0x00, &mut f));
+    assert_eq!(nor.sr1 & WEL, 0);
+    assert!(nor.secregs().is_empty());
+    assert!(f.iter().all(|&b| b == 0xFF));
+}

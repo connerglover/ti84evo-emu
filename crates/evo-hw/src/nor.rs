@@ -150,8 +150,9 @@ impl NorFlash {
             0x44 => {
                 if self.wel()
                     && let Some(base) = secreg_base(addr)
+                    && let Some(s) = self.secregs.get_mut(base..base + SECREG_SIZE)
                 {
-                    self.secregs[base..base + SECREG_SIZE].fill(ERASED);
+                    s.fill(ERASED);
                 }
                 self.clear_wel();
                 return DataPhase::None;
@@ -195,7 +196,9 @@ impl NorFlash {
             0x15 => (self.sr3, p.addr),
             0x48 => {
                 let b = secreg_base(p.addr)
-                    .map_or(ERASED, |base| self.secregs[base + (p.addr & 0xFF) as usize]);
+                    .and_then(|base| self.secregs.get(base + (p.addr & 0xFF) as usize))
+                    .copied()
+                    .unwrap_or(ERASED);
                 (b, page_next(p.addr))
             }
             _ => {
@@ -222,8 +225,10 @@ impl NorFlash {
                 0x31 => self.sr2 = b,
                 0x11 => self.sr3 = b,
                 0x42 => {
-                    if let Some(base) = secreg_base(p.addr) {
-                        self.secregs[base + (p.addr & 0xFF) as usize] &= b;
+                    if let Some(s) = secreg_base(p.addr)
+                        .and_then(|base| self.secregs.get_mut(base + (p.addr & 0xFF) as usize))
+                    {
+                        *s &= b;
                     }
                 }
                 _ => {
