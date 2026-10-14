@@ -2,3 +2,5 @@
 //! are registered at their base addresses by [`crate::soc::attach`].
 
 pub mod mpc;
+pub mod storage;
+pub mod sysctl;

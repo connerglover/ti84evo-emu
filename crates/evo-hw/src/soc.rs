@@ -2,6 +2,8 @@
 
 use crate::MemoryMap;
 use crate::dev::mpc::Mpc;
+use crate::dev::storage::Storage;
+use crate::dev::sysctl::{Cru, Spctrl};
 
 /// Name of the flash buffer (the `MemoryMap` ROM a flash controller writes through
 /// `DevCtx::buffer_mut`).
@@ -18,4 +20,14 @@ pub fn attach(map: &mut MemoryMap) {
     map.add_device("mpc_sram1", 0x5020_5000, 0x1000, Box::new(Mpc::new(3)));
     map.add_device("mpc_sram2", 0x5020_6000, 0x1000, Box::new(Mpc::new(3)));
     map.add_device("mpc_flash", 0x5020_8000, 0x1000, Box::new(Mpc::new(127)));
+    // System control (security.md §2, §3, §6) and the XIP instruction cache (spif-nor.md §7).
+    map.add_device("cru", 0x5020_0000, 0x1000, Box::new(Cru::new()));
+    map.add_device("spctrl", 0x5020_1000, 0x1000, Box::new(Spctrl::new()));
+    map.add_device("ledpat", 0x5020_2B00, 0x100, Box::new(Storage::new(0x100)));
+    map.add_device(
+        "icache",
+        0x5000_5000,
+        0x1000,
+        Box::new(Storage::new(0x1000)),
+    );
 }
