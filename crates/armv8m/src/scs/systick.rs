@@ -90,4 +90,56 @@ impl SysTick {
         }
         wrapped && self.csr & TICKINT != 0
     }
+
+    /// The fewest cycles after which `tick` returns true (pends the exception), or `None` if it
+    /// never will without a register write: the counter is disabled, TICKINT is clear, or it is
+    /// stopped at zero by RVR = 0.
+    pub fn cycles_to_interrupt(&self) -> Option<u32> {
+        if self.csr & ENABLE == 0 || self.csr & TICKINT == 0 {
+            return None;
+        }
+        match (self.cvr, self.rvr) {
+            (0, 0) => None,
+            // One cycle reloads RVR, then RVR more count it down to zero.
+            (0, rvr) => Some(1 + rvr),
+            (cvr, _) => Some(cvr),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cycles_to_interrupt_agrees_with_tick() {
+        for rvr in [0, 1, 2, 5, 99, COUNTER_MASK] {
+            for cvr in [0, 1, 3, rvr] {
+                let st = SysTick {
+                    csr: ENABLE | TICKINT,
+                    countflag: false,
+                    rvr,
+                    cvr,
+                };
+                let state = format!("rvr {rvr} cvr {cvr}");
+                match st.cycles_to_interrupt() {
+                    Some(n) => {
+                        assert!(n > 0, "{state}");
+                        let mut early = st.clone();
+                        assert!(!early.tick(n - 1), "{state}: fired before {n}");
+                        assert!(early.tick(1), "{state}: did not fire at {n}");
+                        assert!(st.clone().tick(n), "{state}: one tick of {n}");
+                    }
+                    None => assert!(!st.clone().tick(u32::MAX), "{state}"),
+                }
+            }
+        }
+        let quiet = SysTick {
+            csr: ENABLE,
+            countflag: false,
+            rvr: 10,
+            cvr: 5,
+        };
+        assert_eq!(quiet.cycles_to_interrupt(), None, "TICKINT clear");
+    }
 }

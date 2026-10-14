@@ -568,4 +568,14 @@ impl Cpu {
             }
         }
     }
+
+    /// The fewest cycles of `tick_systick` after which a SysTick exception (either security
+    /// state) is pended, or `None` if neither counter will pend one. Lets a sleeping machine
+    /// skip ahead to the next SysTick instead of stepping through the wait.
+    pub fn cycles_to_systick(&self) -> Option<u32> {
+        [Sec::Secure, Sec::NonSecure]
+            .into_iter()
+            .filter_map(|sec| self.scs.systick.get(sec).cycles_to_interrupt())
+            .min()
+    }
 }

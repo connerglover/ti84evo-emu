@@ -510,6 +510,66 @@ fn systick_tick_counts_and_reloads() {
     assert_eq!(cpu.ppb_read32(SYST_CVR), 50);
 }
 
+const PENDSTSET: u32 = 1 << 26;
+
+#[test]
+fn cycles_to_systick_is_the_tick_that_pends() {
+    let (mut cpu, _bus) = cpu_with_code(&[B_SELF]);
+    assert_eq!(cpu.cycles_to_systick(), None, "disabled");
+    cpu.ppb_write32(SYST_RVR, 99);
+    cpu.ppb_write32(SYST_CSR, 0b101);
+    assert_eq!(cpu.cycles_to_systick(), None, "counting, but TICKINT clear");
+
+    cpu.ppb_write32(SYST_CSR, 0b111);
+    // At zero: one reload cycle, then 99 down to zero.
+    assert_eq!(cpu.cycles_to_systick(), Some(100));
+    cpu.tick_systick(99);
+    assert_eq!(cpu.cycles_to_systick(), Some(1));
+    assert_eq!(cpu.ppb_read32(ICSR) & PENDSTSET, 0);
+    cpu.tick_systick(1);
+    assert_ne!(cpu.ppb_read32(ICSR) & PENDSTSET, 0);
+    assert_eq!(cpu.cycles_to_systick(), Some(100), "at zero again");
+    cpu.tick_systick(30);
+    assert_eq!(cpu.cycles_to_systick(), Some(70));
+
+    // The Non-secure counter (through the NS alias) is due first.
+    cpu.ppb_write32(0xE002_E014, 9);
+    cpu.ppb_write32(0xE002_E010, 0b111);
+    assert_eq!(cpu.cycles_to_systick(), Some(10));
+
+    // RVR = 0 stops a counter at zero: no further interrupt from it.
+    cpu.ppb_write32(0xE002_E010, 0);
+    cpu.ppb_write32(SYST_RVR, 0);
+    cpu.tick_systick(70);
+    assert_eq!(cpu.cycles_to_systick(), None);
+}
+
+#[test]
+fn exception_pending_ignores_priority_but_not_enable() {
+    // cpsid i ; b .
+    let (mut cpu, mut bus) = cpu_with_code(&[0xB672, B_SELF]);
+    handler(&mut bus, 16 + 3, 0x200, &[B_SELF]);
+    assert!(!cpu.exception_pending());
+    cpu.pulse_irq(3);
+    assert!(!cpu.exception_pending(), "a disabled IRQ is not counted");
+    executed(cpu.step(&mut bus));
+    enable_irqs(&mut cpu, 1 << 3);
+    assert!(
+        cpu.exception_pending(),
+        "counted while PRIMASK keeps it from being taken"
+    );
+    executed(cpu.step(&mut bus));
+    assert_eq!(ipsr(&cpu), 0, "still masked");
+    // Taking it clears the pending state.
+    cpu.regs.primask.s = false;
+    executed(cpu.step(&mut bus));
+    assert_eq!(ipsr(&cpu), 19);
+    assert!(!cpu.exception_pending());
+    // System exceptions count too.
+    cpu.ppb_write32(ICSR, 1 << 28); // PENDSVSET
+    assert!(cpu.exception_pending());
+}
+
 // ---- Faults ----
 
 #[test]

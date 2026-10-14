@@ -125,6 +125,15 @@ impl Cpu {
         self.lockup.is_some()
     }
 
+    /// True if an enabled exception is pending, whatever its priority relative to the current
+    /// execution priority (PRIMASK, BASEPRI, active handlers). This is the wake-up condition
+    /// for WFI/WFE that the machine uses. It slightly over-approximates the architecture, which
+    /// does not wake for an exception that could not preempt the active handlers even with
+    /// PRIMASK clear; such a wake only makes the CPU run on instead of sleeping.
+    pub fn exception_pending(&self) -> bool {
+        self.highest_pending().is_some()
+    }
+
     // ---- Exception state ----
 
     pub(crate) fn exc_pending(&self, num: u16, sec: Sec) -> bool {
