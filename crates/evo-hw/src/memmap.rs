@@ -15,7 +15,10 @@ use crate::unmapped::{UnmappedAccess, UnmappedKind, UnmappedLog};
 
 /// Sorted table of RAM, ROM and device windows plus the log of accesses that hit none of them.
 ///
-/// The CPU intercepts the PPB (0xE000_0000..=0xE00F_FFFF) itself, so it never reaches this map.
+/// The CPU intercepts the internal PPB (0xE000_0000..=0xE003_FFFF) itself, so it never reaches
+/// this map. The external PPB (0xE004_0000..=0xE00F_FFFF) is reached over the system bus: data
+/// accesses there come here like any other address (and land in the unmapped log if no window
+/// covers them).
 ///
 /// # Serialization
 ///

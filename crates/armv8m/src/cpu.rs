@@ -9,9 +9,9 @@ use crate::exception::{ENTRY_CYCLES, Fault, ReturnOutcome, SVCALL};
 use crate::exec::{self, Flow};
 use crate::instr::Instr;
 use crate::regs::{Registers, Sec};
-use crate::scs::Scs;
 use crate::scs::sau::{Attr, Idau, IdauHandle, SecAttr};
 use crate::scs::scb::CCR_STKOFHFNMIGN;
+use crate::scs::{PpbMiss, Scs};
 
 /// Outcome of one `Cpu::step`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +54,10 @@ pub struct Cpu {
     /// it into a STKOF UsageFault. Only meaningful within one instruction.
     #[serde(skip)]
     pub(crate) sp_violation: bool,
+    /// Guest data accesses to unimplemented internal PPB registers, drained by
+    /// `take_ppb_misses` (diagnostics only: not serialized).
+    #[serde(skip)]
+    pub(crate) ppb_misses: Vec<PpbMiss>,
     /// The SoC's attribution unit (configuration: kept across reset, not serialized).
     #[serde(skip)]
     idau: IdauHandle,
@@ -130,6 +134,7 @@ impl Cpu {
             scs: Scs::default(),
             lockup: None,
             sp_violation: false,
+            ppb_misses: Vec::new(),
             idau: IdauHandle::default(),
         }
     }

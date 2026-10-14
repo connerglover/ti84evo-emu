@@ -2,6 +2,7 @@
 
 mod common;
 
+use armv8m::scs::PpbMiss;
 use armv8m::{Access, Bus, BusError, Cpu, Sec, SleepKind, StepResult};
 use common::{FlatBus, RAM_BASE, cpu_with_code};
 
@@ -1332,4 +1333,104 @@ fn msr_msp_is_exempt_from_the_stack_limit() {
     executed(cpu.step(&mut bus));
     assert_eq!((ipsr(&cpu), cpu.regs.msp.s), (0, LIMIT - 0x100));
     assert_eq!(cpu.ppb_read32(CFSR), 0);
+}
+
+// ---- PPB accesses the CPU does not implement ----
+
+/// A `FlatBus` that also answers `0x5555_5555` for word reads at or above `0xE004_0000` (the
+/// external PPB) and records word writes there.
+struct EppbBus {
+    inner: FlatBus,
+    writes: Vec<(u32, u32)>,
+}
+
+const EPPB_START: u32 = 0xE004_0000;
+
+impl Bus for EppbBus {
+    fn read8(&mut self, addr: u32, a: Access) -> Result<u8, BusError> {
+        self.inner.read8(addr, a)
+    }
+    fn read16(&mut self, addr: u32, a: Access) -> Result<u16, BusError> {
+        self.inner.read16(addr, a)
+    }
+    fn read32(&mut self, addr: u32, a: Access) -> Result<u32, BusError> {
+        if addr >= EPPB_START {
+            return Ok(0x5555_5555);
+        }
+        self.inner.read32(addr, a)
+    }
+    fn write8(&mut self, addr: u32, v: u8, a: Access) -> Result<(), BusError> {
+        self.inner.write8(addr, v, a)
+    }
+    fn write16(&mut self, addr: u32, v: u16, a: Access) -> Result<(), BusError> {
+        self.inner.write16(addr, v, a)
+    }
+    fn write32(&mut self, addr: u32, v: u32, a: Access) -> Result<(), BusError> {
+        if addr >= EPPB_START {
+            self.writes.push((addr, v));
+            return Ok(());
+        }
+        self.inner.write32(addr, v, a)
+    }
+}
+
+#[test]
+fn eppb_access_reaches_the_bus() {
+    // ldr r0,=0xE004_3018; ldr r1,[r0]; orr r1,#2; str r1,[r0]; b .; literal
+    let (mut cpu, inner) = cpu_with_code(&[
+        0x4802, 0x6801, 0xF041, 0x0102, 0x6001, B_SELF, 0x3018, 0xE004,
+    ]);
+    let mut bus = EppbBus {
+        inner,
+        writes: Vec::new(),
+    };
+    for _ in 0..4 {
+        executed(cpu.step(&mut bus));
+    }
+    assert_eq!(ipsr(&cpu), 0, "no fault");
+    assert_eq!(cpu.regs.r[1], 0x5555_5557);
+    assert_eq!(bus.writes, [(0xE004_3018, 0x5555_5557)]);
+    assert_eq!(cpu.take_ppb_misses(), []);
+}
+
+#[test]
+fn unimplemented_internal_ppb_is_recorded() {
+    // ldr r0,=DWT_CTRL; ldr r1,[r0]; ldr r0,=ITM_TCR; str r2,[r0]; b .; nop; literals
+    let (mut cpu, mut bus) = cpu_with_code(&[
+        0x4802, 0x6801, 0x4802, 0x6002, B_SELF, NOP, 0x1000, 0xE000, 0x0E80, 0xE000,
+    ]);
+    cpu.regs.r[1] = 0xFFFF_FFFF;
+    cpu.regs.r[2] = 1;
+    for _ in 0..4 {
+        executed(cpu.step(&mut bus));
+    }
+    assert_eq!(ipsr(&cpu), 0, "no fault");
+    assert_eq!(cpu.regs.r[1], 0);
+    assert_eq!(
+        cpu.take_ppb_misses(),
+        [
+            PpbMiss {
+                addr: 0xE000_1000,
+                width: 4,
+                write: None,
+                secure: true
+            },
+            PpbMiss {
+                addr: 0xE000_0E80,
+                width: 4,
+                write: Some(1),
+                secure: true
+            },
+        ]
+    );
+    assert_eq!(cpu.take_ppb_misses(), [], "drained");
+}
+
+#[test]
+fn host_ppb_reads_record_nothing() {
+    let (mut cpu, _bus) = cpu_with_code(&[B_SELF]);
+    assert_eq!(cpu.ppb_read32(0xE000_1000), 0);
+    cpu.ppb_write32(0xE000_0E80, 1);
+    assert_eq!(cpu.ppb_peek32(0xE000_1000, Sec::Secure), None);
+    assert_eq!(cpu.take_ppb_misses(), []);
 }
