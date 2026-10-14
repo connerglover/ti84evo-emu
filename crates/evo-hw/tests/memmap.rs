@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use armv8m::BusError;
 use armv8m::{Access, AccessKind, Bus};
-use evo_hw::{Device, MemoryMap, UnmappedAccess, UnmappedKind};
+use evo_hw::{DevCtx, Device, MemoryMap, ResetKind, StateError, UnmappedAccess, UnmappedKind};
 
 fn acc(secure: bool) -> Access {
     Access {
@@ -293,13 +293,20 @@ struct Probe {
 }
 
 impl Device for Probe {
-    fn read(&mut self, off: u32, width: u8) -> u32 {
+    fn read(&mut self, off: u32, width: u8, _ctx: &mut DevCtx<'_>) -> u32 {
         self.seen.lock().unwrap().push(("r", off, width, 0));
         // Deliberately returns junk above the access width: the map must mask.
         0xA5A5_0000 | off
     }
-    fn write(&mut self, off: u32, width: u8, v: u32) {
+    fn write(&mut self, off: u32, width: u8, v: u32, _ctx: &mut DevCtx<'_>) {
         self.seen.lock().unwrap().push(("w", off, width, v));
+    }
+    fn reset(&mut self, _kind: ResetKind, _ctx: &mut DevCtx<'_>) {}
+    fn save(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    fn load(&mut self, _state: &[u8]) -> Result<(), StateError> {
+        Ok(())
     }
 }
 

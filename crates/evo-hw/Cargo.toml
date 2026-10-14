@@ -7,6 +7,9 @@ license.workspace = true
 [dependencies]
 armv8m = { path = "../armv8m" }
 serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+log.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
