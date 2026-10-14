@@ -170,3 +170,30 @@ fn snapshot_about_window() {
     h.run_steps(10);
     h.snapshot("about_window");
 }
+
+#[test]
+#[cfg_attr(
+    not(feature = "snapshots"),
+    ignore = "golden images: cargo test -p evo-gui --features snapshots"
+)]
+fn snapshot_debug_panels() {
+    use egui_kittest::kittest::Queryable;
+    let _gpu = gpu_lock();
+    let opts = AppOptions {
+        start_paused: true,
+        ..AppOptions::new(std::env::temp_dir().join("evo-gui-tests-snapshots"))
+    };
+    let mut h = Harness::builder()
+        .with_size([1060.0, 960.0])
+        .with_theme(egui::Theme::Light)
+        .with_pixels_per_point(1.0)
+        .with_step_dt(1.0 / 60.0)
+        .build_eframe(|cc| EvoApp::new(&cc.egui_ctx, Box::new(FakeBackend::new()), opts));
+    h.run_steps(3);
+    h.get_by_label("Debug panels").click();
+    // Move the pointer off the toolbar so no hover highlight or tooltip shows.
+    h.run_steps(3);
+    h.hover_at(egui::pos2(300.0, 950.0));
+    h.run_steps(10);
+    h.snapshot("debug_panels");
+}

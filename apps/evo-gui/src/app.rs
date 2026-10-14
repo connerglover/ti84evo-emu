@@ -1,19 +1,20 @@
 //! The application shell: header, toolbar, calculator view, run loop and
-//! keypad input, and (later) debug panels.
+//! keypad input, and debug panels.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use egui::{
-    Align, Frame, Id, Layout, Margin, Pos2, Rect, Response, RichText, Sense, WidgetInfo,
-    WidgetType, pos2,
+    Align, Frame, Id, Layout, Margin, Pos2, Rect, Response, RichText, Sense, Vec2, ViewportCommand,
+    WidgetInfo, WidgetType, pos2, vec2,
 };
 
 use crate::backend::{CLOCK_HZ, EmuBackend, RunStatus};
+use crate::debug::{DEBUG_MIN_W, DEBUG_W, DebugPanel};
 use crate::input::{KeyAction, KeyLatch, KeyboardTracker, Keymap, Source, pc_key_label};
 use crate::keypad::geometry::{
-    CalcTransform, KEYPAD_ORIGIN, LCD_RECT, bounds, dpad_bounds, hit_test,
+    BODY_W, CalcTransform, KEYPAD_ORIGIN, LCD_RECT, bounds, dpad_bounds, hit_test,
 };
 use crate::keypad::paint::{body_rect_to_screen, keypad_rect_to_screen, paint_body, paint_key};
 use crate::keypad::{KEYS, KeyId, KeyShape, key_def};
@@ -37,8 +38,20 @@ const TITLE_SIZE: f32 = 18.0;
 const CENTRAL_MARGIN: i8 = 8;
 /// Duration of the key press animation, in seconds.
 const PRESS_ANIM_SECS: f32 = 0.06;
-/// The most UART bytes kept until the console (Task 8) takes them over.
-const UART_KEEP: usize = 64 * 1024;
+/// The debug panel's egui id.
+const DEBUG_PANEL_ID: &str = "debug";
+/// How many frames to wait for the window to reach the size asked for.
+const GROW_WAIT_FRAMES: u32 = 30;
+/// The smallest calculator scale the debug panel may squeeze the view to.
+const MIN_CALC_SCALE_WITH_DEBUG: f32 = 0.6;
+
+/// The widest the debug panel may be in a window `window_w` points wide:
+/// what is left after the toolbar, the central margins and a calculator at
+/// [`MIN_CALC_SCALE_WITH_DEBUG`]. Never negative.
+pub fn debug_max_width(window_w: f32) -> f32 {
+    let reserved = TOOLBAR_W + 2.0 * f32::from(CENTRAL_MARGIN) + BODY_W * MIN_CALC_SCALE_WITH_DEBUG;
+    (window_w - reserved).max(0.0)
+}
 
 /// Start-up options of [`EvoApp`].
 #[derive(Clone, Debug)]
@@ -117,8 +130,16 @@ pub struct EvoApp {
     dpad_down: bool,
     /// The wedge the current D-pad press pressed (none for a press in a gap).
     dpad_pressed: Option<KeyId>,
-    /// UART output not yet shown (the console arrives in Task 8).
-    uart: Vec<u8>,
+    /// Debug panel state, including the UART console.
+    debug: DebugPanel,
+    /// Whether the debug panel was open when the window size was last synced.
+    debug_shown: bool,
+    /// True when opening the debug panel grew the window by `DEBUG_W`.
+    grown: bool,
+    /// While the window grows: the width asked for and how many more frames
+    /// to wait for it. The panel forgets its width meanwhile, so it opens at
+    /// `DEBUG_W` once there is room instead of keeping the narrow first frame's.
+    grow_target: Option<(f32, u32)>,
     lcd: LcdView,
     filter: ScaleFilter,
     transform: CalcTransform,
@@ -163,7 +184,10 @@ impl EvoApp {
             pointer_keys: BTreeSet::new(),
             dpad_down: false,
             dpad_pressed: None,
-            uart: Vec::new(),
+            debug: DebugPanel::new(),
+            debug_shown: false,
+            grown: false,
+            grow_target: None,
             lcd: LcdView::new(),
             filter: ScaleFilter::Nearest,
             transform: CalcTransform::fit(egui::Rect::ZERO),
@@ -413,13 +437,53 @@ impl EvoApp {
         }
     }
 
-    /// Step 4 of `logic`: keep the UART output (bounded).
+    /// Step 4 of `logic`: move the UART output into the console.
     fn drain_uart(&mut self) {
         let bytes = self.backend.take_uart();
-        self.uart.extend_from_slice(&bytes);
-        if self.uart.len() > UART_KEEP {
-            let excess = self.uart.len() - UART_KEEP;
-            self.uart.drain(..excess);
+        self.debug.uart_mut().push(&bytes);
+    }
+
+    /// The debug panel's contents; applies its run controls.
+    fn debug_panel(&mut self, ui: &mut egui::Ui) {
+        let out = self.debug.show(ui, self.backend.as_mut(), self.paused);
+        if out.step && self.paused {
+            self.status = self.backend.step();
+        }
+        if out.toggle_pause {
+            if self.paused && matches!(self.status, RunStatus::Breakpoint(_)) {
+                // Move off the breakpoint, or the run would stop on it at once.
+                self.status = self.backend.step();
+            }
+            self.paused = !self.paused;
+            if !self.paused && !self.status.is_stop() {
+                self.status = RunStatus::Running;
+            }
+            self.speed.reset();
+        }
+    }
+
+    /// Grows the window by `DEBUG_W` when the debug panel opens and shrinks it
+    /// back when it closes (only if it grew). A host that ignores viewport
+    /// commands (kittest) keeps the size; the panel's width cap covers that.
+    fn sync_window(&mut self, ctx: &egui::Context) {
+        if self.debug_open == self.debug_shown {
+            return;
+        }
+        self.debug_shown = self.debug_open;
+        self.grow_target = None;
+        let inner = ctx.input(|i| i.viewport().inner_rect);
+        if self.debug_open {
+            if let Some(r) = inner {
+                let size = r.size() + vec2(DEBUG_W, 0.0);
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+                self.grown = true;
+                self.grow_target = Some((size.x, GROW_WAIT_FRAMES));
+            }
+        } else if std::mem::take(&mut self.grown)
+            && let Some(r) = inner
+        {
+            let size = (r.size() - vec2(DEBUG_W, 0.0)).max(Vec2::splat(1.0));
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
         }
     }
 
@@ -579,11 +643,30 @@ impl eframe::App for EvoApp {
             .resizable(false)
             .frame(toolbar_frame())
             .show(ui, |ui| self.toolbar(ui));
+        if self.debug_open {
+            let window_w = ui.max_rect().width();
+            if let Some((target, left)) = self.grow_target {
+                ui.ctx()
+                    .data_mut(|d| d.remove::<egui::PanelState>(Id::new(DEBUG_PANEL_ID)));
+                self.grow_target =
+                    (window_w + 0.5 < target && left > 0).then(|| (target, left - 1));
+            }
+            let max_w = debug_max_width(window_w);
+            // `max_size` after `min_size` lowers the minimum to the cap when
+            // the window is too narrow for both.
+            egui::Panel::right(DEBUG_PANEL_ID)
+                .resizable(true)
+                .default_size(DEBUG_W)
+                .min_size(DEBUG_MIN_W)
+                .max_size(max_w)
+                .show(ui, |ui| self.debug_panel(ui));
+        }
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(APP_BG).inner_margin(CENTRAL_MARGIN))
             .show(ui, |ui| self.calculator(ui));
         let ctx = ui.ctx().clone();
         self.overlays(&ctx);
+        self.sync_window(&ctx);
     }
 
     /// Called on shutdown and periodically: writes flash to disk.

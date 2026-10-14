@@ -4,6 +4,7 @@
 
 pub mod app;
 pub mod backend;
+pub mod debug;
 pub mod input;
 pub mod keypad;
 pub mod lcd;

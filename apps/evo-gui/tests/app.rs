@@ -1,7 +1,7 @@
 use egui::{Event, Key, PointerButton, Pos2, Rect, pos2, vec2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use evo_gui::app::{AppOptions, EvoApp, status_text};
+use evo_gui::app::{AppOptions, EvoApp, debug_max_width, status_text};
 use evo_gui::backend::fake::{FAKE_PC, FakeBackend};
 use evo_gui::backend::{EmuBackend, Frame, RunStatus};
 use evo_gui::keypad::KeyId;
@@ -517,4 +517,200 @@ fn about_window_shows_disclaimer() {
     h.get_by_label_contains("Not affiliated with Texas Instruments");
     h.get_by_label("You must supply your own OS bundle.");
     h.get_by_label_contains(env!("CARGO_PKG_VERSION"));
+}
+
+// ---------------------------------------------------------------------------
+// Debug panels (Task 8).
+
+/// A harness at an explicit window size.
+fn harness_sized(fake: FakeBackend, paused: bool, size: [f32; 2]) -> Harness<'static, EvoApp> {
+    let opts = AppOptions {
+        start_paused: paused,
+        ..AppOptions::new(data_dir())
+    };
+    Harness::builder()
+        .with_size(size)
+        .with_pixels_per_point(1.0)
+        .with_step_dt(1.0 / 60.0)
+        .build_eframe(|cc| EvoApp::new(&cc.egui_ctx, Box::new(fake), opts))
+}
+
+const WIDE: [f32; 2] = [1060.0, 960.0];
+
+/// A paused wide harness with the debug panels open.
+fn debug_harness(fake: FakeBackend) -> Harness<'static, EvoApp> {
+    let mut h = harness_sized(fake, true, WIDE);
+    h.run_steps(1);
+    click(&mut h, "Debug panels");
+    h
+}
+
+#[test]
+fn debug_toggle_shows_registers() {
+    let mut h = debug_harness(FakeBackend::new());
+    h.get_by_label("r0");
+    h.get_by_label("0x10000200");
+    h.get_by_label("sp");
+    h.get_by_label("xpsr");
+    h.get_by_label("Secure");
+    h.get_by_label("Thread");
+    h.get_by_label("msp_ns");
+    h.get_by_label("0x20093000");
+    for tab in ["Registers", "Disassembly", "Memory", "UART", "Unmapped"] {
+        h.get_by_label(tab);
+    }
+    click(&mut h, "Debug panels");
+    assert!(h.query_by_label("r0").is_none());
+}
+
+#[test]
+fn debug_keeps_calculator_usable() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness_sized(fake, true, [520.0, 960.0]);
+    h.run_steps(1);
+    h.get_by_label("Debug panels").click();
+    h.run_steps(2);
+    assert!(h.state().debug_open());
+    let scale = h.state().calc_transform().scale;
+    assert!(scale >= 0.6 - 1e-3, "scale {scale}");
+    // The panel fits the window instead of growing past its right edge.
+    for label in ["Step", "Registers", "Unmapped", "r0", "0x10000200"] {
+        let r = h.get_by_label(label).rect();
+        assert!(r.right() <= 520.0 + 1e-3, "{label} at {r:?}");
+    }
+    h.get_by_label("enter").click();
+    h.run_steps(1);
+    assert_eq!(probe.key_log(), [(KeyId::Enter, true)]);
+}
+
+#[test]
+fn typing_in_memory_address_does_not_press_keys() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = debug_harness(fake);
+    click(&mut h, "Memory");
+    h.get_by_role(egui::accesskit::Role::TextInput).click();
+    h.run_steps(2);
+    h.key_down(Key::Num5);
+    h.key_up(Key::Num5);
+    h.run_steps(2);
+    assert!(probe.key_log().is_empty(), "{:?}", probe.key_log());
+}
+
+#[test]
+fn memory_tab_shows_hex_dump() {
+    let mut h = debug_harness(FakeBackend::new());
+    click(&mut h, "Memory");
+    h.get_by_label("20000000  00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f  |................|");
+    // Bytes 0x20..=0x2f are printable ASCII.
+    h.get_by_label(
+        "20000020  20 21 22 23 24 25 26 27 28 29 2a 2b 2c 2d 2e 2f  | !\"#$%&'()*+,-./|",
+    );
+}
+
+#[test]
+fn memory_tab_shows_unreadable_bytes() {
+    let mut h = debug_harness(FakeBackend::new());
+    click(&mut h, "Memory");
+    h.get_by_role(egui::accesskit::Role::TextInput).click();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, Key::A);
+    h.run_steps(1);
+    h.get_by_role(egui::accesskit::Role::TextInput)
+        .type_text("0x1fff_fff8");
+    h.run_steps(3);
+    h.get_by_label("1ffffff8  ?? ?? ?? ?? ?? ?? ?? ?? 00 01 02 03 04 05 06 07  |................|");
+}
+
+#[test]
+fn uart_tab_shows_output() {
+    let mut fake = FakeBackend::new();
+    fake.run_for(100_000_000);
+    let mut h = debug_harness(fake);
+    click(&mut h, "UART");
+    h.get_by_label_contains("fake: 100 Mcycles");
+    click(&mut h, "Clear");
+    assert!(h.query_by_label_contains("fake: 100 Mcycles").is_none());
+}
+
+#[test]
+fn clicking_disasm_line_sets_breakpoint() {
+    let mut h = debug_harness(FakeBackend::new());
+    click(&mut h, "Disassembly");
+    click(&mut h, " \u{25B6} 10000200  bf00       nop");
+    assert_eq!(h.state().backend().breakpoints(), [FAKE_PC]);
+    h.get_by_label("\u{25CF}\u{25B6} 10000200  bf00       nop");
+    click(&mut h, "\u{25CF}\u{25B6} 10000200  bf00       nop");
+    assert!(h.state().backend().breakpoints().is_empty());
+}
+
+#[test]
+fn step_button_steps_when_paused() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = debug_harness(fake);
+    click(&mut h, "Step");
+    assert_eq!(probe.cycles(), 1);
+}
+
+#[test]
+fn continue_and_pause_buttons() {
+    let mut h = debug_harness(FakeBackend::new());
+    click(&mut h, "Continue");
+    assert!(!h.state().paused());
+    click(&mut h, "Pause");
+    assert!(h.state().paused());
+    h.get_by_label("Continue");
+}
+
+#[test]
+fn unmapped_tab_lists_rows() {
+    let mut h = debug_harness(FakeBackend::new());
+    click(&mut h, "Unmapped");
+    for col in ["addr", "width", "kind", "value", "pc", "sec", "count"] {
+        h.get_by_label(col);
+    }
+    h.get_by_label("1 address");
+    h.get_by_label("0x50208014");
+    h.get_by_label("read");
+}
+
+#[test]
+fn breakpoint_stop_opens_registers_tab() {
+    let mut fake = FakeBackend::new();
+    fake.toggle_breakpoint(FAKE_PC);
+    let mut h = harness_sized(fake, false, WIDE);
+    h.run_steps(3);
+    assert!(h.state().debug_open());
+    h.get_by_label("r0");
+}
+
+#[test]
+fn debug_width_cap_keeps_calculator_at_0_6() {
+    // 520 - toolbar 48 - margins 16 - 0.6 * 372.
+    assert!((debug_max_width(520.0) - 232.8).abs() < 1e-3);
+    assert!((debug_max_width(1060.0) - 772.8).abs() < 1e-3);
+    assert_eq!(debug_max_width(200.0), 0.0);
+}
+
+#[test]
+fn grown_window_gives_the_panel_its_default_width() {
+    let mut h = harness_sized(FakeBackend::new(), true, [520.0, 960.0]);
+    h.run_steps(1);
+    // kittest leaves the viewport size unset and ignores resize commands:
+    // report the size, then grow the window as the OS would.
+    let inner = Rect::from_min_size(Pos2::ZERO, vec2(520.0, 960.0));
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .inner_rect = Some(inner);
+    click(&mut h, "Debug panels");
+    h.set_size(vec2(940.0, 960.0));
+    h.run_steps(3);
+    // The panel spans about DEBUG_W (420) from the right edge, not the
+    // 232.8-point cap of the 520-point window it opened in.
+    let left = h.get_by_label("Continue").rect().left();
+    assert!(left < 940.0 - 400.0, "Continue at x {left}");
 }
