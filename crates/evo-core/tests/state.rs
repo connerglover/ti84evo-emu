@@ -381,3 +381,57 @@ fn load_state_keeps_secregs() {
     m.load_state(&state).expect("load");
     assert_eq!(m.nv_state().secregs()[0], 0x12);
 }
+
+/// Bytes before the postcard body: magic, version, bundle id.
+const HEADER_LEN: usize = 8 + 4 + 32;
+
+/// A state of a machine that ran a while, with its CPU replaced by `edit(cpu)`: the CPU is the
+/// first field of the body, so its postcard bytes are swapped in place and the header (bundle id
+/// included) stays valid. Also returns a second machine of the same bundle to load it into.
+fn with_cpu(edit: impl FnOnce(&mut armv8m::Cpu)) -> (Vec<u8>, Machine) {
+    let p = counter_uart();
+    let mut a = p.boot();
+    a.run(50_000);
+    let state = a.save_state();
+    let old = postcard::to_stdvec(&a.cpu).unwrap();
+    assert_eq!(&state[HEADER_LEN..HEADER_LEN + old.len()], &old[..]);
+    let mut cpu = a.cpu.clone();
+    edit(&mut cpu);
+    let mut out = state[..HEADER_LEN].to_vec();
+    out.extend(postcard::to_stdvec(&cpu).unwrap());
+    out.extend_from_slice(&state[HEADER_LEN + old.len()..]);
+    let mut b = p.boot();
+    b.run(10_000);
+    (out, b)
+}
+
+#[test]
+fn with_cpu_unchanged_loads() {
+    // Guards the splice in `with_cpu`: with no edit the state loads.
+    let (state, mut m) = with_cpu(|_| {});
+    m.load_state(&state).unwrap();
+}
+
+#[test]
+fn load_state_rejects_short_nvic_priority() {
+    for len in [0, 1, 479, 481] {
+        let (state, mut m) = with_cpu(|cpu| cpu.scs.nvic.priority.resize(len, 0));
+        let err = rejected(&mut m, &state);
+        assert!(matches!(err, StateError::Decode(_)), "len {len}: {err}");
+    }
+}
+
+#[test]
+fn load_state_rejects_bad_prigroup() {
+    for (s, ns) in [(8, 0), (0, 8), (32, 0), (255, 255)] {
+        let (state, mut m) = with_cpu(|cpu| {
+            cpu.scs.scb.prigroup.s = s;
+            cpu.scs.scb.prigroup.ns = ns;
+        });
+        let err = rejected(&mut m, &state);
+        assert!(
+            matches!(err, StateError::Decode(_)),
+            "prigroup {s}/{ns}: {err}"
+        );
+    }
+}

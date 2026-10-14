@@ -5,7 +5,7 @@
 //! live in the Secure copy; the Non-secure view reaches them only where the architecture allows
 //! (mostly when `AIRCR.BFHFNMINS` hands BusFault, HardFault and NMI to Non-secure state).
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::regs::Banked;
 
@@ -84,7 +84,9 @@ pub struct Scb {
     pub vtor: Banked<u32>,
     /// Vector table base loaded into `VTOR` at reset (the INITSVTOR/INITNSVTOR inputs).
     pub init_vtor: Banked<u32>,
-    /// `AIRCR.PRIGROUP` per security state.
+    /// `AIRCR.PRIGROUP` per security state: 0..=7. The priority grouping shifts by it, so
+    /// decoding a larger value fails.
+    #[serde(deserialize_with = "prigroups")]
     pub prigroup: Banked<u8>,
     /// `AIRCR.PRIS` (Secure only): Non-secure priorities are de-prioritised.
     pub pris: bool,
@@ -114,6 +116,20 @@ pub struct Scb {
     pub cpacr: Banked<u32>,
     /// `NSACR` (stored; Secure-writable, Non-secure read-only).
     pub nsacr: u32,
+}
+
+/// Decodes `Scb::prigroup`, rejecting values above 7 (save states are untrusted).
+fn prigroups<'de, D: Deserializer<'de>>(d: D) -> Result<Banked<u8>, D::Error> {
+    let v = Banked::<u8>::deserialize(d)?;
+    for p in [v.s, v.ns] {
+        if p > 7 {
+            return Err(serde::de::Error::invalid_value(
+                serde::de::Unexpected::Unsigned(u64::from(p)),
+                &"AIRCR.PRIGROUP 0..=7",
+            ));
+        }
+    }
+    Ok(v)
 }
 
 impl Default for Scb {
