@@ -291,7 +291,7 @@ counts are recorded here as each one passes.
 |---|---|---|
 | M1 | `Booting TF-M v2.1.1` on UART0 (steps 1–3) | 81,955,780 (first UART0 byte, without a SPIF model: the 100 ms Read-ID timeout and the SPI-device delays come first; Task 10) |
 | M2 | secure boot completes; NS hand-off at 0x0011_6D50; `Starting BSP` on UART0 | hand-off 70,784,675 (first boot, 0 resets; 70,282,729 on the second power-on from the saved NV state); `Starting BSP` by 80,784,676 (the test checks UART0 every 10 M cycles, so this is an upper bound); Task 16 |
-| M3 | the boot logo on the emulated screen | not yet recorded |
+| M3 | the boot logo on the emulated screen | 90,000,000 (the TI logo alone is on the screen from about 80 M to 100 M; Task 23, "M3 notes") |
 | M4 | OS image 1 entered at 0x0044_BC90 | not yet recorded |
 
 The M1 banner now arrives by cycle 70,000,001 (same 10 M-cycle granularity): with the SPIF
@@ -318,3 +318,34 @@ the Read-ID probe no longer times out.
     TIM2 = 0x00EF_7801, TIM3 = 0, UPBASE = 0x2004_8000 (0x0015f41e..0x0015f428).
 
   This matches the order of §3.2.
+
+### M3 notes (Task 23)
+
+- **What the screen shows, in order** (screenshots every few M cycles with
+  `evo-cli run --screenshot`): the secure splash (the TI logo) from about 70 M; the BSP
+  redraws the same logo with `Starting BSP` (a different frame hash, the same picture) and
+  it stays alone on the screen up to about 100 M; by 105 M a grey busy spinner is drawn above
+  it; by 130 M a battery icon with a green bar replaces the spinner, and the logo is then
+  cleared. From about 180 M the screen shows only the battery icon, whose bars fill one by one
+  (one step every 100 M to 150 M cycles) and start again: a **charging animation**, still
+  running at 3,000 M.
+- **The pinned frame.** `m3_boot_logo` hashes the frame at 90,000,000 (the middle of the
+  logo-only window; the window bounds are not exact). The `m3_find_settled_logo` search
+  (50 M slices from the `Starting BSP` cycle, three equal frames in a row) never sees the
+  logo-only frame: its first slice ends at about 130 M, and it stops on a charging-animation
+  step (three bars) that happens to last three slices. That frame is not a settled image, so
+  it was not used.
+- **Approval.** The frame at 90 M was checked by eye by the Task 23 implementer (Claude), not
+  by the user: the Texas Instruments wordmark with its logo, horizontally centred in the lower
+  third of a black screen, upright, reads left to right, not mirrored. This confirms the
+  `Lcdc::frame` orientation (`lcdc.md`). No image is committed; the test compares a SHA-256 of
+  the decoded RGB bytes.
+- **The colour order is not confirmed by M3.** The logo and spinner are grey and the battery
+  bars are green (RGB 8,255,16 as decoded); none of them tells R from B apart.
+- **Input for M4 (Task 24).** The charging animation suggests the BSP treats this power-on as
+  a charger wake-up (off-mode charging) rather than an ON-key boot: a lead for the launch gate
+  of §5 item 8. Holding the ON key from power-on for 1 s (`--keys "+on wait=1000 -on"`) shows
+  the same animation at 400 M. Not investigated further here.
+- **Checks at 90 M:** the backlight PWM brightness is above 0; no SRAM access past 1.5 MiB;
+  no fatal stub IRQ line; no unmapped access outside `KNOWN_UNMODELLED`; a second boot gives
+  the same frame hash.

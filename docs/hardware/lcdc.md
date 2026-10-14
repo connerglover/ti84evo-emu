@@ -80,14 +80,25 @@ released at 0x100b284c just before the first write (`security.md` §3).
 - `Lcdc::frame` (behind `Machine::screen`) decodes RGB565 at UPBASE with bit 28 cleared (the
   Secure SRAM alias 0x3xxx_xxxx is the same bytes as 0x2xxx_xxxx). It returns `None` unless
   LcdEn, LcdPwr and bpp = 6 are set and the whole buffer lies in SRAM. Working orientation
-  (open question 2, until Task 23 checks it against the logo): the output is LPP x PPL
-  (320x240) and output pixel (x, y) = buffer line x, pixel y; BGR = 1 swaps the R and B fields.
+  (confirmed for orientation by Task 23, below): the output is LPP x PPL (320x240) and output
+  pixel (x, y) = buffer line x, pixel y; BGR = 1 swaps the R and B fields.
 - `Pwm` stores +0x00 and +0x04; `brightness()` = duty / period clamped to 0..=1, 0 for
   period 0. Other offsets are unhandled.
 
 ## Open questions
 
 1. The LCDC pixel clock and so the real frame rate.
-2. The orientation and colour order of the image as the panel shows it (MADCTL 0x28 and
-   CONTROL bit 8 BGR); to be confirmed against the real boot logo.
+2. The colour order (CONTROL bit 8 BGR = 1 and the panel's MADCTL 0x28): the decode swaps R
+   and B; no boot image seen so far tells them apart (orientation: settled, below).
 3. The PWM's real period and the meaning of the 0x000F_FFFF writes.
+
+## Orientation and colours, checked against the boot logo (Task 23)
+
+Evidence: the panel is set to MADCTL 0x28 (landscape, `spi-panel.md`) and CONTROL bit 8 (BGR)
+is 1. With the working decode (output pixel (x, y) = buffer line x, pixel y; R and B swapped),
+the M3 frame (`boot-flow.md` "M3 notes") shows the Texas Instruments wordmark upright and
+reading left to right, so the orientation is kept as it is: no change to `Lcdc::frame` or to
+`frame_decode`. The colour order is kept as a working assumption: the logo and spinner are
+grey and the charging animation's bars are pure-looking green, which look the same with or
+without the R/B swap. A boot screen with red or blue in it (e.g. a later OS screen) will
+settle it.

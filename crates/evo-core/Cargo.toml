@@ -17,4 +17,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 evo-image = { path = "../evo-image", features = ["testutil"] }
+png = "0.17"
 serde_json.workspace = true

@@ -14,6 +14,7 @@ use std::ops::RangeInclusive;
 use evo_core::{Machine, NvState, StopReason, UartPort};
 use evo_hw::UnmappedAccess;
 use evo_hw::dev::crypto::Sha256Engine;
+use evo_hw::dev::lcdc::Pwm;
 use evo_hw::dev::spi::Spi;
 use evo_hw::dev::uart::Uart16550;
 use evo_image::{Bundle, Layout};
@@ -390,4 +391,129 @@ fn m2_no_boot_combo() {
         assert_eq!(combo, COMBO_NONE);
         assert_eq!(result, Some(COMBO_NONE));
     }
+}
+
+/// A cycle inside the window where the BSP's TI logo is on the screen alone (about 80 M to
+/// 100 M: drawn with the `Starting BSP` banner, joined by a busy spinner by 105 M; `boot-flow.md`
+/// "M3 notes"). `m3_find_settled_logo` cannot find this frame: its 50 M slices start after it,
+/// and what it reports is a step of the charging animation that follows.
+const M3_CYCLES: u64 = 90_000_000;
+/// Lowercase hex SHA-256 of the approved logo frame's `Frame::rgb` (a hash holds no TI data).
+const M3_SCREEN_SHA256: &str = "f90877dd5646659cb227dab64bbe301c88207c995eeb708a6843e50d3dc86c30";
+/// `m3_find_settled_logo` slice length.
+const M3_SLICE: u64 = 50_000_000;
+/// `m3_find_settled_logo` stops searching here.
+const M3_SEARCH_END: u64 = 3_000_000_000;
+
+/// Lowercase hex SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The workspace `target/` directory.
+fn target_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")
+}
+
+/// Write `frame` as an RGB8 PNG.
+fn write_png(path: &std::path::Path, frame: &evo_hw::dev::lcdc::Frame) {
+    let file = std::fs::File::create(path).expect("create the PNG");
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), frame.width, frame.height);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut w = enc.write_header().expect("PNG header");
+    w.write_image_data(&frame.rgb).expect("PNG data");
+}
+
+/// Search helper, run by hand: from the M2 BSP-banner cycle, run in [`M3_SLICE`] slices up to
+/// [`M3_SEARCH_END`]; after each slice hash `screen()`; stop after three identical non-blank
+/// frames in a row; print the first cycle of the run of three and write that frame to
+/// `target/m3.png`. With OS 7.1.0.4421 it stops on the charging animation (`boot-flow.md`
+/// "M3 notes"), whose steps last longer than three slices; see [`M3_CYCLES`].
+#[test]
+#[ignore]
+fn m3_find_settled_logo() {
+    let Some(os) = Os::boot() else {
+        return;
+    };
+    let mut os = boot_to_handoff(os);
+    run_to_bsp(&mut os);
+    // (first cycle of the current run of equal frames, its hash, run length)
+    let mut run: Option<(u64, String, u32)> = None;
+    while os.m.sched.now < M3_SEARCH_END {
+        let stop = os.run_until(M3_SLICE, |_| false);
+        assert_eq!(stop, StopReason::CycleLimit, "UART0:\n{}", os.uart_text());
+        let now = os.m.sched.now;
+        let frame = os.m.screen().filter(|f| {
+            let px = f.rgb.as_chunks::<3>().0;
+            px.iter().any(|p| Some(p) != px.first())
+        });
+        let Some(frame) = frame else {
+            println!("m3: {now}: blank or off");
+            run = None;
+            continue;
+        };
+        let hash = sha256_hex(&frame.rgb);
+        println!("m3: {now}: {hash}");
+        run = match run {
+            Some((first, h, n)) if h == hash => Some((first, h, n + 1)),
+            _ => Some((now, hash, 1)),
+        };
+        if let Some((first, h, 3)) = &run {
+            println!("m3: settled at cycle {first}: {h}");
+            let path = target_dir().join("m3.png");
+            write_png(&path, &frame);
+            println!("m3: wrote {}", path.display());
+            return;
+        }
+    }
+    panic!("no settled frame by cycle {M3_SEARCH_END}");
+}
+
+/// M3: the BSP draws its boot logo; the emulated screen shows the approved image, the
+/// backlight is on, and the run is deterministic.
+#[test]
+fn m3_boot_logo() {
+    let Some(mut os) = Os::boot() else {
+        return;
+    };
+    let stop = os.run_until(M3_CYCLES, |_| false);
+    assert_eq!(stop, StopReason::CycleLimit, "UART0:\n{}", os.uart_text());
+    let frame = os.m.screen().expect("the LCD is on");
+    assert_eq!((frame.width, frame.height), (320, 240));
+    let hash = sha256_hex(&frame.rgb);
+    println!("m3: screen at cycle {} is {hash}", os.m.sched.now);
+    assert_eq!(hash, M3_SCREEN_SHA256);
+    let pwm = os.m.bus.device::<Pwm>("pwm").expect("pwm device");
+    assert!(pwm.brightness() > 0.0, "the backlight is off");
+    let past: Vec<_> =
+        os.m.bus
+            .log
+            .entries()
+            .map(|(a, _)| a)
+            .filter(|a| {
+                (0x2018_0000..0x2020_0000).contains(&a.addr)
+                    || (0x3018_0000..0x3020_0000).contains(&a.addr)
+            })
+            .cloned()
+            .collect();
+    assert!(past.is_empty(), "accesses past 1.5 MiB of SRAM: {past:#x?}");
+    assert_eq!(os.m.bus.irq_lines() & FATAL_STUB_IRQS, 0);
+    let bad = unexpected_unmapped(&os.m);
+    assert!(bad.is_empty(), "unexpected unmapped accesses: {bad:#x?}");
+
+    let Some(mut os2) = Os::boot() else {
+        return;
+    };
+    os2.run_until(M3_CYCLES, |_| false);
+    let frame2 = os2.m.screen().expect("the LCD is on (second run)");
+    assert_eq!(
+        sha256_hex(&frame2.rgb),
+        hash,
+        "the boot is not deterministic"
+    );
 }
