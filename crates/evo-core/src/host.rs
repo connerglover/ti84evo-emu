@@ -3,6 +3,7 @@
 //! `Machine::with_dev`, so the device sees the current time and its IRQ changes reach the CPU.
 
 use evo_hw::dev::gpio::Gpio;
+use evo_hw::dev::keypad::{Key, Keypad};
 use evo_hw::dev::lcdc::{Frame, Lcdc};
 use evo_hw::dev::uart::Uart16550;
 use evo_hw::dev::usb::UsbTypeC;
@@ -60,6 +61,14 @@ impl Machine {
     /// System reset.
     pub fn set_gpio_input(&mut self, pin: u8, level: Option<bool>) {
         self.with_dev("gpio", |g: &mut Gpio, ctx| g.set_input(pin, level, ctx));
+    }
+
+    /// Press or release `key` (`docs/hardware/keypad.md`). A matrix key latches in its row
+    /// register, sets the key-down status and schedules a scan (IRQ 13 when the guest unmasked
+    /// it); the ON key pulses IRQ 0 on press. Held keys survive a System reset. A matrix
+    /// position outside 0..8 is logged and ignored.
+    pub fn set_key(&mut self, key: Key, pressed: bool) {
+        self.with_dev("keypad", |k: &mut Keypad, ctx| k.set_key(key, pressed, ctx));
     }
 
     /// True once after the guest released the power hold (GPIO pin 1, an output, went from

@@ -6,7 +6,8 @@
 use std::ops::ControlFlow;
 
 use armv8m::Sec;
-use evo_core::{EventKind, Machine, StopReason, UartPort};
+use evo_core::{EventKind, Key, Machine, StopReason, UartPort};
+use evo_hw::dev::keypad::{Keypad, SCAN_CYCLES};
 use evo_hw::{DevCtx, Device, ResetKind, StateError, UnmappedKind};
 use evo_image::testutil::secure_image_bundle;
 use evo_image::{Bundle, ImageError, Layout};
@@ -1112,4 +1113,34 @@ fn lcdc_vcomp_irq_and_screen() {
         !m.cpu.scs.nvic.level(14),
         "the handler cleared the interrupt"
     );
+}
+
+#[test]
+fn set_key_reaches_keypad() {
+    let mut m = sleeper().boot();
+    m.cpu.ppb_write32(NVIC_ISER0, 1); // IRQ 0: the ON key
+    assert_eq!(m.run(1_000), StopReason::Idle);
+    assert_eq!(m.cpu.regs.r[4], 0);
+    m.set_key(Key::On, true);
+    m.run(1_000);
+    assert_eq!(m.cpu.regs.r[4], 1, "the ON-key handler ran once");
+    m.set_key(Key::On, false);
+    m.run(1_000);
+    assert_eq!(m.cpu.regs.r[4], 1, "release raises nothing");
+    m.set_key(Key::Matrix { row: 2, col: 5 }, true);
+    let rows = m.bus.device::<Keypad>("keypad").expect("keypad");
+    assert!(rows.pressed(Key::Matrix { row: 2, col: 5 }));
+}
+
+#[test]
+fn set_key_after_sleep_uses_current_time() {
+    let mut m = sleeper().boot();
+    m.cpu.ppb_write32(SYST_RVR, 999_999);
+    m.cpu.ppb_write32(SYST_CSR, 0b111); // ENABLE, TICKINT, CLKSOURCE
+    assert_eq!(m.run(500_000), StopReason::CycleLimit);
+    assert!(m.asleep());
+    assert_eq!(m.sched.now, 500_000);
+    assert_eq!(m.cpu.regs.r[4], 0, "no SysTick yet");
+    m.set_key(Key::Matrix { row: 0, col: 0 }, true);
+    assert_eq!(m.sched.next_deadline(), Some(500_000 + SCAN_CYCLES));
 }

@@ -3,6 +3,7 @@
 use crate::MemoryMap;
 use crate::dev::crypto::{Sha256Engine, TRNG_SEED, Trng};
 use crate::dev::gpio::Gpio;
+use crate::dev::keypad::Keypad;
 use crate::dev::lcdc::{Lcdc, Pwm};
 use crate::dev::mpc::Mpc;
 use crate::dev::spi::{DEFAULT_PANEL_ID, Spi, St7789};
@@ -65,4 +66,6 @@ pub fn attach(map: &mut MemoryMap) {
     // framebuffer from SRAM. The backlight PWM next to it is plain storage, no IRQ.
     map.add_device("lcdc", 0x4000_4000, 0x1000, Box::new(Lcdc::new()));
     map.add_device("pwm", 0x4010_4000, 0x1000, Box::new(Pwm::new()));
+    // Keypad scanner (keypad.md): IRQ 13 for the matrix; the ON key pulses IRQ 0.
+    map.add_device("keypad", 0x4010_3000, 0x1000, Box::new(Keypad::new()));
 }

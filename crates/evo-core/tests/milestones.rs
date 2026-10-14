@@ -314,3 +314,80 @@ fn m2_no_access_past_1_5_mib_sram() {
             .collect();
     assert!(past.is_empty(), "accesses past 1.5 MiB of SRAM: {past:#x?}");
 }
+
+/// The BSP's boot-combo result byte (`keypad.md` "Boot key combos"): 10 = no combo, else the
+/// index of the matched combo in the table at NS 0x0018_3DF0.
+const COMBO_RESULT: u32 = 0x2001_0DB8;
+/// No combo matched.
+const COMBO_NONE: u32 = 10;
+/// Combo 0: ALPHA + LN + ENTER, the Self-Test menu.
+const COMBO_SELF_TEST: u32 = 0;
+/// Combo 9: ALPHA + SIN + ENTER, the Engineering menu.
+const COMBO_ENGINEERING: u32 = 9;
+/// In the BSP main thread, just after `r4 = get_combo()` (0x0015_D482: `bl`, `mov r4, r0`).
+const AFTER_GET_COMBO: u32 = 0x0015_D488;
+
+/// Boot with `keys` held from power-on (as on hardware: hold them, then press ON) and return
+/// what the BSP's boot-combo matcher picked: `get_combo()`'s result and the result byte.
+/// `None` when the milestone tests are skipped.
+fn boot_combo(keys: &[&str]) -> Option<(u32, Option<u32>)> {
+    let mut os = Os::boot()?;
+    for name in keys {
+        let key = evo_core::Key::from_name(name).expect("a key name");
+        os.m.set_key(key, true);
+    }
+    os.m.breakpoints.insert(AFTER_GET_COMBO);
+    let stop = os.run_until(2_500_000_000, |_| false);
+    let combo = os.m.cpu.regs.r[4];
+    let keypad_misses: Vec<_> =
+        os.m.bus
+            .log
+            .entries()
+            .map(|(a, _)| a)
+            .filter(|a| (0x4010_3000..=0x4010_3FFF).contains(&a.addr))
+            .cloned()
+            .collect();
+    assert!(
+        keypad_misses.is_empty(),
+        "unhandled keypad accesses: {keypad_misses:#x?}"
+    );
+    let result = os.m.bus.peek(COMBO_RESULT, 1);
+    println!(
+        "m2: {keys:?}: get_combo returned {combo} by cycle {} (result byte {result:?})",
+        os.m.sched.now
+    );
+    assert_eq!(
+        stop,
+        StopReason::Breakpoint(AFTER_GET_COMBO),
+        "UART0:\n{}",
+        os.uart_text()
+    );
+    Some((combo, result))
+}
+
+/// ALPHA + LN + ENTER held across the power-on reset selects Self-Test.
+#[test]
+fn m2_self_test_boot_combo() {
+    if let Some((combo, result)) = boot_combo(&["alpha", "ln", "enter"]) {
+        assert_eq!(combo, COMBO_SELF_TEST);
+        assert_eq!(result, Some(COMBO_SELF_TEST));
+    }
+}
+
+/// ALPHA + SIN + ENTER selects the Engineering menu.
+#[test]
+fn m2_engineering_boot_combo() {
+    if let Some((combo, result)) = boot_combo(&["alpha", "sin", "enter"]) {
+        assert_eq!(combo, COMBO_ENGINEERING);
+        assert_eq!(result, Some(COMBO_ENGINEERING));
+    }
+}
+
+/// With no key held the matcher finds nothing.
+#[test]
+fn m2_no_boot_combo() {
+    if let Some((combo, result)) = boot_combo(&[]) {
+        assert_eq!(combo, COMBO_NONE);
+        assert_eq!(result, Some(COMBO_NONE));
+    }
+}
