@@ -288,7 +288,7 @@ counts are recorded here as each one passes.
 
 | milestone | what it shows | cycle |
 |---|---|---|
-| M1 | `Booting TF-M v2.1.1` on UART0 (steps 1–3) | not yet recorded |
+| M1 | `Booting TF-M v2.1.1` on UART0 (steps 1–3) | 81,955,780 (first UART0 byte, without a SPIF model: the 100 ms Read-ID timeout and the SPI-device delays come first; Task 10) |
 | M2 | secure boot completes; NS hand-off at 0x0011_6D50; `Starting BSP` on UART0 | not yet recorded |
 | M3 | the boot logo on the emulated screen | not yet recorded |
 | M4 | OS image 1 entered at 0x0044_BC90 | not yet recorded |

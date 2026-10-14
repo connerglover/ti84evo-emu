@@ -42,7 +42,9 @@ const WINDOW: u32 = 0x1000;
 
 /// CTRL2 bit 0: enable.
 const CTRL2_EN: u32 = 1 << 0;
-/// CTRL2 bit 6: set on every disable; with EN clear it flushes both FIFOs.
+/// CTRL2 bit 6: written 1 on every disable; with EN clear it flushes both FIFOs. It is
+/// self-clearing (reads 0), so the read-modify-writes of the enable sequence that follow do not
+/// flush the frames queued in between (`spi-panel.md`, open question 3).
 const CTRL2_FLUSH: u32 = 1 << 6;
 /// STATUS bit 1: TX FIFO not full.
 const STATUS_TNF: u32 = 1 << 1;
@@ -302,7 +304,7 @@ impl Spi {
     }
 
     fn write_ctrl2(&mut self, v: u32) {
-        self.regs.ctrl2 = v;
+        self.regs.ctrl2 = v & !CTRL2_FLUSH;
         if v & CTRL2_FLUSH != 0 && v & CTRL2_EN == 0 {
             self.regs.tx.clear();
             self.regs.rx.clear();

@@ -370,3 +370,178 @@ fn cli_bad_bundle_exits_one() {
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
     assert!(!stderr.contains("panicked"), "{stderr}");
 }
+
+/// Payload offset of a program's literal pool.
+const LIT: u32 = 0x300;
+
+/// `ldr r0, [pc, #..]` at payload offset `at`, loading the word at [`LIT`].
+fn ldr_r0_lit(at: u32) -> u16 {
+    0x4800 | ((LIT - ((at + 4) & !3)) / 4) as u16
+}
+
+/// Reset handler: `ldr r0, =uart ; movs r1, #a ; str r1, [r0] ; movs r1, #b ; str r1, [r0] ;
+/// b .` (THR is at +0).
+fn writes_two(uart: u32, a: u8, b: u8) -> Vec<u8> {
+    payload(
+        &[(1, CODE)],
+        &[
+            (
+                CODE,
+                &[
+                    ldr_r0_lit(CODE),
+                    0x2100 | u16::from(a),
+                    0x6001,
+                    0x2100 | u16::from(b),
+                    0x6001,
+                    0xE7FE,
+                ],
+            ),
+            (LIT, &[uart as u16, (uart >> 16) as u16]),
+        ],
+    )
+}
+
+/// Reset handler: wait for an RX byte on UART0 (LSR bit 0), then echo it to THR; `b .`.
+/// `ldr r0, =uart0 ; 1: ldr r1, [r0, #20] ; lsrs r1, r1, #1 ; bcc 1b ; ldr r2, [r0] ;
+/// str r2, [r0] ; b .`
+fn echoes_one() -> Vec<u8> {
+    payload(
+        &[(1, CODE)],
+        &[
+            (
+                CODE,
+                &[
+                    ldr_r0_lit(CODE),
+                    0x6941,
+                    0x0849,
+                    0xD3FC,
+                    0x6802,
+                    0x6002,
+                    0xE7FE,
+                ],
+            ),
+            (LIT, &[0x6000, 0x4010]),
+        ],
+    )
+}
+
+/// `--uart` streams UART0 TX to stdout, raw, ahead of the summary.
+#[test]
+fn cli_uart_streams_to_stdout() {
+    let bundle = bundle_file("cli_uart_streams", writes_two(0x4010_6000, b'h', b'i'));
+    let out = stdout(
+        evo_cli()
+            .arg("run")
+            .arg(&bundle)
+            .args(["--max-cycles", "10000", "--uart"]),
+        0,
+    );
+    let hi = out
+        .find("hi")
+        .unwrap_or_else(|| panic!("no UART bytes: {out}"));
+    let stop = out.find("stop: cycle-limit").expect("stop line");
+    assert!(hi < stop, "{out}");
+}
+
+/// `--uart-in FILE` feeds the file's bytes into UART0 RX at cycle 0.
+#[test]
+fn cli_uart_in_feeds_rx() {
+    let bundle = bundle_file("cli_uart_in", echoes_one());
+    let input = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cli_uart_in.bin");
+    std::fs::write(&input, b"Z").expect("write input");
+    let out = stdout(
+        evo_cli()
+            .arg("run")
+            .arg(&bundle)
+            .args(["--max-cycles", "10000", "--uart", "--uart-in"])
+            .arg(&input),
+        0,
+    );
+    assert!(out.starts_with('Z'), "{out}");
+
+    // Without input the guest waits, and prints nothing.
+    let out = stdout(
+        evo_cli()
+            .arg("run")
+            .arg(&bundle)
+            .args(["--max-cycles", "10000", "--uart"]),
+        0,
+    );
+    assert!(out.starts_with("stop: "), "{out}");
+
+    // A missing input file is an error.
+    let missing = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no-such-uart-in.bin");
+    let out = evo_cli()
+        .arg("run")
+        .arg(&bundle)
+        .arg("--uart-in")
+        .arg(&missing)
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(stderr.contains("no-such-uart-in.bin"), "{stderr}");
+}
+
+/// Without `--uart`, UART0 bytes are discarded: stdout is only the summary.
+#[test]
+fn cli_without_uart_prints_no_guest_bytes() {
+    let bundle = bundle_file("cli_without_uart", writes_two(0x4010_6000, b'h', b'i'));
+    let out = evo_cli()
+        .env_remove("RUST_LOG")
+        .arg("run")
+        .arg(&bundle)
+        .args(["--max-cycles", "10000"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(stdout.starts_with("stop: cycle-limit"), "{stdout}");
+    assert!(
+        out.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Traffic on UART2 (the link port) is counted and reported on stderr.
+#[test]
+fn cli_reports_uart2_bytes() {
+    let bundle = bundle_file("cli_uart2", writes_two(0x4010_B000, b'a', b'b'));
+    let out = evo_cli()
+        .arg("run")
+        .arg(&bundle)
+        .args(["--max-cycles", "10000", "--uart"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("uart2: 2 bytes"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        stdout.starts_with("stop: "),
+        "UART2 bytes are not printed: {stdout}"
+    );
+}
+
+/// A budget of several UART slices still stops right at the budget, like one long run.
+#[test]
+fn cli_budget_spans_slices() {
+    let bundle = bundle_file("cli_budget_spans_slices", looping());
+    let out = stdout(
+        evo_cli()
+            .arg("run")
+            .arg(&bundle)
+            .args(["--max-cycles", "5_000_000", "--uart"]),
+        0,
+    );
+    let cycles: u64 = out
+        .lines()
+        .find_map(|l| l.strip_prefix("stop: cycle-limit pc="))
+        .and_then(|l| l.split("cycles=").nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_else(|| panic!("no stop line: {out}"));
+    // The loop's longest instruction (a taken branch) takes 2 cycles.
+    assert!((5_000_000..5_000_002).contains(&cycles), "{out}");
+}

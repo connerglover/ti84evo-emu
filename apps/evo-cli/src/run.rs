@@ -8,7 +8,7 @@ use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use evo_core::{Machine, StopReason};
+use evo_core::{Machine, StopReason, UartPort};
 use evo_image::{Bundle, Layout};
 
 /// What `evo-cli run` was asked to do.
@@ -20,10 +20,46 @@ pub struct RunArgs {
     pub breaks: Vec<u32>,
     pub unmapped_out: Option<PathBuf>,
     pub gdb: Option<u16>,
+    /// Stream UART0 TX to stdout.
+    pub uart: bool,
+    /// Bytes to feed into UART0 RX at cycle 0.
+    pub uart_in: Option<PathBuf>,
 }
 
 /// Exit status for a lockup (0 is a normal stop, 1 a host-side error).
 const EXIT_LOCKUP: u8 = 2;
+
+/// The run goes in slices of at most this many cycles (10 ms of guest time); the UARTs are
+/// drained after each.
+pub const UART_SLICE: u64 = 1_560_000;
+
+/// What the guest sent on the UARTs so far.
+#[derive(Default)]
+struct UartSink {
+    /// Print UART0 bytes (`--uart`); otherwise they are discarded.
+    print: bool,
+    /// Bytes seen on UART2, the link port; reported on stderr at the end.
+    uart2: u64,
+}
+
+impl UartSink {
+    /// Drain both UARTs; UART0 goes to `out` if printing.
+    fn drain(&mut self, m: &mut Machine, out: &mut impl Write) -> io::Result<()> {
+        let tx = m.take_uart_tx(UartPort::Uart0);
+        self.uart2 += m.take_uart_tx(UartPort::Uart2).len() as u64;
+        if self.print && !tx.is_empty() {
+            out.write_all(&tx)?;
+        }
+        Ok(())
+    }
+
+    /// `uart2: N bytes` on stderr if there was traffic on UART2.
+    fn report(&self) {
+        if self.uart2 > 0 {
+            eprintln!("uart2: {} bytes", self.uart2);
+        }
+    }
+}
 
 pub fn main(args: RunArgs) -> ExitCode {
     let bundle = match Bundle::open(&args.bundle) {
@@ -44,34 +80,60 @@ pub fn main(args: RunArgs) -> ExitCode {
     machine
         .breakpoints
         .extend(args.breaks.iter().map(|a| a & !1));
+    if let Some(path) = &args.uart_in {
+        match fs::read(path) {
+            Ok(bytes) => machine.inject_uart_rx(UartPort::Uart0, &bytes),
+            Err(e) => {
+                eprintln!("evo-cli: {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let mut uarts = UartSink {
+        print: args.uart,
+        ..UartSink::default()
+    };
     if let Some(port) = args.gdb {
-        return gdb(&mut machine, port, args.unmapped_out.as_deref());
+        return gdb(&mut machine, port, args.unmapped_out.as_deref(), &mut uarts);
     }
 
     // Written as the run goes, in buffered blocks: a trace can be gigabytes.
     let mut out = BufWriter::new(io::stdout().lock());
-    // The first stdout error. A trace stops the run at the first one (e.g. `| head` closed
-    // the pipe): nothing more can be printed. The unmapped log is still written.
+    // The first stdout error. It stops the run at the end of the slice, or at once while
+    // tracing (e.g. `| head` closed the pipe): nothing more can be printed. The unmapped log is
+    // still written.
     let mut stdout_err: Option<io::Error> = None;
-    let stop = if args.trace || args.trace_range.is_some() {
-        let range = args.trace_range.clone().unwrap_or(0..u32::MAX);
-        machine.run_with(args.max_cycles, |m| {
-            if range.contains(&m.cpu.regs.pc) {
-                stdout_err = writeln!(out, "{}", m.trace_line()).err();
-            }
-            match stdout_err {
-                Some(_) => ControlFlow::Break(()),
-                None => ControlFlow::Continue(()),
-            }
-        })
-    } else {
-        machine.run(args.max_cycles)
+    let tracing = args.trace || args.trace_range.is_some();
+    let range = args.trace_range.clone().unwrap_or(0..u32::MAX);
+    let end = machine.sched.now.saturating_add(args.max_cycles);
+    let stop = loop {
+        let slice = end.saturating_sub(machine.sched.now).min(UART_SLICE);
+        let stop = if tracing {
+            machine.run_with(slice, |m| {
+                if range.contains(&m.cpu.regs.pc) {
+                    stdout_err = writeln!(out, "{}", m.trace_line()).err();
+                }
+                match stdout_err {
+                    Some(_) => ControlFlow::Break(()),
+                    None => ControlFlow::Continue(()),
+                }
+            })
+        } else {
+            machine.run(slice)
+        };
+        if stdout_err.is_none() {
+            stdout_err = uarts.drain(&mut machine, &mut out).err();
+        }
+        if stop != StopReason::CycleLimit || machine.sched.now >= end || stdout_err.is_some() {
+            break stop;
+        }
     };
     if stdout_err.is_none() {
         stdout_err = summary(&mut out, &machine, stop)
             .and_then(|()| out.flush())
             .err();
     }
+    uarts.report();
 
     if !write_unmapped(args.unmapped_out.as_deref(), &machine) {
         return ExitCode::FAILURE;
@@ -87,7 +149,13 @@ pub fn main(args: RunArgs) -> ExitCode {
 }
 
 /// `--gdb PORT`: serve one GDB client on localhost, then report where it left the machine.
-fn gdb(machine: &mut Machine, port: u16, unmapped_out: Option<&Path>) -> ExitCode {
+/// UART output the guest produced during the session is printed (with `--uart`) when it ends.
+fn gdb(
+    machine: &mut Machine,
+    port: u16,
+    unmapped_out: Option<&Path>,
+    uarts: &mut UartSink,
+) -> ExitCode {
     // Loopback only: whoever connects controls the machine.
     let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
         Ok(l) => l,
@@ -111,13 +179,18 @@ fn gdb(machine: &mut Machine, port: u16, unmapped_out: Option<&Path>) -> ExitCod
     }
 
     let mut out = io::stdout().lock();
-    let printed = writeln!(
-        out,
-        "gdb: session ended pc=0x{:08x} cycles={}",
-        machine.cpu.regs.pc, machine.sched.now
-    )
-    .and_then(|()| notes(&mut out, machine, false))
-    .and_then(|()| out.flush());
+    let printed = uarts
+        .drain(machine, &mut out)
+        .and_then(|()| {
+            writeln!(
+                out,
+                "gdb: session ended pc=0x{:08x} cycles={}",
+                machine.cpu.regs.pc, machine.sched.now
+            )
+        })
+        .and_then(|()| notes(&mut out, machine, false))
+        .and_then(|()| out.flush());
+    uarts.report();
     if !write_unmapped(unmapped_out, machine) {
         return ExitCode::FAILURE;
     }
@@ -254,6 +327,11 @@ mod tests {
         assert!(parse_range("0x20..0x10").is_err());
         assert!(parse_range("0x10").is_err());
         assert!(parse_range("0x10..").is_err());
+    }
+
+    #[test]
+    fn uart_slice_is_10_ms() {
+        assert_eq!(UART_SLICE, evo_core::CPU_HZ / 100);
     }
 
     #[test]

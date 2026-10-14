@@ -237,9 +237,13 @@ State: `ctrl0, ctrl1, ctrl2, inten: u32`, `tx: VecDeque<u16>` (capacity `DEPTH` 
 
 - `read(+0x00/+0x04/+0x08/+0x1C)` returns the stored value.
 - `write(+0x00/+0x04/+0x1C)` stores the value.
-- `write(+0x08, v)`: store it.
+- `write(+0x08, v)`: store it, except bit 6, which is self-clearing (reads 0).
   - If v bit 6 is set and bit 0 is clear, clear `tx` and `rx`. The firmware drains RX
     itself, so clearing only `tx` is also acceptable.
+  - Bit 6 must not be stored: the transfer at 0x100b4928 disables (`|0x40`), queues its TX
+    frames, then enables with read-modify-writes (`|0x180`, `|2`, `|1`). A stored bit 6
+    would make the first two of those writes flush the queued frames, and the RX wait at
+    0x100b49c8 would hang the boot (found in Plan 2, Task 10).
   - On a 0→1 edge of bit 0, shift out every queued `tx` frame (see the shift rule below).
 - `read(+0x0C)` returns `(1<<1 if tx.len() < DEPTH) | (0<<2 BUSY) | ((min(rx.len(), 63)) << 4)`.
   BUSY is 0 because transfers complete instantly.
@@ -297,6 +301,9 @@ State: `ctrl0, ctrl1, ctrl2, inten: u32`, `tx: VecDeque<u16>` (capacity `DEPTH` 
 3. **Exact meaning of the CTRL0 bits** [3:2], [7], [17:16] and the CTRL2 bits [1], [3:2],
    [6], [8:7], [11:10]. The model only needs CTRL2[0] (enable) and CTRL1[22:16] (frame
    size). Bit 6 is presumably a FIFO flush.
+   **Emulator decision (Plan 2, Task 10):** bit 6 is a self-clearing flush (write 1 with
+   EN clear empties both FIFOs; it reads 0). A stored bit 6 hangs the boot (see the model
+   above). The other bits are stored and have no effect.
 4. **FIFO depth** (+0x64[23:16]) is unknown. 8 is a guess; the behavior does not depend on
    it. **Emulator decision (Task 9):** TX depth `SPI_FIFO_DEPTH` = 8 (+0x64 reads
    0x0007_0000), RX capacity `SPI_RX_CAP` = 16; neither line IRQ 19 nor IRQ 20 is driven.

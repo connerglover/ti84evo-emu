@@ -134,6 +134,32 @@ fn flush_bit6() {
     assert_eq!(h.read(&mut s, STATUS, 4), 0x2);
 }
 
+/// The firmware's transfer (0x100b4928..0x100b49ba): disable (`&~1, |0x40, &~0x180, &~2`),
+/// queue the frames, then enable (`|0x180, |2, |1`) with read-modify-writes. Bit 6 is
+/// self-clearing, so the enable writes do not flush the queued frames, and each MOSI frame
+/// yields its MISO frame (the loop at 0x100b49c8 waits for all of them, without a timeout).
+#[test]
+fn queued_frames_survive_enable_sequence() {
+    let (mut h, mut s) = enabled();
+    let rmw = |h: &mut DevHarness, s: &mut Spi, clear: u32, set: u32| {
+        let v = h.read(s, CTRL2, 4);
+        h.write(s, CTRL2, 4, (v & !clear) | set);
+    };
+    rmw(&mut h, &mut s, 1, 0);
+    rmw(&mut h, &mut s, 0, 0x40);
+    assert_eq!(h.read(&mut s, CTRL2, 4) & 0x40, 0, "bit 6 reads 0");
+    rmw(&mut h, &mut s, 0x180, 0);
+    rmw(&mut h, &mut s, 2, 0);
+    send(&mut h, &mut s, &[0x004, 0, 0, 0]);
+    assert_eq!(rx_level(&mut h, &mut s), 0);
+    rmw(&mut h, &mut s, 0, 0x180);
+    rmw(&mut h, &mut s, 0, 2);
+    assert_eq!(rx_level(&mut h, &mut s), 0, "still queued");
+    rmw(&mut h, &mut s, 0, 1);
+    assert_eq!(rx_level(&mut h, &mut s), 4);
+    assert_eq!(pop(&mut h, &mut s, 4), [0x000, 0x085, 0x10A, 0x148]);
+}
+
 #[test]
 fn rx_caps_at_16() {
     let (mut h, mut s) = enabled();

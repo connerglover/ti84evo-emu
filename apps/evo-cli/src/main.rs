@@ -65,6 +65,14 @@ enum Command {
             conflicts_with_all = ["max_cycles", "trace", "trace_range"]
         )]
         gdb: Option<u16>,
+        /// Stream the guest's UART0 output (the TF-M and BSP log) to stdout, raw, as it runs.
+        /// UART2 (the link port) is not printed; a run that saw traffic on it ends with
+        /// `uart2: N bytes` on stderr.
+        #[arg(long)]
+        uart: bool,
+        /// Feed the bytes of FILE into UART0's receiver at cycle 0.
+        #[arg(long, value_name = "FILE")]
+        uart_in: Option<PathBuf>,
     },
 }
 
@@ -98,6 +106,8 @@ fn main() -> ExitCode {
             breaks,
             unmapped_out,
             gdb,
+            uart,
+            uart_in,
         } => run::main(run::RunArgs {
             bundle,
             max_cycles,
@@ -106,6 +116,8 @@ fn main() -> ExitCode {
             breaks,
             unmapped_out,
             gdb,
+            uart,
+            uart_in,
         }),
         Command::Inspect {
             bundle,
@@ -178,6 +190,8 @@ mod tests {
             breaks,
             unmapped_out,
             gdb,
+            uart,
+            uart_in,
         } = cli.command
         else {
             panic!("not run");
@@ -189,6 +203,8 @@ mod tests {
         assert!(breaks.is_empty());
         assert_eq!(unmapped_out, None);
         assert_eq!(gdb, None);
+        assert!(!uart);
+        assert_eq!(uart_in, None);
     }
 
     #[test]
@@ -208,6 +224,9 @@ mod tests {
             "44bc90",
             "--unmapped-out",
             "log.md",
+            "--uart",
+            "--uart-in",
+            "in.bin",
         ])
         .expect("parse");
         let Command::Run {
@@ -217,6 +236,8 @@ mod tests {
             breaks,
             unmapped_out,
             gdb,
+            uart,
+            uart_in,
             ..
         } = cli.command
         else {
@@ -228,6 +249,8 @@ mod tests {
         assert_eq!(breaks, [0x100b_1adc, 0x0044_bc90]);
         assert_eq!(unmapped_out, Some(PathBuf::from("log.md")));
         assert_eq!(gdb, None);
+        assert!(uart);
+        assert_eq!(uart_in, Some(PathBuf::from("in.bin")));
 
         assert!(Cli::try_parse_from(["evo-cli", "run"]).is_err());
         assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--break", "zz"]).is_err());
