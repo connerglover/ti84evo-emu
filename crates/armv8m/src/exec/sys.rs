@@ -145,10 +145,10 @@ fn write_sysreg(cpu: &mut Cpu, sysm: u8, mask: u8, v: u32) {
 }
 
 /// The `TT` response word for `addr`. Secure state sees the security attribution (S, SAU and
-/// IDAU regions, NSR/NSRW); everyone sees the MPU permissions (R/RW) of the current security
-/// state's MPU, or of the Non-secure MPU for `alt` (TTA/TTAT), at the current privilege or
-/// unprivileged for `unpriv` (TTT/TTAT). The MPU region number is reported to privileged code
-/// and for `alt`.
+/// IDAU regions). The MPU fields (R/RW, MREGION/MRVALID, and so NSR/NSRW) are reported only to
+/// privileged software or for `alt` (TTA/TTAT), and are zero otherwise. They come from the
+/// current security state's MPU, or the Non-secure one for `alt`, at the privilege of the
+/// target state's current mode, or unprivileged for `unpriv` (TTT/TTAT).
 fn tt_response(cpu: &Cpu, addr: u32, alt: bool, unpriv: bool) -> u32 {
     const MRVALID: u32 = 1 << 16;
     const SRVALID: u32 = 1 << 17;
@@ -160,6 +160,11 @@ fn tt_response(cpu: &Cpu, addr: u32, alt: bool, unpriv: bool) -> u32 {
     const IRVALID: u32 = 1 << 23;
 
     let secure = cpu.regs.sec == Sec::Secure;
+    let mpu_sec = match (alt, cpu.regs.sec) {
+        (false, sec) => sec,
+        (true, Sec::Secure) => Sec::NonSecure,
+        (true, Sec::NonSecure) => Sec::Secure,
+    };
     let mut resp = 0;
     let mut addr_secure = false;
     if secure {
@@ -170,16 +175,19 @@ fn tt_response(cpu: &Cpu, addr: u32, alt: bool, unpriv: bool) -> u32 {
         if let Some(r) = a.iregion {
             resp |= (u32::from(r) << 24) | IRVALID;
         }
-        addr_secure = a.attr != Attr::NonSecure;
+        // Exempt memory is accessed in the security state being queried.
+        addr_secure = match a.attr {
+            Attr::NonSecure => false,
+            Attr::Exempt => mpu_sec == Sec::Secure,
+            Attr::Secure | Attr::NonSecureCallable => true,
+        };
         if addr_secure {
             resp |= S;
         }
     }
-    let mpu_sec = match (alt, cpu.regs.sec) {
-        (false, sec) => sec,
-        (true, Sec::Secure) => Sec::NonSecure,
-        (true, Sec::NonSecure) => Sec::Secure,
-    };
+    if !(cpu.is_privileged() || alt) {
+        return resp;
+    }
     let privileged = !unpriv && (cpu.regs.handler_mode() || cpu.regs.control.get(mpu_sec) & 1 == 0);
     let negative = cpu.execution_priority() < 0;
     let (read, write, region) = cpu
@@ -187,9 +195,7 @@ fn tt_response(cpu: &Cpu, addr: u32, alt: bool, unpriv: bool) -> u32 {
         .mpu
         .get(mpu_sec)
         .permissions(addr, privileged, negative);
-    if let Some(r) = region
-        && (cpu.is_privileged() || alt)
-    {
+    if let Some(r) = region {
         resp |= u32::from(r) | MRVALID;
     }
     if read {

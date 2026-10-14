@@ -42,9 +42,10 @@ pub enum Attr {
     Exempt,
 }
 
-/// Implementation Defined Attribution Unit: the SoC's fixed security map. It is combined with
-/// the SAU (most secure wins) while the SAU is enabled; with the SAU disabled the SAU alone
-/// decides (`SAU_CTRL.ALLNS`).
+/// Implementation Defined Attribution Unit: the SoC's fixed security map. It is always combined
+/// with the SAU, most secure wins: with the SAU disabled and `ALLNS` clear everything is Secure
+/// anyway, with `ALLNS` set the IDAU decides. An `Exempt` result and region numbers apply
+/// whether or not the SAU is enabled.
 pub trait Idau: Send + Sync {
     /// Attribution of `addr` and the number of the IDAU region holding it (reported by `TT` as
     /// IREGION). `None` means the IDAU does not cover `addr`: it imposes nothing and the SAU
@@ -55,8 +56,9 @@ pub trait Idau: Send + Sync {
 
 /// The default IDAU, following the Arm convention: address bit 28 set is Secure, clear is
 /// Non-secure. As in Arm's reference subsystems the Secure half is reported as NSC-capable, so
-/// the SAU's NSC regions (the CMSE veneers in Secure flash) take effect; elsewhere the SAU's
-/// default (Secure) wins. There are no region numbers.
+/// the SAU's NSC regions (the CMSE veneers in Secure flash) take effect; where the SAU says
+/// Secure that wins, and where it says Non-secure (an NS region, or `ALLNS`) the result is
+/// NSC. There are no region numbers.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DefaultIdau;
 
@@ -180,27 +182,26 @@ impl Sau {
         rlar & RLAR_ENABLE != 0 && self.rbar[r] & !GRANULE <= addr && addr <= rlar | GRANULE
     }
 
-    /// `SecurityCheck()`. With the SAU disabled every address is Secure, or Non-secure when
-    /// `ALLNS` is set; the IDAU only takes part while the SAU is enabled (ruling R2). An address
-    /// in no SAU region, or in more than one, is Secure. The IDAU can then only make the result
-    /// more secure.
+    /// `SecurityCheck()` (ruling R2a). Exempt addresses (the system space, or the IDAU's
+    /// `Exempt`) come first. Then the SAU: disabled, every address is Secure, or Non-secure with
+    /// `ALLNS`; enabled, an address in no region, or in more than one, is Secure. Finally the
+    /// IDAU can make the result more secure (most secure wins).
     pub(crate) fn check(&self, addr: u32, idau: &dyn Idau) -> SecAttr {
-        let exempt = |iregion| SecAttr {
+        let exempt = SecAttr {
             attr: Attr::Exempt,
             sregion: None,
-            iregion,
+            iregion: None,
         };
         if addr >= EXEMPT_START {
-            return exempt(None);
+            return exempt;
         }
-        let enabled = self.ctrl & CTRL_ENABLE != 0;
-        let idau = if enabled { idau.attr(addr) } else { None };
-        if let Some((Attr::Exempt, iregion)) = idau {
-            return exempt(iregion);
+        let idau = idau.attr(addr);
+        if let Some((Attr::Exempt, _)) = idau {
+            return exempt;
         }
 
         let (mut ns, mut nsc, mut sregion) = (false, false, None);
-        if enabled {
+        if self.ctrl & CTRL_ENABLE != 0 {
             let mut hits = (0..REGIONS).filter(|&r| self.region_contains(r, addr));
             if let (Some(r), None) = (hits.next(), hits.next()) {
                 nsc = self.rlar[r] & RLAR_NSC != 0;

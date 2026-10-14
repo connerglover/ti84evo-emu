@@ -539,7 +539,7 @@ impl Cpu {
                 self.preemptable_pending().unwrap_or((num, sec))
             }
         };
-        self.exception_taken(bus, num, sec);
+        self.exception_taken(bus, num, sec, false);
     }
 
     /// `PushStack`: write the basic frame below the current SP of the current security state
@@ -618,49 +618,71 @@ impl Cpu {
 
     /// `PushCalleeStack`: push the additional state context (integrity signature, a reserved
     /// word, r4-r11) below the basic frame on the Secure stack that LR (EXC_RETURN) describes.
-    /// On failure nothing changes but memory: SP and LR still describe the basic frame alone.
+    /// Like `push_stack`, a stack limit violation writes nothing and sets SP to the limit, and
+    /// a bus error does not stop the other writes; SP moves either way.
     fn push_callee_stack(&mut self, bus: &mut impl Bus) -> Option<Fault> {
         let lr = self.regs.lr;
         let privileged = lr & EXC_RETURN_MODE == 0 || self.regs.control.s & 1 == 0;
-        let (sp, limit) = self.secure_frame_sp(lr);
+        let (sp, limit) = {
+            let (sp, limit) = self.secure_frame_sp(lr);
+            (*sp, limit)
+        };
         let frame = sp.wrapping_sub(CALLEE_FRAME_SIZE);
         if frame < limit {
+            *self.secure_frame_sp(lr).0 = limit;
             return Some(Fault::StkOf);
         }
         let r = &self.regs.r;
         let mut words = [INTEGRITY_SIGNATURE, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         words[2..].copy_from_slice(&r[4..12]);
+        let mut derived = None;
         for (i, &w) in words.iter().enumerate() {
             let addr = frame.wrapping_add(4 * i as u32);
             if let Err(f) = self.stack_write(bus, addr, w, Sec::Secure, privileged) {
-                return Some(f);
+                derived.get_or_insert(f);
             }
         }
         *self.secure_frame_sp(lr).0 = frame;
-        None
+        derived
     }
 
     /// `ExceptionTaken`: fetch the vector and enter the handler of `num` targeting `sec`. LR
-    /// already holds the EXC_RETURN value (from `push_stack`, or kept across a tail-chain).
-    fn exception_taken(&mut self, bus: &mut impl Bus, num: u16, sec: Sec) {
-        // A Non-secure handler over a Secure background: the callee-saved registers go on the
-        // Secure stack with an integrity signature (once; DCRS = 0 records that they are there).
-        let both = EXC_RETURN_S | EXC_RETURN_DCRS;
-        if sec == Sec::NonSecure && self.regs.lr & both == both {
-            if let Some(fault) = self.push_callee_stack(bus) {
-                // A derived exception: taken instead when it preempts. (The Non-secure handler
-                // cannot be entered without the context, so otherwise the processor locks up.)
-                if !self.raise_fault(fault) {
-                    self.enter_lockup(Some((num, sec)));
-                    return;
+    /// already holds the EXC_RETURN value (from `push_stack`, or kept across a tail-chain:
+    /// `tail_chain`, in which case its ES bit is the security of the exception just left).
+    ///
+    /// EXC_RETURN.DCRS ("default callee register stacking") is 1 when the callee-saved
+    /// registers are stacked by the default rule: on the Secure stack exactly when a
+    /// Non-secure exception interrupted a Secure background. It is 0 when they are on the
+    /// stack although the exception is Secure, which happens when a Non-secure exception over
+    /// a Secure background tail-chains into a Secure one.
+    fn exception_taken(&mut self, bus: &mut impl Bus, num: u16, sec: Sec, tail_chain: bool) {
+        let lr = self.regs.lr;
+        let mut derived = None;
+        if lr & EXC_RETURN_S != 0 {
+            // Secure background. Leaving a Non-secure exception, its callee context is already
+            // on the Secure stack.
+            let from_ns_exception = tail_chain && lr & EXC_RETURN_ES == 0;
+            if sec == Sec::NonSecure {
+                if lr & EXC_RETURN_DCRS != 0 && !from_ns_exception {
+                    derived = self.push_callee_stack(bus);
                 }
-                match self.preemptable_pending() {
-                    Some(next) if next != (num, sec) => self.exception_taken(bus, next.0, next.1),
-                    _ => self.enter_lockup(Some((num, sec))),
-                }
+                self.regs.lr |= EXC_RETURN_DCRS;
+            } else if from_ns_exception {
+                self.regs.lr &= !EXC_RETURN_DCRS;
+            }
+        }
+        self.regs.lr = (self.regs.lr & !EXC_RETURN_ES) | u32::from(sec == Sec::Secure);
+        if let Some(fault) = derived {
+            // A derived exception on callee stacking: start again as a tail-chain from this
+            // exception, taking the derived exception instead if it preempts (the original
+            // stays pending). The context is not pushed a second time.
+            if !self.raise_fault(fault) {
+                self.enter_lockup(Some((num, sec)));
                 return;
             }
-            self.regs.lr &= !EXC_RETURN_DCRS;
+            let (n, s) = self.preemptable_pending().unwrap_or((num, sec));
+            self.exception_taken(bus, n, s, true);
+            return;
         }
 
         let vtor = *self.scs.scb.vtor.get(sec);
@@ -675,33 +697,36 @@ impl Cpu {
             Err(e) => {
                 log::warn!("vector read for exception {num} at {addr:#010x} failed: {e:?}");
                 self.scs.scb.hfsr |= scb::HFSR_VECTTBL;
-                // The original exception stays pending; HardFault is taken in its place.
+                // The original exception stays pending; HardFault is taken in its place, as a
+                // tail-chain from it (LR already describes the frame for it).
                 let hf = self.hardfault_target(sec);
                 if num == HARDFAULT
                     || self.exception_priority(HARDFAULT, hf, true) >= self.execution_priority()
                 {
                     self.enter_lockup(Some((num, sec)));
                 } else {
-                    self.exception_taken(bus, HARDFAULT, hf);
+                    self.exception_taken(bus, HARDFAULT, hf, true);
                 }
                 return;
             }
         };
 
-        // Leaving Secure state for a Non-secure handler: the Secure register contents must not
-        // be visible. r4-r11 are only cleared when they are saved on the stack.
-        if sec == Sec::NonSecure && self.regs.sec == Sec::Secure {
+        // A Non-secure handler must not see Secure register contents: the caller-saved
+        // registers and APSR when leaving Secure state (they are in the basic frame), and r4-r11
+        // over a Secure background (they are in the callee context).
+        if sec == Sec::NonSecure {
             let r = &mut self.regs.r;
-            r[..4].fill(0);
-            r[12] = 0;
-            if self.regs.lr & EXC_RETURN_DCRS == 0 {
+            if self.regs.sec == Sec::Secure {
+                r[..4].fill(0);
+                r[12] = 0;
+                let x = &mut self.regs.xpsr;
+                (x.n, x.z, x.c, x.v, x.q, x.ge) = (false, false, false, false, false, 0);
+            }
+            if self.regs.lr & EXC_RETURN_S != 0 {
                 r[4..12].fill(0);
             }
-            let x = &mut self.regs.xpsr;
-            (x.n, x.z, x.c, x.v, x.q, x.ge) = (false, false, false, false, false, 0);
         }
 
-        self.regs.lr = (self.regs.lr & !EXC_RETURN_ES) | u32::from(sec == Sec::Secure);
         self.regs.sec = sec;
         let x = &mut self.regs.xpsr;
         x.exception = num;
@@ -742,11 +767,11 @@ impl Cpu {
         let spsel = exc_return & EXC_RETURN_SPSEL != 0;
         let dcrs = exc_return & EXC_RETURN_DCRS != 0;
 
-        // Non-secure software can neither return from a Secure exception nor return to Secure
-        // state without the additional state context pushed when it was entered.
-        if cur == Sec::NonSecure && (es || (to_secure && dcrs)) {
+        // Non-secure software can neither return from a Secure exception (ES = 1) nor claim a
+        // non-default callee context (DCRS = 0). The exception is then treated as Non-secure.
+        if cur == Sec::NonSecure && (es || !dcrs) {
             log::warn!("invalid exception return {exc_return:#010x} from Non-secure state");
-            return self.return_fault(bus, exc_return, Fault::InvEr);
+            return self.return_fault(bus, exc_return & !EXC_RETURN_ES, Fault::InvEr);
         }
         let valid = exc_return & 0x00FF_FF82 == 0x00FF_FF80
             && exc_return & EXC_RETURN_FTYPE != 0
@@ -774,7 +799,7 @@ impl Cpu {
         // taken without unstacking and restacking; LR keeps describing the frame.
         if let Some((n, s)) = self.preemptable_pending() {
             self.regs.lr = exc_return;
-            self.exception_taken(bus, n, s);
+            self.exception_taken(bus, n, s, true);
             return self.entry_outcome();
         }
 
@@ -786,8 +811,10 @@ impl Cpu {
             *self.regs.msp.get(frame_sec)
         };
         let privileged = !to_thread || self.regs.control.get(frame_sec) & 1 == 0;
+        // The callee context is on the Secure stack for a Non-secure exception over a Secure
+        // background (ES = 0), and for a Secure one with DCRS = 0.
         let mut callee = None;
-        if to_secure && !dcrs {
+        if to_secure && (!es || !dcrs) {
             let sig = match self.stack_read(bus, frame, frame_sec, privileged) {
                 Ok(v) => v,
                 Err(f) => return self.return_fault(bus, exc_return, f),
@@ -855,7 +882,7 @@ impl Cpu {
         }
         if let Some((n, s)) = self.preemptable_pending() {
             self.regs.lr = exc_return;
-            self.exception_taken(bus, n, s);
+            self.exception_taken(bus, n, s, true);
         }
         self.entry_outcome()
     }

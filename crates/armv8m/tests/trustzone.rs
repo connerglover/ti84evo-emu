@@ -426,6 +426,12 @@ fn tt_reports_region() {
     cpu.regs.r[6] = 0x3000_0000;
     step(&mut cpu, &mut bus);
     assert_eq!(cpu.regs.r[5], (0x13 << 24) | IRVALID | TT_R | TT_RW | TT_S);
+    // ... with the SAU disabled too.
+    cpu.ppb_write32(SAU_CTRL, 0);
+    bus.code(0x1000_0104, &[0xE846, 0xF500]);
+    cpu.regs.r[5] = 0;
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.regs.r[5], (0x13 << 24) | IRVALID | TT_R | TT_RW | TT_S);
 
     // From Non-secure state only the MPU fields are reported, and TTA is UNDEFINED.
     let (mut cpu, mut bus) = tz();
@@ -463,8 +469,9 @@ fn ns_irq_from_secure_thread_clears_regs() {
     assert_eq!(cpu.regs.r, [0; 13], "r0-r12 cleared");
     let x = cpu.regs.xpsr;
     assert!(!x.n && !x.z && x.ge == 0, "APSR cleared");
-    // Secure background, callee registers stacked (DCRS = 0), Non-secure exception.
-    assert_eq!(cpu.regs.lr, 0xFFFF_FFD8);
+    // Secure background (S = 1), callee registers stacked by the default rule (DCRS = 1),
+    // Non-secure exception (ES = 0).
+    assert_eq!(cpu.regs.lr, 0xFFFF_FFF8);
     // Additional state context below the basic frame on the Secure stack.
     let sp = SP_S - 0x48;
     assert_eq!(cpu.regs.msp.s, sp);
@@ -591,18 +598,22 @@ fn ns_alias_scs_reads_ns_vtor() {
 #[test]
 fn sau_disabled_allns_bit() {
     let mut cpu = Cpu::new();
-    // Reset: SAU disabled, ALLNS = 0: everything Secure, the IDAU is not consulted.
+    // Reset: SAU disabled, ALLNS = 0: everything Secure (the IDAU can only add security).
     for addr in [0x0000_0000, 0x1000_0000, 0x2000_0000, 0x3000_0000] {
         assert_eq!(cpu.security_of(addr), Attr::Secure, "{addr:#x}");
     }
     assert_eq!(cpu.security_of(0xE000_ED00), Attr::Exempt);
     assert_eq!(cpu.ppb_read32(SAU_TYPE), 8);
 
-    // ALLNS with the SAU disabled: everything Non-secure except the exempt system space.
+    // ALLNS with the SAU disabled: the SAU says Non-secure everywhere, and the IDAU still
+    // applies (most secure wins): the default IDAU's Secure half is NSC.
     cpu.ppb_write32(SAU_CTRL, 0b10);
     assert_eq!(cpu.ppb_read32(SAU_CTRL), 0b10);
-    for addr in [0x0000_0000, 0x1000_0000, 0x2000_0000, 0x3000_0000] {
+    for addr in [0x0000_0000, 0x2000_0000] {
         assert_eq!(cpu.security_of(addr), Attr::NonSecure, "{addr:#x}");
+    }
+    for addr in [0x1000_0000, 0x3000_0000] {
+        assert_eq!(cpu.security_of(addr), Attr::NonSecureCallable, "{addr:#x}");
     }
     assert_eq!(cpu.security_of(0xE000_E000), Attr::Exempt);
 
@@ -634,6 +645,22 @@ fn sau_disabled_allns_bit() {
     assert_eq!(cpu.ppb_read32(SAU_CTRL + NS_ALIAS), 0);
     cpu.ppb_write32(SAU_CTRL + NS_ALIAS, 0);
     assert_eq!(cpu.ppb_read32(SAU_CTRL), 1);
+
+    // The IDAU's Exempt applies with the SAU disabled too; addresses it does not cover follow
+    // the SAU alone.
+    struct ExemptLow;
+    impl Idau for ExemptLow {
+        fn attr(&self, addr: u32) -> Option<(Attr, Option<u8>)> {
+            (addr < 0x100).then_some((Attr::Exempt, None))
+        }
+    }
+    let mut cpu = Cpu::new();
+    cpu.set_idau(Box::new(ExemptLow));
+    assert_eq!(cpu.security_of(0x10), Attr::Exempt);
+    assert_eq!(cpu.security_of(0x1000_0100), Attr::Secure);
+    cpu.ppb_write32(SAU_CTRL, 0b10);
+    assert_eq!(cpu.security_of(0x10), Attr::Exempt);
+    assert_eq!(cpu.security_of(0x1000_0100), Attr::NonSecure);
 }
 
 // ---- Carried items and other Security Extension behaviour ----
@@ -928,4 +955,117 @@ fn reset_keeps_installed_idau() {
     cpu.ppb_write32(SAU_RBAR, 0x1000_0000);
     cpu.ppb_write32(SAU_RLAR, 0x1000_0FE0 | 1);
     assert_eq!(cpu.security_of(0x1000_0000), Attr::NonSecure, "IDAU kept");
+}
+
+// ---- Review fix round 1 ----
+
+#[test]
+fn ns_return_to_secure_requires_dcrs() {
+    // A Secure thread is interrupted by a Non-secure IRQ whose handler returns with `bx r0`.
+    for (exc_return, valid) in [(0xFFFF_FFF8u32, true), (0xFFFF_FFD8, false)] {
+        let (mut cpu, mut bus) = tz();
+        bus.code(0x1000_0100, &[B_SELF]);
+        ns_handler(&mut bus, 16 + 3, 0x400, &[0x4700]);
+        s_handler(&mut bus, 7, 0x1000_0400, &[B_SELF]);
+        cpu.ppb_write32(NVIC_ITNS0, 1 << 3);
+        cpu.ppb_write32(NVIC_ISER0, 1 << 3);
+        // IRQ 3 below SecureFault's priority, so the fault is not escalated.
+        cpu.ppb_write32(NVIC_IPR0, 0x80 << 24);
+        cpu.regs.r[5] = 0x5555;
+        cpu.pulse_irq(3);
+        step(&mut cpu, &mut bus);
+        assert_eq!(cpu.regs.lr, 0xFFFF_FFF8);
+        cpu.regs.r[0] = exc_return;
+        step(&mut cpu, &mut bus);
+        if valid {
+            // S = 1, DCRS = 1: the callee context and the basic frame are popped.
+            assert_eq!(ipsr(&cpu), 0);
+            assert_eq!((cpu.regs.sec, cpu.regs.pc), (Sec::Secure, 0x1000_0100));
+            assert_eq!((cpu.regs.r[5], cpu.regs.msp.s), (0x5555, SP_S));
+        } else {
+            // S = 1, DCRS = 0 from Non-secure state: SecureFault INVER.
+            assert_eq!((ipsr(&cpu), cpu.regs.sec), (7, Sec::Secure));
+            assert_eq!(cpu.ppb_read32(SFSR), INVER);
+            assert_eq!(cpu.regs.msp.s, SP_S - 0x48, "nothing unstacked");
+        }
+    }
+}
+
+#[test]
+fn tail_chain_from_ns_to_secure_exception_keeps_callee_context() {
+    // A Secure thread with Non-secure IRQ 3 (priority 0) and Secure IRQ 4 (priority 0x40)
+    // pending together.
+    let (mut cpu, mut bus) = tz();
+    bus.code(0x1000_0100, &[B_SELF]);
+    ns_handler(&mut bus, 16 + 3, 0x400, &[BX_LR]);
+    s_handler(&mut bus, 16 + 4, 0x1000_0600, &[NOP, BX_LR]);
+    for i in 0..13 {
+        cpu.regs.r[i] = 0x100 + i as u32;
+    }
+    let before = cpu.regs.r;
+    cpu.ppb_write32(NVIC_ITNS0, 1 << 3);
+    cpu.ppb_write32(NVIC_ISER0, (1 << 3) | (1 << 4));
+    cpu.ppb_write32(NVIC_IPR0 + 4, 0x40);
+    cpu.pulse_irq(3);
+    cpu.pulse_irq(4);
+    step(&mut cpu, &mut bus);
+    assert_eq!((ipsr(&cpu), cpu.regs.sec), (19, Sec::NonSecure));
+    assert_eq!(cpu.regs.lr, 0xFFFF_FFF8);
+
+    // Returning from IRQ 3 tail-chains into the Secure IRQ 4 without unstacking. DCRS = 0
+    // records that the callee context is on the stack although the exception is Secure.
+    step(&mut cpu, &mut bus);
+    assert_eq!((ipsr(&cpu), cpu.regs.sec), (20, Sec::Secure));
+    assert_eq!((cpu.regs.pc, cpu.regs.lr), (0x1000_0600, 0xFFFF_FFD9));
+    assert_eq!(cpu.regs.msp.s, SP_S - 0x48);
+
+    // Its return pops the callee context and the basic frame.
+    step(&mut cpu, &mut bus);
+    step(&mut cpu, &mut bus);
+    assert_eq!((ipsr(&cpu), cpu.regs.sec), (0, Sec::Secure));
+    assert_eq!(cpu.regs.pc, 0x1000_0100);
+    assert_eq!(cpu.regs.r, before);
+    assert_eq!(cpu.regs.msp.s, SP_S);
+}
+
+#[test]
+fn tt_mpu_fields_need_privilege() {
+    // tt r2, r1 ; ttt r3, r1 ; tt r4, r1 ; tt r5, r6 ; tta r7, r6
+    let (mut cpu, mut bus) = tz();
+    bus.code(
+        0x1000_0100,
+        &[
+            0xE841, 0xF200, 0xE841, 0xF340, 0xE841, 0xF400, 0xE846, 0xF500, 0xE846, 0xF780,
+        ],
+    );
+    // Secure MPU: region 1 = Secure RAM, read/write for privileged code only; region 2 = NS
+    // RAM, read/write at any privilege.
+    cpu.ppb_write32(MPU_RNR, 1);
+    cpu.ppb_write32(MPU_RBAR, 0x3000_0000);
+    cpu.ppb_write32(MPU_RLAR, 0x3000_FFE0 | 1);
+    cpu.ppb_write32(MPU_RNR, 2);
+    cpu.ppb_write32(MPU_RBAR, 0x2000_0000 | (0b01 << 1));
+    cpu.ppb_write32(MPU_RLAR, 0x2000_FFE0 | 1);
+    cpu.ppb_write32(MPU_CTRL, 0b101);
+    cpu.regs.r[1] = 0x3000_0010;
+    cpu.regs.r[6] = 0x2000_0010;
+    step(&mut cpu, &mut bus);
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.regs.r[2], 1 | MRVALID | TT_R | TT_RW | TT_S);
+    // TTT checks unprivileged permissions; privileged code still gets the region number.
+    assert_eq!(cpu.regs.r[3], 1 | MRVALID | TT_S);
+
+    // Unprivileged code gets no MPU information (so no NSR/NSRW either).
+    cpu.regs.control.s = 1;
+    for _ in 0..3 {
+        step(&mut cpu, &mut bus);
+    }
+    assert_eq!(cpu.regs.r[4], TT_S);
+    assert_eq!(cpu.regs.r[5], (1 << 8) | SRVALID);
+    // ... except through TTA, which reports the Non-secure MPU (disabled; Non-secure Thread
+    // mode is privileged).
+    assert_eq!(
+        cpu.regs.r[7],
+        (1 << 8) | SRVALID | TT_R | TT_RW | TT_NSR | TT_NSRW
+    );
 }
