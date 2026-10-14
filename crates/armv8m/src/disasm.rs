@@ -1,7 +1,9 @@
 //! Disassembly in GNU/UAL syntax (lowercase, `sp`/`lr`/`pc` names).
 
 use crate::bits::SRType;
-use crate::instr::{AluOp, BarrierKind, HintOp, Instr, LongMulKind, MemSize, Reg, RevKind, Shift};
+use crate::instr::{
+    AluOp, BarrierKind, HintOp, Instr, LongMulKind, MemSize, ParKind, ParOp, Reg, RevKind, Shift,
+};
 
 const COND: [&str; 16] = [
     "eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al", "nv",
@@ -18,6 +20,21 @@ fn r(n: Reg) -> &'static str {
 /// `.w` suffix for 32-bit encodings of mnemonics that also have a 16-bit form.
 fn w(len: u8) -> &'static str {
     if len == 4 { ".w" } else { "" }
+}
+
+/// `b`/`t` halfword selector of the 16-bit multiplies.
+fn tb(top: bool) -> &'static str {
+    if top { "t" } else { "b" }
+}
+
+/// Comma-joined registers followed by the optional accumulator register.
+fn regs_with_acc(regs: &[Reg], ra: Option<Reg>) -> String {
+    regs.iter()
+        .copied()
+        .chain(ra)
+        .map(r)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Mnemonic (with `s`) of a logical / carry ALU operation.
@@ -793,6 +810,166 @@ pub fn disasm(instr: &Instr, addr: u32, len: u8) -> String {
             format!("bfi {}, {}, #{lsb}, #{width}", r(rd), r(rn))
         }
         Instr::Bfc { rd, lsb, width } => format!("bfc {}, #{lsb}, #{width}", r(rd)),
+        Instr::Parallel {
+            kind,
+            op,
+            rd,
+            rn,
+            rm,
+        } => {
+            let prefix = match kind {
+                ParKind::S => "s",
+                ParKind::Q => "q",
+                ParKind::Sh => "sh",
+                ParKind::U => "u",
+                ParKind::Uq => "uq",
+                ParKind::Uh => "uh",
+            };
+            let name = match op {
+                ParOp::Add16 => "add16",
+                ParOp::Asx => "asx",
+                ParOp::Sax => "sax",
+                ParOp::Sub16 => "sub16",
+                ParOp::Add8 => "add8",
+                ParOp::Sub8 => "sub8",
+            };
+            format!("{prefix}{name} {}, {}, {}", r(rd), r(rn), r(rm))
+        }
+        Instr::SatArith {
+            rd,
+            rm,
+            rn,
+            sub,
+            double,
+        } => format!(
+            "q{}{} {}, {}, {}",
+            if double { "d" } else { "" },
+            if sub { "sub" } else { "add" },
+            r(rd),
+            r(rm),
+            r(rn)
+        ),
+        Instr::MulHalf {
+            rd,
+            rn,
+            rm,
+            ra,
+            n_top,
+            m_top,
+        } => format!(
+            "{}{}{} {}",
+            if ra.is_some() { "smla" } else { "smul" },
+            tb(n_top),
+            tb(m_top),
+            regs_with_acc(&[rd, rn, rm], ra)
+        ),
+        Instr::MulWordHalf {
+            rd,
+            rn,
+            rm,
+            ra,
+            top,
+        } => format!(
+            "{}{} {}",
+            if ra.is_some() { "smlaw" } else { "smulw" },
+            tb(top),
+            regs_with_acc(&[rd, rn, rm], ra)
+        ),
+        Instr::MulLongHalf {
+            rdlo,
+            rdhi,
+            rn,
+            rm,
+            n_top,
+            m_top,
+        } => format!(
+            "smlal{}{} {}, {}, {}, {}",
+            tb(n_top),
+            tb(m_top),
+            r(rdlo),
+            r(rdhi),
+            r(rn),
+            r(rm)
+        ),
+        Instr::DualMul {
+            rd,
+            rn,
+            rm,
+            ra,
+            sub,
+            x,
+        } => format!(
+            "{}{} {}",
+            match (sub, ra.is_some()) {
+                (false, false) => "smuad",
+                (false, true) => "smlad",
+                (true, false) => "smusd",
+                (true, true) => "smlsd",
+            },
+            if x { "x" } else { "" },
+            regs_with_acc(&[rd, rn, rm], ra)
+        ),
+        Instr::DualMulLong {
+            rdlo,
+            rdhi,
+            rn,
+            rm,
+            sub,
+            x,
+        } => format!(
+            "{}{} {}, {}, {}, {}",
+            if sub { "smlsld" } else { "smlald" },
+            if x { "x" } else { "" },
+            r(rdlo),
+            r(rdhi),
+            r(rn),
+            r(rm)
+        ),
+        Instr::MulMsw {
+            rd,
+            rn,
+            rm,
+            ra,
+            sub,
+            round,
+        } => format!(
+            "{}{} {}",
+            match (sub, ra.is_some()) {
+                (true, _) => "smmls",
+                (false, true) => "smmla",
+                (false, false) => "smmul",
+            },
+            if round { "r" } else { "" },
+            regs_with_acc(&[rd, rn, rm], ra)
+        ),
+        Instr::Usad8 { rd, rn, rm, ra } => format!(
+            "{} {}",
+            if ra.is_some() { "usada8" } else { "usad8" },
+            regs_with_acc(&[rd, rn, rm], ra)
+        ),
+        Instr::Ssat16 { rd, rn, bits } => format!("ssat16 {}, #{bits}, {}", r(rd), r(rn)),
+        Instr::Usat16 { rd, rn, bits } => format!("usat16 {}, #{bits}, {}", r(rd), r(rn)),
+        Instr::Extend16 {
+            rd,
+            rn,
+            rm,
+            rotate,
+            signed,
+        } => {
+            let name = format!(
+                "{}xt{}b16",
+                if signed { "s" } else { "u" },
+                if rn.is_some() { "a" } else { "" }
+            );
+            let mut ops = vec![r(rd)];
+            ops.extend(rn.map(r));
+            ops.push(r(rm));
+            let mut text = format!("{name} {}", ops.join(", "));
+            if rotate != 0 {
+                text += &format!(", ror #{rotate}");
+            }
+            text
+        }
         Instr::Undefined { raw } => match len {
             2 if raw & 0xFF00 == 0xDE00 => format!("udf #{}", raw & 0xFF),
             2 => format!(".short {raw:#06x}"),

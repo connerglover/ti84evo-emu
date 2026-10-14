@@ -3,6 +3,7 @@
 pub mod t16;
 pub mod t32;
 mod t32_branch;
+mod t32_dsp;
 mod t32_mem;
 
 pub use t16::decode16;

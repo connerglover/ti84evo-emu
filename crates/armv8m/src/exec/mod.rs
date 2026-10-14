@@ -2,6 +2,7 @@
 
 mod alu;
 mod branch;
+mod dsp;
 mod mem;
 mod sys;
 
@@ -75,6 +76,18 @@ pub(crate) fn execute(
         | Instr::MulAcc { .. }
         | Instr::LongMul { .. }
         | Instr::Div { .. } => alu::execute(cpu, instr, suppress_flags),
+        Instr::Parallel { .. }
+        | Instr::SatArith { .. }
+        | Instr::MulHalf { .. }
+        | Instr::MulWordHalf { .. }
+        | Instr::MulLongHalf { .. }
+        | Instr::DualMul { .. }
+        | Instr::DualMulLong { .. }
+        | Instr::MulMsw { .. }
+        | Instr::Usad8 { .. }
+        | Instr::Ssat16 { .. }
+        | Instr::Usat16 { .. }
+        | Instr::Extend16 { .. } => dsp::execute(cpu, instr),
         Instr::LoadImm { .. }
         | Instr::StoreImm { .. }
         | Instr::LoadReg { .. }

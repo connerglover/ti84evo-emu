@@ -6,7 +6,7 @@
 //! (SP-based ADD/SUB, and a SP base for CMP/CMN only; TST/TEQ reject SP) and the `Rd == 15`
 //! encodings that are the compare/test aliases (CMP/CMN/TST/TEQ).
 
-use super::{t32_branch, t32_mem};
+use super::{t32_branch, t32_dsp, t32_mem};
 use crate::bits::{SRType, decode_imm_shift, thumb_expand_imm_c};
 use crate::instr::{AluOp, Instr, LongMulKind, RevKind, Shift};
 
@@ -199,10 +199,13 @@ fn plain_imm(h1: u32, h2: u32) -> Option<Instr> {
                 Instr::Movt { rd, imm }
             })
         }
-        // SSAT (sh = bit 5 selects ASR); SSAT16 (ASR #0) is not decoded.
+        // SSAT (sh = bit 5 selects ASR); ASR #0 is SSAT16/USAT16.
         0b10000 | 0b10010 | 0b11000 | 0b11010 => {
             let asr = op & 2 != 0;
-            if !(gp(rd) && gp(rn)) || (asr && imm5 == 0) {
+            if asr && imm5 == 0 {
+                return t32_dsp::sat16(h1, h2, op < 0b11000);
+            }
+            if !(gp(rd) && gp(rn)) {
                 return None;
             }
             let (ty, amount) = decode_imm_shift(if asr { 2 } else { 0 }, imm5);
@@ -369,7 +372,7 @@ fn mov_or_shift(rd: u8, rm: u8, (ty, imm5): (u32, u32), shift: Shift, s: bool) -
     })
 }
 
-/// Data processing (register): shifts, extends, parallel add/sub (not decoded), misc.
+/// Data processing (register): shifts, extends, parallel add/sub, misc.
 fn register_ops(h1: u32, h2: u32) -> Option<Instr> {
     let rn = field(h1, 0, 4) as u8;
     let rd = field(h2, 8, 4) as u8;
@@ -378,6 +381,9 @@ fn register_ops(h1: u32, h2: u32) -> Option<Instr> {
     let op2 = field(h2, 4, 4);
     if field(h2, 12, 4) != 0xF {
         return None;
+    }
+    if op1 & 8 != 0 && op2 & 8 == 0 {
+        return t32_dsp::parallel(h1, h2);
     }
     if op1 & 8 == 0 {
         if op2 == 0 {
@@ -394,7 +400,10 @@ fn register_ops(h1: u32, h2: u32) -> Option<Instr> {
         if op2 & 0xC != 0x8 {
             return None;
         }
-        // SXTAH/UXTAH/SXTAB/UXTAB (and the unsupported *16 forms)
+        // SXTAH/UXTAH/SXTAB/UXTAB; SXTB16/UXTB16 (+A) are op1 2/3.
+        if op1 == 2 || op1 == 3 {
+            return t32_dsp::extend16(h1, h2);
+        }
         let (signed, half) = match op1 {
             0 => (true, true),
             1 => (false, true),
@@ -431,6 +440,7 @@ fn register_ops(h1: u32, h2: u32) -> Option<Instr> {
     }
     let sel = field(h2, 4, 2);
     match (field(h1, 4, 2), sel) {
+        (0b00, s) => t32_dsp::sat_arith(rd, rm, rn, s),
         (0b01, s) if rm == rn && gp(rd) && gp(rm) => Some(match s {
             0 => Instr::Rev {
                 rd,
@@ -464,8 +474,11 @@ fn multiply(h1: u32, h2: u32) -> Option<Instr> {
     let op2 = field(h2, 4, 4);
     let rm = field(h2, 0, 4) as u8;
     if h1 & 0x80 == 0 {
-        // MUL / MLA / MLS (the DSP multiplies are not decoded).
-        if op1 != 0 || !(gp(rd) && gp(rn) && gp(rm)) {
+        // MUL / MLA / MLS; the other op1 values are the DSP multiplies.
+        if op1 != 0 {
+            return t32_dsp::multiply(h1, h2);
+        }
+        if !(gp(rd) && gp(rn) && gp(rm)) {
             return None;
         }
         return match op2 {
@@ -506,7 +519,7 @@ fn multiply(h1: u32, h2: u32) -> Option<Instr> {
         (0b100, 0b0000) => long(LongMulKind::Smlal),
         (0b110, 0b0000) => long(LongMulKind::Umlal),
         (0b110, 0b0110) => long(LongMulKind::Umaal),
-        _ => None,
+        _ => t32_dsp::long_multiply(h1, h2),
     }
 }
 

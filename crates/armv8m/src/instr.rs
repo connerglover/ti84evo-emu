@@ -61,6 +61,36 @@ pub enum RevKind {
     Revsh,
 }
 
+/// Parallel add/subtract flavour (the prefix of `SADD16`, `QADD8`, `UHSAX`, ...).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParKind {
+    /// Signed, modulo, sets APSR.GE.
+    S,
+    /// Signed saturating.
+    Q,
+    /// Signed halving.
+    Sh,
+    /// Unsigned, modulo, sets APSR.GE.
+    U,
+    /// Unsigned saturating.
+    Uq,
+    /// Unsigned halving.
+    Uh,
+}
+
+/// Parallel add/subtract lane arrangement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParOp {
+    Add16,
+    /// `ASX`: low = `Rn.lo - Rm.hi`, high = `Rn.hi + Rm.lo`.
+    Asx,
+    /// `SAX`: low = `Rn.lo + Rm.hi`, high = `Rn.hi - Rm.lo`.
+    Sax,
+    Sub16,
+    Add8,
+    Sub8,
+}
+
 /// Hint instructions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HintOp {
@@ -556,6 +586,102 @@ pub enum Instr {
     /// Coprocessor space (including the FP load/stores); raises NOCP.
     Coprocessor {
         raw: u32,
+    },
+    /// Parallel add/subtract (DSP): `{S,Q,SH,U,UQ,UH}{ADD16,ASX,SAX,SUB16,ADD8,SUB8}`.
+    Parallel {
+        kind: ParKind,
+        op: ParOp,
+        rd: Reg,
+        rn: Reg,
+        rm: Reg,
+    },
+    /// `QADD`/`QSUB`/`QDADD`/`QDSUB rd, rm, rn`: `rm +/- (double ? sat(2 * rn) : rn)`, saturating.
+    SatArith {
+        rd: Reg,
+        rm: Reg,
+        rn: Reg,
+        sub: bool,
+        double: bool,
+    },
+    /// `SMULxy` (`ra == None`) / `SMLAxy`: 16 x 16 multiply; `*_top` selects the top halfword.
+    MulHalf {
+        rd: Reg,
+        rn: Reg,
+        rm: Reg,
+        ra: Option<Reg>,
+        n_top: bool,
+        m_top: bool,
+    },
+    /// `SMULWy` / `SMLAWy`: `(rn * half(rm)) >> 16`, optionally accumulating `ra`.
+    MulWordHalf {
+        rd: Reg,
+        rn: Reg,
+        rm: Reg,
+        ra: Option<Reg>,
+        top: bool,
+    },
+    /// `SMLALxy`: 64-bit accumulate of a 16 x 16 product.
+    MulLongHalf {
+        rdlo: Reg,
+        rdhi: Reg,
+        rn: Reg,
+        rm: Reg,
+        n_top: bool,
+        m_top: bool,
+    },
+    /// `SMUAD`/`SMLAD`/`SMUSD`/`SMLSD` (`x` swaps the halves of `rm`).
+    DualMul {
+        rd: Reg,
+        rn: Reg,
+        rm: Reg,
+        ra: Option<Reg>,
+        sub: bool,
+        x: bool,
+    },
+    /// `SMLALD`/`SMLSLD` (`x` swaps the halves of `rm`).
+    DualMulLong {
+        rdlo: Reg,
+        rdhi: Reg,
+        rn: Reg,
+        rm: Reg,
+        sub: bool,
+        x: bool,
+    },
+    /// `SMMUL`/`SMMLA`/`SMMLS` (+`R` rounding): most-significant-word multiply.
+    MulMsw {
+        rd: Reg,
+        rn: Reg,
+        rm: Reg,
+        ra: Option<Reg>,
+        sub: bool,
+        round: bool,
+    },
+    /// `USAD8` (`ra == None`) / `USADA8`.
+    Usad8 {
+        rd: Reg,
+        rn: Reg,
+        rm: Reg,
+        ra: Option<Reg>,
+    },
+    /// `SSAT16 rd, #bits, rn` (`bits` is 1..=16).
+    Ssat16 {
+        rd: Reg,
+        rn: Reg,
+        bits: u8,
+    },
+    /// `USAT16 rd, #bits, rn` (`bits` is 0..=15).
+    Usat16 {
+        rd: Reg,
+        rn: Reg,
+        bits: u8,
+    },
+    /// `SXTB16`/`UXTB16` (`rn == None`) and `SXTAB16`/`UXTAB16`.
+    Extend16 {
+        rd: Reg,
+        rn: Option<Reg>,
+        rm: Reg,
+        rotate: u8,
+        signed: bool,
     },
     Undefined {
         raw: u32,
