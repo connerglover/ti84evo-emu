@@ -7,21 +7,15 @@ use evo_gui::backend::{EmuBackend, Frame, RunStatus};
 use evo_gui::keypad::KeyId;
 use evo_gui::keypad::geometry::{DPAD_CENTER, KEYPAD_ORIGIN};
 use evo_gui::lcd::{ScaleFilter, lcd_draw_rect};
+use evo_gui::store::Store;
+use evo_gui::toolbar::Tool;
 
 fn data_dir() -> std::path::PathBuf {
     std::env::temp_dir().join("evo-gui-tests-app")
 }
 
 fn harness(fake: FakeBackend, paused: bool) -> Harness<'static, EvoApp> {
-    let opts = AppOptions {
-        start_paused: paused,
-        ..AppOptions::new(data_dir())
-    };
-    Harness::builder()
-        .with_size([520.0, 960.0])
-        .with_pixels_per_point(1.0)
-        .with_step_dt(1.0 / 60.0)
-        .build_eframe(|cc| EvoApp::new(&cc.egui_ctx, Box::new(fake), opts))
+    harness_in(fake, paused, data_dir())
 }
 
 #[test]
@@ -309,4 +303,218 @@ fn running_advances_cycles_and_reports_speed() {
     assert_eq!(probe.cycles() - before, 3 * 2_600_000);
     h.run_steps(60);
     h.get_by_label("Running \u{b7} 100%");
+}
+
+// ---------------------------------------------------------------------------
+// Toolbar, state slots, screenshots, toasts and persistence hooks (Task 7).
+
+/// A fresh, empty data directory for one test.
+fn fresh_dir(test: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("evo-gui-app-{test}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+fn harness_in(
+    fake: FakeBackend,
+    paused: bool,
+    dir: std::path::PathBuf,
+) -> Harness<'static, EvoApp> {
+    let opts = AppOptions {
+        start_paused: paused,
+        ..AppOptions::new(dir)
+    };
+    Harness::builder()
+        .with_size([520.0, 960.0])
+        .with_pixels_per_point(1.0)
+        .with_step_dt(1.0 / 60.0)
+        .build_eframe(|cc| EvoApp::new(&cc.egui_ctx, Box::new(fake), opts))
+}
+
+/// Clicks the widget labeled `label` and lets the click play out.
+fn click(h: &mut Harness<'static, EvoApp>, label: &str) {
+    h.get_by_label(label).click();
+    h.run_steps(3);
+}
+
+/// A test-local `eframe::Storage`.
+#[derive(Default)]
+struct MemStorage(std::collections::HashMap<String, String>);
+
+impl eframe::Storage for MemStorage {
+    fn get_string(&self, key: &str) -> Option<String> {
+        self.0.get(key).cloned()
+    }
+    fn set_string(&mut self, key: &str, value: String) {
+        self.0.insert(key.to_owned(), value);
+    }
+    fn remove_string(&mut self, key: &str) {
+        self.0.remove(key);
+    }
+    fn flush(&mut self) {}
+}
+
+#[test]
+fn toolbar_has_every_tool() {
+    let mut h = harness(FakeBackend::new(), true);
+    h.run_steps(1);
+    for t in Tool::ALL {
+        h.get_by_label(t.tooltip());
+    }
+}
+
+#[test]
+fn reset_button_resets_backend() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness_in(fake, true, fresh_dir("reset"));
+    h.run_steps(1);
+    click(&mut h, "Reset");
+    assert_eq!(probe.resets(), 1);
+    assert_eq!(probe.persists(), 1);
+    // The toolbar button and the toast.
+    assert_eq!(h.query_all_by_label("Reset").count(), 2);
+}
+
+#[test]
+fn save_and_load_via_toolbar() {
+    let dir = fresh_dir("saveload");
+    let store = Store::new(dir.clone());
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness_in(fake, true, dir);
+    h.run_steps(1);
+    click(&mut h, "Save state");
+    assert_eq!(h.query_all_by_label("empty").count(), 4);
+    click(&mut h, "Slot 1");
+    assert!(store.slot_path(1).exists());
+    h.get_by_label("saved");
+    h.get_by_label("Saved slot 1");
+
+    click(&mut h, "Load state");
+    click(&mut h, "Slot 1");
+    h.get_by_label("Loaded slot 1");
+    // Loading persists flash first.
+    assert_eq!(probe.persists(), 1);
+}
+
+#[test]
+fn loading_empty_slot_shows_error_toast() {
+    let mut h = harness_in(FakeBackend::new(), true, fresh_dir("loadempty"));
+    h.run_steps(1);
+    click(&mut h, "Load state");
+    click(&mut h, "Slot 2");
+    h.get_by_label("Load failed: slot 2 is empty");
+}
+
+#[test]
+fn loading_corrupt_slot_shows_error_toast() {
+    let dir = fresh_dir("loadcorrupt");
+    let store = Store::new(dir.clone());
+    let path = store.slot_path(1);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"hello").unwrap();
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness_in(fake, true, dir);
+    h.run_steps(1);
+    let before = probe.cycles();
+    click(&mut h, "Load state");
+    h.get_by_label("saved");
+    click(&mut h, "Slot 1");
+    h.get_by_label_contains("Load failed");
+    assert_eq!(probe.cycles(), before);
+    assert_eq!(probe.resets(), 0);
+}
+
+#[test]
+fn load_while_key_held_releases_keys() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness_in(fake, true, fresh_dir("loadheld"));
+    h.run_steps(1);
+    h.key_down(Key::Enter);
+    h.run_steps(1);
+    assert_eq!(probe.held(), [KeyId::Enter]);
+    click(&mut h, "Save state");
+    click(&mut h, "Slot 1");
+    click(&mut h, "Load state");
+    click(&mut h, "Slot 1");
+    h.get_by_label("Loaded slot 1");
+    assert!(probe.held().is_empty(), "{:?}", probe.held());
+    assert!(!h.state().key_down(KeyId::Enter));
+}
+
+#[test]
+fn save_hook_persists_flash() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness_in(fake, true, fresh_dir("savehook"));
+    h.run_steps(1);
+    eframe::App::save(h.state_mut(), &mut MemStorage::default());
+    assert_eq!(probe.persists(), 1);
+}
+
+#[test]
+fn smooth_toggle_flips_filter() {
+    let mut h = harness(FakeBackend::new(), true);
+    h.run_steps(1);
+    assert_eq!(h.state().filter(), ScaleFilter::Nearest);
+    click(&mut h, "Smooth scaling (better at non-integer sizes)");
+    assert_eq!(h.state().filter(), ScaleFilter::Smooth);
+    click(&mut h, "Smooth scaling (better at non-integer sizes)");
+    assert_eq!(h.state().filter(), ScaleFilter::Nearest);
+}
+
+#[test]
+fn debug_toggle_flips_debug_open() {
+    let mut h = harness(FakeBackend::new(), true);
+    h.run_steps(1);
+    click(&mut h, "Debug panels");
+    assert!(h.state().debug_open());
+    click(&mut h, "Debug panels");
+    assert!(!h.state().debug_open());
+}
+
+#[test]
+fn screenshot_button_writes_png() {
+    let dir = fresh_dir("screenshot");
+    let mut h = harness_in(FakeBackend::new(), true, dir.clone());
+    h.run_steps(1);
+    click(&mut h, "Screenshot");
+    let shots: Vec<_> = std::fs::read_dir(dir.join("screenshots"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(shots.len(), 1, "{shots:?}");
+    h.get_by_label_contains("Screenshot saved to");
+}
+
+#[test]
+fn screenshot_without_display_shows_error_toast() {
+    let mut h = harness_in(FakeBackend::without_display(), true, fresh_dir("noshot"));
+    h.run_steps(1);
+    click(&mut h, "Screenshot");
+    h.get_by_label("Screenshot failed: no display frame to capture");
+}
+
+#[test]
+fn toasts_expire() {
+    let mut h = harness_in(FakeBackend::new(), true, fresh_dir("expire"));
+    h.run_steps(1);
+    click(&mut h, "Reset");
+    assert_eq!(h.query_all_by_label("Reset").count(), 2);
+    // 4 s at 60 frames per second, plus slack.
+    h.run_steps(260);
+    assert_eq!(h.query_all_by_label("Reset").count(), 1);
+}
+
+#[test]
+fn about_window_shows_disclaimer() {
+    let mut h = harness(FakeBackend::new(), true);
+    h.run_steps(1);
+    click(&mut h, "About");
+    h.get_by_label_contains("Not affiliated with Texas Instruments");
+    h.get_by_label("You must supply your own OS bundle.");
+    h.get_by_label_contains(env!("CARGO_PKG_VERSION"));
 }

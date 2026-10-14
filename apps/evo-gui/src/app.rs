@@ -1,12 +1,13 @@
-//! The application shell: header, calculator view, run loop and keypad input,
-//! and (later) toolbar and debug panels.
+//! The application shell: header, toolbar, calculator view, run loop and
+//! keypad input, and (later) debug panels.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use egui::{
-    Align, Frame, Id, Layout, Margin, Pos2, Response, RichText, Sense, WidgetInfo, WidgetType,
+    Align, Frame, Id, Layout, Margin, Pos2, Rect, Response, RichText, Sense, WidgetInfo,
+    WidgetType, pos2,
 };
 
 use crate::backend::{CLOCK_HZ, EmuBackend, RunStatus};
@@ -18,7 +19,13 @@ use crate::keypad::paint::{body_rect_to_screen, keypad_rect_to_screen, paint_bod
 use crate::keypad::{KEYS, KeyId, KeyShape, key_def};
 use crate::lcd::{LcdView, ScaleFilter};
 use crate::pacer::{FrameRunner, Pacer, SpeedMeter, WALL_BUDGET};
+use crate::store::{Store, StoreError};
 use crate::theme::{APP_BG, HEADER_BG, LABEL_DARK, install_fonts};
+use crate::toast::{ToastKind, Toasts};
+use crate::toolbar::{
+    PickerMode, TOOLBAR_W, Tool, about_window, drawable_icons, slot_picker, toolbar_buttons,
+    toolbar_frame,
+};
 
 /// The window and header title.
 pub const TITLE: &str = "TI-84 Evo Emulator";
@@ -115,6 +122,16 @@ pub struct EvoApp {
     lcd: LcdView,
     filter: ScaleFilter,
     transform: CalcTransform,
+    store: Store,
+    toasts: Toasts,
+    /// Per tool, whether its icon is drawable; filled on the first frame,
+    /// once the fonts are loaded.
+    icons: Option<[bool; 8]>,
+    /// The open slot picker and where it sits.
+    picker: Option<(PickerMode, Pos2)>,
+    about_open: bool,
+    /// The toolbar panel as laid out in the last frame.
+    toolbar_rect: Rect,
 }
 
 impl EvoApp {
@@ -124,6 +141,12 @@ impl EvoApp {
         cc_ctx.set_theme(egui::ThemePreference::Light);
         Self {
             backend,
+            store: Store::new(opts.data_dir.clone()),
+            toasts: Toasts::new(),
+            icons: None,
+            picker: None,
+            about_open: false,
+            toolbar_rect: Rect::NOTHING,
             data_dir: opts.data_dir,
             paused: opts.start_paused,
             debug_open: false,
@@ -181,6 +204,145 @@ impl EvoApp {
     /// The calculator transform as laid out in the last frame.
     pub fn calc_transform(&self) -> CalcTransform {
         self.transform
+    }
+
+    /// How the LCD frame is scaled.
+    pub fn filter(&self) -> ScaleFilter {
+        self.filter
+    }
+
+    /// Writes flash to disk; a failure becomes a toast.
+    fn persist(&mut self) {
+        if let Err(e) = self.backend.persist() {
+            self.toasts
+                .push(format!("Flash not saved: {e}"), ToastKind::Error);
+        }
+    }
+
+    /// Brings the GUI back in line with a machine that was reset or loaded:
+    /// drops keys restored as held and releases pending on the old timeline.
+    fn resync(&mut self) {
+        self.latch.clear();
+        for id in KeyId::ALL {
+            self.backend.set_key(id, false);
+        }
+        self.status = RunStatus::Running;
+        self.speed.reset();
+    }
+
+    fn reset_machine(&mut self) {
+        self.persist();
+        self.backend.reset();
+        self.resync();
+        self.toasts.push("Reset", ToastKind::Info);
+    }
+
+    fn save_slot(&mut self, n: u8) {
+        match self.store.save_slot(n, self.backend.as_ref()) {
+            Ok(_) => self.toasts.push(format!("Saved slot {n}"), ToastKind::Info),
+            Err(e) => self
+                .toasts
+                .push(format!("Save failed: {e}"), ToastKind::Error),
+        }
+    }
+
+    fn load_slot(&mut self, n: u8) {
+        self.persist();
+        match self.store.load_slot(n, self.backend.as_mut()) {
+            Ok(()) => {
+                self.resync();
+                self.toasts
+                    .push(format!("Loaded slot {n}"), ToastKind::Info);
+            }
+            Err(e) => self
+                .toasts
+                .push(format!("Load failed: {e}"), ToastKind::Error),
+        }
+    }
+
+    fn screenshot(&mut self) {
+        let unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let result = match self.backend.framebuffer() {
+            Some(frame) => self.store.screenshot(frame, unix_ms),
+            None => Err(StoreError::NoFrame),
+        };
+        match result {
+            Ok(path) => self.toasts.push(
+                format!("Screenshot saved to {}", path.display()),
+                ToastKind::Info,
+            ),
+            Err(e) => self
+                .toasts
+                .push(format!("Screenshot failed: {e}"), ToastKind::Error),
+        }
+    }
+
+    /// Opens the slot picker in `mode` beside `button`, or closes it when it
+    /// is already open in that mode.
+    fn toggle_picker(&mut self, mode: PickerMode, button: Rect) {
+        self.picker = match self.picker {
+            Some((open, _)) if open == mode => None,
+            _ => Some((mode, pos2(self.toolbar_rect.right(), button.top()))),
+        };
+    }
+
+    fn apply_tool(&mut self, tool: Tool, button: Rect) {
+        match tool {
+            Tool::Screenshot => self.screenshot(),
+            Tool::SaveState => self.toggle_picker(PickerMode::Save, button),
+            Tool::LoadState => self.toggle_picker(PickerMode::Load, button),
+            Tool::Reset => self.reset_machine(),
+            Tool::Smooth => {
+                self.filter = match self.filter {
+                    ScaleFilter::Nearest => ScaleFilter::Smooth,
+                    ScaleFilter::Smooth => ScaleFilter::Nearest,
+                };
+            }
+            Tool::Debug => self.debug_open = !self.debug_open,
+            // Task 9 opens the keyboard-mapping window here.
+            Tool::Keymap => {}
+            Tool::About => self.about_open = !self.about_open,
+        }
+    }
+
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
+        self.toolbar_rect = ui.max_rect();
+        let icons = *self.icons.get_or_insert_with(|| drawable_icons(ui.ctx()));
+        let (filter, debug_open) = (self.filter, self.debug_open);
+        let out = toolbar_buttons(ui, &icons, |t| match t {
+            Tool::Smooth => filter == ScaleFilter::Smooth,
+            Tool::Debug => debug_open,
+            _ => false,
+        });
+        if let (Some(tool), Some(rect)) = (out.clicked, out.clicked_rect) {
+            self.apply_tool(tool, rect);
+        }
+    }
+
+    /// The slot picker, About window and toasts, over everything else.
+    fn overlays(&mut self, ctx: &egui::Context) {
+        if let Some((mode, pos)) = self.picker {
+            let store = &self.store;
+            let out = slot_picker(ctx, pos, mode, |n| store.has_slot(n));
+            if let Some(n) = out.picked {
+                match mode {
+                    PickerMode::Save => self.save_slot(n),
+                    PickerMode::Load => self.load_slot(n),
+                }
+            } else if out.clicked_elsewhere {
+                // A click on the toolbar is handled by the tool itself.
+                let on_toolbar = ctx
+                    .input(|i| i.pointer.interact_pos())
+                    .is_some_and(|p| self.toolbar_rect.contains(p));
+                if !on_toolbar {
+                    self.picker = None;
+                }
+            }
+        }
+        about_window(ctx, &mut self.about_open);
+        self.toasts.show(ctx);
     }
 
     /// Sends the latch's pending edges to the backend.
@@ -412,8 +574,20 @@ impl eframe::App for EvoApp {
                     .inner_margin(Margin::symmetric(12, 0)),
             )
             .show(ui, |ui| self.header(ui));
+        egui::Panel::left("toolbar")
+            .exact_size(TOOLBAR_W)
+            .resizable(false)
+            .frame(toolbar_frame())
+            .show(ui, |ui| self.toolbar(ui));
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(APP_BG).inner_margin(CENTRAL_MARGIN))
             .show(ui, |ui| self.calculator(ui));
+        let ctx = ui.ctx().clone();
+        self.overlays(&ctx);
+    }
+
+    /// Called on shutdown and periodically: writes flash to disk.
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.persist();
     }
 }

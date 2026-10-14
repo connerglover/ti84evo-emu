@@ -50,6 +50,10 @@ pub const KEY_SHADOW_OFFSET: egui::Vec2 = egui::vec2(0.0, 2.0);
 pub const HEADER_BG: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
 /// Toolbar background.
 pub const TOOLBAR_BG: Color32 = Color32::from_rgb(0xF5, 0xF9, 0xFD);
+/// Background of an info toast.
+pub const TOAST_BG: Color32 = Color32::from_rgb(0x2E, 0x36, 0x40);
+/// Background of an error toast.
+pub const TOAST_ERROR_BG: Color32 = Color32::from_rgb(0xB3, 0x26, 0x1E);
 /// LCD fill when there is no frame.
 pub const NO_SIGNAL_BG: Color32 = Color32::from_rgb(0x1E, 0x23, 0x29);
 /// Per-channel factor applied to a key's fill while it is pressed.
@@ -115,4 +119,30 @@ pub fn install_fonts(ctx: &egui::Context) {
         ]
         .into();
     });
+}
+
+/// Whether every char of `s` is drawn from a real glyph of `font`, not the
+/// replacement glyph. Call it once the fonts are loaded, i.e. during or after
+/// the first pass after [`install_fonts`].
+///
+/// egui 0.36.2's `has_glyphs` reports `false` for every char of the face that
+/// also holds the replacement glyph `◻` (its own TODO in `Font::has_glyph`):
+/// with the default fonts that is Hack for `Monospace`, so even `?` "is
+/// missing". A char `has_glyphs` rejects therefore counts as present when it
+/// lays out to a different atlas glyph than `◻` does.
+pub fn has_glyphs(ctx: &egui::Context, font: &FontId, s: &str) -> bool {
+    ctx.fonts_mut(|f| {
+        if f.has_glyphs(font, s) {
+            return true;
+        }
+        let mut uv = |c: char| {
+            let g = f.layout_no_wrap(c.to_string(), font.clone(), Color32::WHITE);
+            g.rows
+                .first()
+                .and_then(|r| r.row.glyphs.first())
+                .map(|g| g.uv_rect)
+        };
+        let replacement = uv('\u{25FB}');
+        s.chars().all(|c| uv(c) != replacement)
+    })
 }

@@ -8,4 +8,7 @@ pub mod input;
 pub mod keypad;
 pub mod lcd;
 pub mod pacer;
+pub mod store;
 pub mod theme;
+pub mod toast;
+pub mod toolbar;

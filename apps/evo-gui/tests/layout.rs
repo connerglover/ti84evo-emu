@@ -4,7 +4,7 @@ use evo_gui::keypad::geometry::{
     dpad_bounds, hit_test,
 };
 use evo_gui::keypad::{Dir, KEYS, KeyId, KeyShape, KeyStyle, key_def};
-use evo_gui::theme::install_fonts;
+use evo_gui::theme::{has_glyphs, install_fonts};
 
 fn legends(id: KeyId) -> (Option<&'static str>, Option<&'static str>) {
     let k = key_def(id);
@@ -285,27 +285,6 @@ fn font_ctx(install: bool) -> egui::Context {
     // egui 0.36 asserts (debug) that texture deltas are consumed before drop.
     out.textures_delta.clear();
     ctx
-}
-
-/// Whether every char of `s` is drawn from a real glyph, not the replacement.
-///
-/// egui 0.36.2's `has_glyphs` reports `false` for every char of the face that
-/// also holds the replacement glyph `◻` (its own TODO in `Font::has_glyph`):
-/// with the default fonts that is Hack for `Monospace`, so even `?` "is
-/// missing". A char `has_glyphs` rejects therefore counts as present when it
-/// lays out to a different atlas glyph than `◻` does.
-fn has_glyphs(ctx: &egui::Context, font: &FontId, s: &str) -> bool {
-    ctx.fonts_mut(|f| {
-        if f.has_glyphs(font, s) {
-            return true;
-        }
-        let mut uv = |c: char| {
-            let g = f.layout_no_wrap(c.to_string(), font.clone(), egui::Color32::WHITE);
-            g.rows[0].row.glyphs[0].uv_rect
-        };
-        let replacement = uv('\u{25FB}');
-        s.chars().all(|c| uv(c) != replacement)
-    })
 }
 
 #[test]
