@@ -8,6 +8,7 @@ license.workspace = true
 armv8m = { path = "../armv8m" }
 evo-hw = { path = "../evo-hw" }
 evo-image = { path = "../evo-image" }
+gdbstub = "0.7.10"
 log.workspace = true
 serde.workspace = true
 
