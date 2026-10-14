@@ -94,7 +94,7 @@ fn bank(num: u16, sec: Sec) -> Sec {
 impl Cpu {
     /// True while the processor is in the lockup state (see `StepResult::Lockup`).
     pub fn locked_up(&self) -> bool {
-        self.lockup
+        self.lockup.is_some()
     }
 
     // ---- Exception state ----
@@ -202,7 +202,10 @@ impl Cpu {
                 };
             }
             4..=15 => self.scs.scb.shpr.get(bank(num, sec))[usize::from(num - 4)],
-            _ => self.scs.nvic.priority[usize::from(num - 16)],
+            _ => {
+                let irq = usize::from(num.saturating_sub(16));
+                self.scs.nvic.priority.get(irq).copied().unwrap_or(0)
+            }
         };
         self.group_priority(raw, sec, group)
     }
@@ -363,12 +366,33 @@ impl Cpu {
         true
     }
 
-    /// Enter the lockup state: execution stops until reset or an exception that can preempt
-    /// the current execution priority (NMI from priority -1).
-    pub(crate) fn enter_lockup(&mut self) {
-        log::warn!("lockup (pc {:#010x})", self.regs.pc);
-        self.lockup = true;
+    /// Enter the lockup state. It is held at the current execution priority (at most -1), or
+    /// at the priority of `entering` if that is the exception whose entry failed (an NMI whose
+    /// vector or stacking failed locks up at -2). Execution stops, and nothing is stacked, until
+    /// reset or a pending exception of strictly higher priority than that (NMI from -1).
+    pub(crate) fn enter_lockup(&mut self, entering: Option<(u16, Sec)>) {
+        let mut priority = self.execution_priority().min(-1);
+        if let Some((num, sec)) = entering {
+            priority = priority.min(self.exception_priority(num, sec, true));
+        }
+        log::warn!("lockup at priority {priority} (pc {:#010x})", self.regs.pc);
+        self.lockup = Some(priority);
         self.regs.pc = LOCKUP_PC;
+    }
+
+    /// While locked up: leave lockup if a pending exception outranks the lockup priority.
+    /// Returns true if still locked up.
+    pub(crate) fn stay_locked_up(&mut self) -> bool {
+        let Some(priority) = self.lockup else {
+            return false;
+        };
+        match self.highest_pending() {
+            Some((num, sec)) if self.exception_priority(num, sec, true) < priority => {
+                self.lockup = None;
+                false
+            }
+            _ => true,
+        }
     }
 
     // ---- Entry ----
@@ -392,7 +416,7 @@ impl Cpu {
             // is taken instead and the original stays pending.
             Some(fault) => {
                 if !self.raise_fault(fault) {
-                    self.enter_lockup();
+                    self.enter_lockup(Some((num, sec)));
                     return;
                 }
                 self.preemptable_pending().unwrap_or((num, sec))
@@ -440,7 +464,10 @@ impl Cpu {
                 privileged: self.is_privileged(),
             };
             for (i, &w) in words.iter().enumerate() {
-                if bus.write32(frame + 4 * i as u32, w, acc).is_err() {
+                if bus
+                    .write32(frame.wrapping_add(4 * i as u32), w, acc)
+                    .is_err()
+                {
                     derived.get_or_insert(Fault::StkErr);
                 }
             }
@@ -488,7 +515,7 @@ impl Cpu {
                 if num == HARDFAULT
                     || self.exception_priority(HARDFAULT, sec, true) >= self.execution_priority()
                 {
-                    self.enter_lockup();
+                    self.enter_lockup(Some((num, sec)));
                 } else {
                     self.exception_taken(bus, HARDFAULT, sec);
                 }
@@ -507,6 +534,8 @@ impl Cpu {
         self.set_exc_pending(num, sec, false);
         self.set_exc_active(num, sec, true);
         self.exclusive = None;
+        // SetEventRegister().
+        self.event = true;
     }
 
     // ---- Return ----
@@ -550,6 +579,8 @@ impl Cpu {
             self.pend_irq(usize::from(num - 16));
         }
         self.exclusive = None;
+        // SetEventRegister().
+        self.event = true;
 
         // Tail-chain: a pending exception that preempts the context being returned to is
         // taken without unstacking and restacking; LR keeps describing the frame.
@@ -609,7 +640,7 @@ impl Cpu {
     /// tail-chain, with LR keeping the EXC_RETURN value.
     fn return_fault(&mut self, bus: &mut impl Bus, exc_return: u32, fault: Fault) -> ReturnOutcome {
         if !self.raise_fault(fault) {
-            self.enter_lockup();
+            self.enter_lockup(None);
             return ReturnOutcome::Lockup;
         }
         if let Some((n, s)) = self.preemptable_pending() {
@@ -620,7 +651,7 @@ impl Cpu {
     }
 
     fn entry_outcome(&self) -> ReturnOutcome {
-        if self.lockup {
+        if self.lockup.is_some() {
             ReturnOutcome::Lockup
         } else {
             ReturnOutcome::Done

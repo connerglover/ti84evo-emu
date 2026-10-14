@@ -993,3 +993,101 @@ fn reset_uses_vtor_set_by_host() {
     assert_eq!(cpu.regs.pc, 0x400);
     assert_eq!(cpu.ppb_read32(VTOR), 0x1000);
 }
+
+// ---- Review fix round 1 ----
+
+#[test]
+fn lockup_on_vector_read_failure_is_stable() {
+    let (mut cpu, mut bus) = cpu_with_code(&[UDF0]);
+    cpu.ppb_write32(VTOR, 0x3000_0000);
+    assert_eq!(cpu.step(&mut bus), StepResult::Lockup);
+    assert_ne!(cpu.ppb_read32(HFSR) & (1 << 1), 0, "VECTTBL");
+    let sp = cpu.regs.sp();
+    let ram = bus.ram.clone();
+    for _ in 0..4 {
+        assert_eq!(cpu.step(&mut bus), StepResult::Lockup);
+        assert_eq!(cpu.regs.sp(), sp, "no stacking while locked up");
+        assert!(bus.ram == ram, "memory unchanged while locked up");
+    }
+}
+
+#[test]
+fn lockup_on_nmi_stacking_failure_in_hardfault_is_stable() {
+    // A stacking fault during NMI entry from HardFault locks up at NMI priority (-2), so the
+    // still-pending NMI cannot leave lockup.
+    let (mut cpu, mut bus) = cpu_with_code(&[UDF0]);
+    handler(&mut bus, 3, 0x200, &[B_SELF]);
+    handler(&mut bus, 2, 0x300, &[B_SELF]);
+    executed(cpu.step(&mut bus));
+    assert_eq!(ipsr(&cpu), 3);
+    cpu.regs.msp.s = 0x3000_0000;
+    cpu.ppb_write32(ICSR, 1 << 31);
+    assert_eq!(cpu.step(&mut bus), StepResult::Lockup);
+    let ram = bus.ram.clone();
+    for _ in 0..4 {
+        assert_eq!(cpu.step(&mut bus), StepResult::Lockup);
+        assert_eq!(cpu.regs.msp.s, 0x3000_0000 - 0x20);
+        assert!(bus.ram == ram);
+    }
+}
+
+#[test]
+fn exception_return_sets_event_register() {
+    // svc 0 ; wfe ; b .   with the SVC handler returning immediately.
+    let (mut cpu, mut bus) = cpu_with_code(&[SVC0, 0xBF20, B_SELF]);
+    handler(&mut bus, 11, 0x200, &[BX_LR]);
+    executed(cpu.step(&mut bus));
+    cpu.event = false;
+    executed(cpu.step(&mut bus));
+    assert!(cpu.event, "exception return sets the event register");
+    // WFE consumes the event and falls through.
+    executed(cpu.step(&mut bus));
+    assert_eq!(cpu.regs.pc, 0x104);
+    assert!(!cpu.event);
+
+    // Exception entry sets it too.
+    let (mut cpu, mut bus) = cpu_with_code(&[SVC0]);
+    handler(&mut bus, 11, 0x200, &[B_SELF]);
+    executed(cpu.step(&mut bus));
+    assert!(cpu.event);
+}
+
+#[test]
+fn stacking_below_address_zero_does_not_panic() {
+    // msr MSP, r0 (r0 = 0x10) ; svc 0: the frame wraps around the top of the address space.
+    let (mut cpu, mut bus) = cpu_with_code(&[0xF380, 0x8808, SVC0]);
+    cpu.regs.r[0] = 0x10;
+    executed(cpu.step(&mut bus));
+    let r = cpu.step(&mut bus);
+    assert!(
+        matches!(r, StepResult::Executed { .. } | StepResult::Lockup),
+        "{r:?}"
+    );
+    assert_ne!(cpu.ppb_read32(CFSR) & STKERR, 0);
+}
+
+#[test]
+fn corrupt_stacked_ipsr_is_invpc_not_a_panic() {
+    // SVC handler: nop ; bx lr. NMI preempts it; its frame's stacked IPSR is corrupted to 0x1FF,
+    // which the NMI return restores (Handler mode, nonzero). The SVC handler's own return then
+    // finds exception 511 not active: INVPC.
+    let (mut cpu, mut bus) = cpu_with_code(&[SVC0, NOP]);
+    handler(&mut bus, 11, 0x200, &[NOP, BX_LR]);
+    handler(&mut bus, 2, 0x300, &[BX_LR]);
+    handler(&mut bus, 3, 0x400, &[B_SELF]);
+    executed(cpu.step(&mut bus));
+    assert_eq!(ipsr(&cpu), 11);
+    cpu.ppb_write32(ICSR, 1 << 31);
+    executed(cpu.step(&mut bus));
+    assert_eq!(ipsr(&cpu), 2);
+    let psr = cpu.regs.sp() + 0x1C;
+    let o = (psr - RAM_BASE) as usize;
+    let v = ram(&bus, psr) | 0x1FF;
+    bus.ram[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    executed(cpu.step(&mut bus));
+    assert_eq!((ipsr(&cpu), cpu.regs.pc), (0x1FF, 0x200));
+    executed(cpu.step(&mut bus));
+    executed(cpu.step(&mut bus));
+    assert_eq!(ipsr(&cpu), 3);
+    assert_eq!(cpu.ppb_read32(CFSR), INVPC);
+}

@@ -39,17 +39,23 @@ fn bit(irq: usize) -> (usize, u32) {
     (irq / 32, 1 << (irq % 32))
 }
 
+/// Out-of-range IRQ numbers (an IPSR of 496..=511 restored from a stacked xPSR, for instance)
+/// read as clear.
 fn get(words: &[u32; WORDS], irq: usize) -> bool {
     let (w, b) = bit(irq);
-    words[w] & b != 0
+    words.get(w).is_some_and(|&word| word & b != 0)
 }
 
+/// Writes to out-of-range IRQ numbers are ignored.
 fn put(words: &mut [u32; WORDS], irq: usize, v: bool) {
     let (w, b) = bit(irq);
+    let Some(word) = words.get_mut(w) else {
+        return;
+    };
     if v {
-        words[w] |= b;
+        *word |= b;
     } else {
-        words[w] &= !b;
+        *word &= !b;
     }
 }
 

@@ -31,8 +31,8 @@ pub struct Cpu {
     pub exclusive: Option<u32>,
     /// System Control Space (NVIC, SCB, SysTick, MPU).
     pub scs: Scs,
-    /// Lockup state (see `locked_up`).
-    pub(crate) lockup: bool,
+    /// While locked up: the priority the lockup is held at (see `locked_up`).
+    pub(crate) lockup: Option<i32>,
 }
 
 impl Default for Cpu {
@@ -92,7 +92,7 @@ impl Cpu {
             event: false,
             exclusive: None,
             scs: Scs::default(),
-            lockup: false,
+            lockup: None,
         }
     }
 
@@ -203,12 +203,8 @@ impl Cpu {
     /// Take a pending exception that preempts the current execution priority, else execute one
     /// instruction (and take any exception it caused or that became pending meanwhile).
     pub fn step(&mut self, bus: &mut impl Bus) -> StepResult {
-        if self.lockup {
-            // Only an exception that preempts the locked-up priority (NMI) leaves lockup.
-            if self.preemptable_pending().is_none() {
-                return StepResult::Lockup;
-            }
-            self.lockup = false;
+        if self.stay_locked_up() {
+            return StepResult::Lockup;
         }
         // Asynchronous exceptions that became pending between steps.
         if self.take_pending(bus) {
@@ -232,7 +228,7 @@ impl Cpu {
     }
 
     fn entry_result(&self, cycles: u32) -> StepResult {
-        if self.lockup {
+        if self.lockup.is_some() {
             StepResult::Lockup
         } else {
             StepResult::Executed { cycles }
@@ -247,7 +243,7 @@ impl Cpu {
                 sleep: false,
             }
         } else {
-            self.enter_lockup();
+            self.enter_lockup(None);
             Exec::Lockup
         }
     }
@@ -308,7 +304,7 @@ impl Cpu {
         match flow {
             Flow::Svc(_) => {
                 if !self.raise_sync(SVCALL, self.regs.sec) {
-                    self.enter_lockup();
+                    self.enter_lockup(None);
                     return Exec::Lockup;
                 }
             }
