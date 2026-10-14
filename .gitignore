@@ -2,3 +2,6 @@
 *.flash
 *.state
 /tools/testprogs/build
+apps/evo-gui/tests/snapshots/*.new.png
+apps/evo-gui/tests/snapshots/*.diff.png
+apps/evo-gui/tests/snapshots/*.old.png

@@ -47,6 +47,22 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
       - run: cargo test --workspace
 
+  gui-snapshots:
+    # Golden images of the GUI on the fake backend. kittest prefers a CPU
+    # wgpu adapter, which is WARP on Windows.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98"
+      - run: cargo test -p evo-gui --features snapshots --test snapshots
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-snapshot-diffs
+          path: apps/evo-gui/tests/snapshots/*.png
+
   testprogs:
     # The committed test program images (tools/testprogs/out) must match their sources.
     runs-on: ubuntu-latest

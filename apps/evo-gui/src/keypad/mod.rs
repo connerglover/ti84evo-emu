@@ -1,6 +1,7 @@
 //! Calculator keys and the keypad layout table.
 
 pub mod geometry;
+pub mod paint;
 
 use serde::{Deserialize, Serialize};
 
