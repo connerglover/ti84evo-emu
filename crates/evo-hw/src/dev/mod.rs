@@ -6,6 +6,7 @@ pub mod gpio;
 pub mod keypad;
 pub mod lcdc;
 pub mod mpc;
+pub mod rtc;
 pub mod spi;
 pub mod spif;
 pub mod storage;

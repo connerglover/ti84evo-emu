@@ -6,6 +6,7 @@ use crate::dev::gpio::Gpio;
 use crate::dev::keypad::Keypad;
 use crate::dev::lcdc::{Lcdc, Pwm};
 use crate::dev::mpc::Mpc;
+use crate::dev::rtc::Rtc;
 use crate::dev::spi::{DEFAULT_PANEL_ID, Spi, St7789};
 use crate::dev::spif::Spif;
 use crate::dev::storage::Storage;
@@ -68,4 +69,7 @@ pub fn attach(map: &mut MemoryMap) {
     map.add_device("pwm", 0x4010_4000, 0x1000, Box::new(Pwm::new()));
     // Keypad scanner (keypad.md): IRQ 13 for the matrix; the ON key pulses IRQ 0.
     map.add_device("keypad", 0x4010_3000, 0x1000, Box::new(Keypad::new()));
+    // RTC (rtc.md): time of day from the cycle count, IRQ 15; always-on, so it keeps its
+    // state across a System reset. NS BSP only.
+    map.add_device("rtc", 0x4010_2000, 0x1000, Box::new(Rtc::new()));
 }

@@ -1,6 +1,7 @@
 # RTC at 0x4010_2000 (IRQ 15)
 
-Status: identity and the accesses seen; no full register map yet. The model is a first cut.
+Status: identity and the accesses seen; no full register map yet. The model is a first cut,
+implemented by `evo_hw::dev::rtc::Rtc`.
 
 ## Identity
 
@@ -25,7 +26,7 @@ Evidence:
   +0x20 with 0x80, 0x01 and 0x20 (control), and reads +0x44 (time: seconds [5:0],
   minutes [11:6], hours [16:12]).
 - **Busy flags in +0x40.** Bit 3 is polled at 0x1542B0 and bit 8 at 0x1543E4, each with
-  `wait_until(…, 1100 ms)` (`timer.md`). Which level means "busy" is not known.
+  `wait_until(…, 1100 ms)` (`timer.md`). Busy is the bit set (see "Busy polarity").
 - **Accesses seen before the BSP idles:** +0x40 read, +0x20 RMW (0x80, then 1). These happen
   after the NS hand-off (`boot-flow.md` §3.2); six accesses in the research run.
 
@@ -36,22 +37,42 @@ Evidence:
 | +0x10 / +0x14 / +0x18 | ALARM fields | W | stored |
 | +0x20 | CTRL | RMW | bits 0x80, 0x01, 0x20 set by the BSP; stored |
 | +0x34 | STATUS | R, W1C | bits 0-5 dispatched by the IRQ 15 handler |
-| +0x40 | BUSY / SYNC | R (polled) | bit 3 and bit 8 polled; polarity open |
+| +0x40 | BUSY / SYNC | R (polled) | bit 3 and bit 8 polled; set = busy |
 | +0x44 | TIME | R (and W when setting the clock) | `sec [5:0] \| min [11:6] \| hour [16:12]` |
 
 ## Model (first cut)
 
 - +0x10/+0x14/+0x18 and +0x20: storage.
 - +0x34: W1C, bits 0-5; nothing sets them yet.
-- +0x40: reads a constant busy value (0 until the polarity is confirmed).
+- +0x40: reads the constant `RTC_BUSY` = 0 (never busy).
 - +0x44: the time of day computed from the cycle count (`CPU_HZ`), starting at 00:00:00 at
   power-on (the machine is deterministic: no host clock). A write decodes the same fields
   and restarts the count from them.
-- IRQ 15 (level) = `status & 0x3F != 0`.
-- The RTC is an always-on block: it keeps its state across a System reset.
+- IRQ 15 (level) = `status & 0x3F != 0`. Only the host hook `Rtc::raise_status` sets status bits.
+- Every register is a 32-bit aligned access; other widths and unmodelled offsets read 0 and
+  are logged as unhandled.
+- The RTC is an always-on block: it keeps its state across a System reset and drives IRQ 15
+  again from the kept status. A PowerOn reset returns to 00:00:00 counted from the reset.
+
+## Busy polarity (decided)
+
+Both predicates return `1 ^ bit`: 0x1542B0 tests bit 3, 0x1543E4 tests bit 8:
+
+```
+ldr   r0, [r0, #64]
+movs  r1, #1
+and.w r0, r0, #8
+eor.w r0, r1, r0, lsr #3
+bx    lr
+```
+
+With +0x40 = 0 each predicate runs once in a boot to the BSP idle loop and its
+`wait_until` exits at the first poll, so a set bit means "busy" and `RTC_BUSY` = 0 stays.
+The six RTC accesses the BSP makes are all modelled; none reaches the unmapped log.
 
 ## Open questions
 
 1. The full register map (date, alarm match, interrupt enables).
-2. The polarity of the +0x40 busy bits 3 and 8.
-3. Which status bit is the alarm and which the periodic tick.
+2. Which status bit is the alarm and which the periodic tick.
+3. Whether the alarm fields, CTRL or STATUS widths are narrower than 32 bits (all stored
+   whole for now).

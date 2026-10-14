@@ -265,7 +265,8 @@ previous boot.
    2. The keypad (`keypad.md`) and GPIO pin 9/11 interrupts (`gpio.md`).
    3. The ON key and keypad presses.
    4. USB-C attach (IRQ 28, 0x4010_C000; `usb.md`), only after the above are refuted.
-   5. RTC busy/status bits (`rtc.md`), if a trace shows the BSP polling them.
+   5. RTC busy/status bits (`rtc.md`): refuted for the busy bits. Both +0x40 polls exit at
+      the first read with +0x40 = 0; the status bits stay open.
    The next step in any case: trace the RTOS ready list or the "LAUNCH" object 0x2001_02B8
    to see what the thread waits on.
 9. Later: image 1 runs through the BSP service table (0x2009_B100), so NS OS hardware needs
