@@ -621,8 +621,10 @@ clocking or QSPI drive.
 ## Open questions
 
 1. **Real MPC geometry** (BLK_CFG/BLK_MAX). The firmware is agnostic: any block ≤ 64 KiB
-   with a matching BLK_MAX works. 4 KiB / 3 / 127 is recommended. A dump from real
-   hardware would settle it.
+   with a matching BLK_MAX works. **Decided (emulator):** `evo_hw::dev::mpc::Mpc` reports
+   BLK_CFG = 7 (4 KiB blocks) on every instance, BLK_MAX = 3 on the three SRAM MPCs and
+   127 on the flash MPC (§1 "Geometry to report"). A dump from real hardware would still
+   settle the silicon value; nothing in the firmware can observe the difference.
 2. **PPC position → peripheral map** for PPC#0/#1/#2: which peripherals are PPC#1 pos 10
    and PPC#0 pos 1 (left Secure)? Needed only if PPC enforcement is ever modelled.
 3. **CRU +0x08 vs +0x60:** which is the wake cause and which the reset cause, and which bit
@@ -637,6 +639,8 @@ clocking or QSPI drive.
 7. **PPB 0xE004_3018 bit 1**: unknown vendor register.
 8. **Does `SYSRESETREQ` reset the CRU/SPCTRL/MPCs on silicon?** The firmware works either
    way, but `+0x04`/`+0x1C` (the PLL state left by BL2) would matter if they reset to 0.
+   **Decided for the MPCs (emulator):** a System reset keeps CTRL (lock-down included),
+   BLK_IDX, the LUT and INT_EN; only a PowerOn reset clears them. CRU/SPCTRL stay open.
 9. **QSPI drive strength.** The PSA service types 14/15 ("QSPI Drive Settings") reach a
    handler path at 0x100baf1c/0x100bb0b0 whose target block is not identified. It is not
    0x5020_2B00 (§6).

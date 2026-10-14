@@ -1,5 +1,6 @@
-//! TI-84 Evo hardware models: the memory map, the device runtime and (later) peripherals.
+//! TI-84 Evo hardware models: the memory map, the device runtime and the SoC peripherals.
 
+pub mod dev;
 pub mod device;
 pub mod memmap;
 mod region;
