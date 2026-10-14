@@ -60,7 +60,21 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    match Cli::parse().command {
+    // Not `Cli::parse()`: clap exits with 2 on a usage error, which `run` uses for lockup.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // Printing to a closed stdout/stderr is not worth failing over.
+            let _ = e.print();
+            // `--help` and `--version` also arrive here, on stdout, and are not errors.
+            return if e.use_stderr() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            };
+        }
+    };
+    match cli.command {
         Command::Run {
             bundle,
             max_cycles,

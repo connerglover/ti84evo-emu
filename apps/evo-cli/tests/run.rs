@@ -156,6 +156,29 @@ fn cli_writes_unmapped_log() {
     assert!(table.starts_with("| addr | width | kind |"), "{table}");
 }
 
+/// Exit status 2 means lockup, so a usage error must not use clap's default of 2.
+#[test]
+fn cli_usage_errors_exit_one() {
+    let out = evo_cli()
+        .args(["run", "x.84b2", "--break", "zz"])
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(stderr.contains("--break"), "{stderr}");
+    evo_cli().arg("run").assert().code(1);
+    evo_cli()
+        .args(["run", "x.84b2", "--no-such-flag"])
+        .assert()
+        .code(1);
+    evo_cli().assert().code(1);
+
+    // Help and version are not errors.
+    let out = evo_cli().args(["run", "--help"]).assert().code(0);
+    let help = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(help.contains("--max-cycles"), "{help}");
+    evo_cli().arg("--version").assert().code(0);
+}
+
 #[test]
 fn cli_bad_bundle_exits_one() {
     let missing = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no-such-bundle.84b2");
