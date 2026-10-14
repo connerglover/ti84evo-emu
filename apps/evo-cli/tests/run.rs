@@ -272,10 +272,12 @@ fn rsp(stream: &mut TcpStream, body: &str) -> String {
 #[test]
 fn cli_gdb_serves_one_client_on_localhost() {
     let bundle = bundle_file("cli_gdb", looping());
+    let flash = flash_file("cli_gdb");
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_evo-cli"))
         .arg("run")
         .arg(&bundle)
-        .args(["--gdb", "0", "--break", "0x100b0604"])
+        .args(["--gdb", "0", "--break", "0x100b0604", "--flash-file"])
+        .arg(&flash)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -313,6 +315,11 @@ fn cli_gdb_serves_one_client_on_localhost() {
         "{out}"
     );
     assert!(out.contains("\nunmapped: 0 distinct accesses"), "{out}");
+    // The end of the session writes the flash file back.
+    assert_eq!(
+        std::fs::metadata(&flash).expect("written").len(),
+        FLASH_FILE_LEN
+    );
 }
 
 #[test]
@@ -544,4 +551,126 @@ fn cli_budget_spans_slices() {
         .unwrap_or_else(|| panic!("no stop line: {out}"));
     // The loop's longest instruction (a taken branch) takes 2 cycles.
     assert!((5_000_000..5_000_002).contains(&cycles), "{out}");
+}
+
+/// Size of a flash file: magic, version, flash length, 16 MiB of flash, 768 secreg bytes.
+const FLASH_FILE_LEN: u64 = 8 + 4 + 4 + (16 << 20) + 768;
+
+/// A fresh path for a flash file named after the test (any earlier one removed).
+fn flash_file(name: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.evoflash"));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+#[test]
+fn cli_flash_file_created_and_reused() {
+    let bundle = bundle_file("cli_flash_file_created", looping());
+    let flash = flash_file("cli_flash_file_created");
+    let run = || {
+        stdout(
+            evo_cli()
+                .arg("run")
+                .arg(&bundle)
+                .args(["--max-cycles", "1000", "--flash-file"])
+                .arg(&flash),
+            0,
+        )
+    };
+    run();
+    assert_eq!(
+        std::fs::metadata(&flash).expect("created").len(),
+        FLASH_FILE_LEN
+    );
+
+    // Mark a byte outside the image slots (flash offset 0x9_0000): run 2 keeps it.
+    let mut bytes = std::fs::read(&flash).expect("read");
+    assert_eq!(&bytes[..8], b"EVOFLASH");
+    assert_eq!(bytes[16 + 0x9_0000], 0xFF);
+    bytes[16 + 0x9_0000] = 0xA5;
+    std::fs::write(&flash, &bytes).expect("write");
+    run();
+    let bytes = std::fs::read(&flash).expect("read");
+    assert_eq!(bytes.len() as u64, FLASH_FILE_LEN);
+    assert_eq!(bytes[16 + 0x9_0000], 0xA5);
+    assert!(!flash.with_extension("evoflash.tmp").exists());
+}
+
+/// Review Focus 2: a corrupt flash file is an error that leaves the file as it was.
+#[test]
+fn cli_bad_flash_file_exits_1_and_keeps_file() {
+    let bundle = bundle_file("cli_bad_flash_file", looping());
+    let flash = flash_file("cli_bad_flash_file");
+    let junk: Vec<u8> = (0..100u8).collect();
+    std::fs::write(&flash, &junk).expect("write");
+    let out = evo_cli()
+        .arg("run")
+        .arg(&bundle)
+        .args(["--max-cycles", "1000", "--flash-file"])
+        .arg(&flash)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("cli_bad_flash_file.evoflash"), "{stderr}");
+    assert!(out.stdout.is_empty(), "the run never started");
+    assert_eq!(std::fs::read(&flash).expect("read"), junk);
+
+    // Truncated after a valid header: also refused, also untouched.
+    let mut short = b"EVOFLASH".to_vec();
+    short.extend_from_slice(&1u32.to_le_bytes());
+    short.extend_from_slice(&(16u32 << 20).to_le_bytes());
+    short.extend_from_slice(&[0xFF; 64]);
+    std::fs::write(&flash, &short).expect("write");
+    evo_cli()
+        .arg("run")
+        .arg(&bundle)
+        .args(["--max-cycles", "1000", "--flash-file"])
+        .arg(&flash)
+        .assert()
+        .code(1);
+    assert_eq!(std::fs::read(&flash).expect("read"), short);
+}
+
+#[test]
+fn cli_flash_file_written_after_lockup() {
+    let bundle = bundle_file("cli_flash_file_lockup", locking_up());
+    let flash = flash_file("cli_flash_file_lockup");
+    evo_cli()
+        .arg("run")
+        .arg(&bundle)
+        .args(["--max-cycles", "1000000", "--flash-file"])
+        .arg(&flash)
+        .assert()
+        .code(2);
+    assert_eq!(
+        std::fs::metadata(&flash).expect("written").len(),
+        FLASH_FILE_LEN
+    );
+}
+
+/// A flash file that cannot be written back is reported (exit 1), naming the path.
+#[test]
+fn cli_flash_file_write_failure_exits_1() {
+    let bundle = bundle_file("cli_flash_file_unwritable", looping());
+    // A directory that does not exist: nothing to read (erased start), nothing can be written.
+    let flash = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("no-such-dir")
+        .join("x.evoflash");
+    let out = evo_cli()
+        .arg("run")
+        .arg(&bundle)
+        .args(["--max-cycles", "1000", "--flash-file"])
+        .arg(&flash)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stderr.contains("x.evoflash"), "{stderr}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("stop: cycle-limit"),
+        "the run itself completed"
+    );
 }

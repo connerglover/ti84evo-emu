@@ -73,6 +73,12 @@ enum Command {
         /// Feed the bytes of FILE into UART0's receiver at cycle 0.
         #[arg(long, value_name = "FILE")]
         uart_in: Option<PathBuf>,
+        /// Keep the flash and the NOR security registers in PATH across runs: read at the
+        /// start (an erased part if PATH does not exist; an invalid file is an error that
+        /// leaves it untouched), the bundle's images placed over it, and written back however
+        /// the run ends. A failed write-back exits 1.
+        #[arg(long, value_name = "PATH")]
+        flash_file: Option<PathBuf>,
     },
 }
 
@@ -108,6 +114,7 @@ fn main() -> ExitCode {
             gdb,
             uart,
             uart_in,
+            flash_file,
         } => run::main(run::RunArgs {
             bundle,
             max_cycles,
@@ -118,6 +125,7 @@ fn main() -> ExitCode {
             gdb,
             uart,
             uart_in,
+            flash_file,
         }),
         Command::Inspect {
             bundle,
@@ -192,6 +200,7 @@ mod tests {
             gdb,
             uart,
             uart_in,
+            flash_file,
         } = cli.command
         else {
             panic!("not run");
@@ -205,6 +214,7 @@ mod tests {
         assert_eq!(gdb, None);
         assert!(!uart);
         assert_eq!(uart_in, None);
+        assert_eq!(flash_file, None);
     }
 
     #[test]
@@ -227,6 +237,8 @@ mod tests {
             "--uart",
             "--uart-in",
             "in.bin",
+            "--flash-file",
+            "nv.evoflash",
         ])
         .expect("parse");
         let Command::Run {
@@ -238,6 +250,7 @@ mod tests {
             gdb,
             uart,
             uart_in,
+            flash_file,
             ..
         } = cli.command
         else {
@@ -251,6 +264,7 @@ mod tests {
         assert_eq!(gdb, None);
         assert!(uart);
         assert_eq!(uart_in, Some(PathBuf::from("in.bin")));
+        assert_eq!(flash_file, Some(PathBuf::from("nv.evoflash")));
 
         assert!(Cli::try_parse_from(["evo-cli", "run"]).is_err());
         assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--break", "zz"]).is_err());

@@ -43,6 +43,8 @@ use std::ops::ControlFlow;
 
 use armv8m::decode::is_32bit;
 use armv8m::{Cpu, Sec, SleepKind, StepResult, decode16, decode32, disasm};
+use evo_hw::dev::spif::Spif;
+use evo_hw::nor::{NvState, SECREGS_LEN};
 use evo_hw::soc::{self, FLASH_BUFFER, SRAM_BUFFER};
 use evo_hw::{DevCtx, Device, MemoryMap, ResetKind, UnmappedAccess, UnmappedKind};
 use evo_image::{Bundle, ImageError, Layout};
@@ -159,19 +161,36 @@ pub struct Machine {
 }
 
 impl Machine {
-    /// Build the memory map, program `b`'s images into flash per `layout` and reset the CPU
-    /// into the secure image: `VTOR_S` = Secure alias of image 0's slot plus its header size.
+    /// Build the memory map, program `b`'s images into an erased flash per `layout` and reset
+    /// the CPU into the secure image: `VTOR_S` = Secure alias of image 0's slot plus its header
+    /// size. Same as [`from_bundle_nv`](Self::from_bundle_nv) with no saved state.
     ///
     /// Images are placed before the map is built, so an image that does not fit in flash is an
     /// [`ImageError::DoesNotFit`], never a panic.
     pub fn from_bundle(b: &Bundle, layout: &Layout) -> Result<Self, ImageError> {
+        Self::from_bundle_nv(b, layout, None)
+    }
+
+    /// [`from_bundle`](Self::from_bundle), starting from `nv` (flash bytes and NOR security
+    /// registers, e.g. read from a flash file) instead of an erased part. The bundle's images
+    /// are placed over that flash, so in their slots they always win over the saved bytes;
+    /// everything outside the slots (e.g. ITS/PS at 0x0009_0000) is kept.
+    pub fn from_bundle_nv(
+        b: &Bundle,
+        layout: &Layout,
+        nv: Option<NvState>,
+    ) -> Result<Self, ImageError> {
         let pkg = &b.package;
         // `Package::parse` never yields an empty package, but its fields are public.
         let secure = pkg
             .images
             .first()
             .ok_or(ImageError::BadMagic { offset: 0 })?;
-        let mut flash = vec![ERASED; FLASH_SIZE as usize];
+        // An `NvState` always holds `NOR_SIZE` (= `FLASH_SIZE`) flash bytes.
+        let mut flash = nv.as_ref().map_or_else(
+            || vec![ERASED; FLASH_SIZE as usize],
+            |nv| nv.flash().to_vec(),
+        );
         layout.place(pkg, &mut flash, FLASH_NS)?;
         // `place` succeeded, so the slot and its header lie inside the 16 MiB flash.
         let vtor = FLASH_S | (layout.secure_slot_base + u32::from(secure.header_size));
@@ -187,7 +206,7 @@ impl Machine {
         let mut cpu = Cpu::new();
         cpu.set_vtor(Sec::Secure, vtor);
         cpu.reset(&mut bus);
-        Ok(Self {
+        let mut m = Self {
             cpu,
             bus,
             sched: Scheduler::new(),
@@ -198,6 +217,36 @@ impl Machine {
             stopped_at: None,
             applied_irqs: 0,
             recent: RecentSteps::default(),
+        };
+        if let Some(nv) = &nv {
+            m.with_dev("spif", |s: &mut Spif, _| {
+                s.nor_mut().set_secregs(nv.secregs())
+            });
+        }
+        Ok(m)
+    }
+
+    /// The non-volatile state now, as a flash file stores it: the flash bytes and the SPIF NOR
+    /// part's security registers. Security registers the part does not hold (it has none
+    /// after a save-state restore until they are set again) read as erased.
+    pub fn nv_state(&self) -> NvState {
+        let mut flash = self
+            .bus
+            .region_bytes(FLASH_BUFFER)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default();
+        // The map always holds `FLASH_SIZE` bytes of flash; this only keeps `new` infallible.
+        flash.resize(FLASH_SIZE as usize, ERASED);
+        let secregs = self
+            .bus
+            .device::<Spif>("spif")
+            .map(|s| s.nor().secregs())
+            .filter(|r| r.len() == SECREGS_LEN)
+            .map_or_else(|| vec![ERASED; SECREGS_LEN], <[u8]>::to_vec);
+        NvState::new(flash, secregs).unwrap_or_else(|e| {
+            // Unreachable: both lengths are fixed above.
+            log::error!("nv_state: {e}");
+            NvState::erased()
         })
     }
 

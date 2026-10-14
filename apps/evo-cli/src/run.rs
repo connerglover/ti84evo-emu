@@ -8,7 +8,7 @@ use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use evo_core::{Machine, StopReason, UartPort};
+use evo_core::{Machine, NvError, NvState, StopReason, UartPort};
 use evo_image::{Bundle, Layout};
 
 /// What `evo-cli run` was asked to do.
@@ -24,6 +24,8 @@ pub struct RunArgs {
     pub uart: bool,
     /// Bytes to feed into UART0 RX at cycle 0.
     pub uart_in: Option<PathBuf>,
+    /// The flash file: read at the start (missing: an erased part), written back at the end.
+    pub flash_file: Option<PathBuf>,
 }
 
 /// Exit status for a lockup (0 is a normal stop, 1 a host-side error).
@@ -69,32 +71,73 @@ pub fn main(args: RunArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut machine = match Machine::from_bundle(&bundle, &Layout::EVO_7_1) {
+    // Every input is read before the machine exists: an input error never touches the flash
+    // file.
+    let nv = match args.flash_file.as_deref().map(read_flash_file) {
+        Some(Ok(nv)) => nv,
+        Some(Err(())) => return ExitCode::FAILURE,
+        None => None,
+    };
+    let uart_in = match &args.uart_in {
+        Some(path) => match fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                eprintln!("evo-cli: {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let mut machine = match Machine::from_bundle_nv(&bundle, &Layout::EVO_7_1, nv) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("evo-cli: {}: {e}", args.bundle.display());
             return ExitCode::FAILURE;
         }
     };
+    if let Some(bytes) = &uart_in {
+        machine.inject_uart_rx(UartPort::Uart0, bytes);
+    }
+    let code = run_machine(&mut machine, &args);
+    // However the run ended (stop, lockup, GDB session end, a trace cut short, an output
+    // error), the flash goes back to the file.
+    match &args.flash_file {
+        Some(path) => match machine.nv_state().write_file(path) {
+            Ok(()) => code,
+            Err(e) => {
+                eprintln!("evo-cli: {}: {e}", path.display());
+                ExitCode::FAILURE
+            }
+        },
+        None => code,
+    }
+}
+
+/// `--flash-file PATH`: the saved state, `None` (start erased) if there is no file yet. An
+/// unreadable or invalid file is reported and is `Err`; the file is not touched.
+fn read_flash_file(path: &Path) -> Result<Option<NvState>, ()> {
+    match NvState::read_file(path) {
+        Ok(nv) => Ok(Some(nv)),
+        Err(NvError::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => {
+            eprintln!("evo-cli: {}: {e}", path.display());
+            Err(())
+        }
+    }
+}
+
+/// Run the booted machine as `args` asks, report, and return the exit status.
+fn run_machine(machine: &mut Machine, args: &RunArgs) -> ExitCode {
     // Breakpoints compare against the PC, whose bit 0 is always clear.
     machine
         .breakpoints
         .extend(args.breaks.iter().map(|a| a & !1));
-    if let Some(path) = &args.uart_in {
-        match fs::read(path) {
-            Ok(bytes) => machine.inject_uart_rx(UartPort::Uart0, &bytes),
-            Err(e) => {
-                eprintln!("evo-cli: {}: {e}", path.display());
-                return ExitCode::FAILURE;
-            }
-        }
-    }
     let mut uarts = UartSink {
         print: args.uart,
         ..UartSink::default()
     };
     if let Some(port) = args.gdb {
-        return gdb(&mut machine, port, args.unmapped_out.as_deref(), &mut uarts);
+        return gdb(machine, port, args.unmapped_out.as_deref(), &mut uarts);
     }
 
     // Written as the run goes, in buffered blocks: a trace can be gigabytes.
@@ -122,20 +165,20 @@ pub fn main(args: RunArgs) -> ExitCode {
             machine.run(slice)
         };
         if stdout_err.is_none() {
-            stdout_err = uarts.drain(&mut machine, &mut out).err();
+            stdout_err = uarts.drain(machine, &mut out).err();
         }
         if stop != StopReason::CycleLimit || machine.sched.now >= end || stdout_err.is_some() {
             break stop;
         }
     };
     if stdout_err.is_none() {
-        stdout_err = summary(&mut out, &machine, stop)
+        stdout_err = summary(&mut out, machine, stop)
             .and_then(|()| out.flush())
             .err();
     }
     uarts.report();
 
-    if !write_unmapped(args.unmapped_out.as_deref(), &machine) {
+    if !write_unmapped(args.unmapped_out.as_deref(), machine) {
         return ExitCode::FAILURE;
     }
     match stdout_err {

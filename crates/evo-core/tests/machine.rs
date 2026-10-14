@@ -913,3 +913,50 @@ fn uart_host_api() {
     assert_eq!(m.cpu.regs.r[2], 0x61);
     assert_eq!(m.cpu.regs.r[3], u32::from(b'z'));
 }
+
+/// An erased part with 0xA5 at flash offset 0x9_0000 (the ITS/PS area, outside both image
+/// slots) and 0x12 in security-register byte 0.
+fn nv_with_marks(fill: u8) -> evo_core::NvState {
+    let mut flash = vec![fill; evo_hw::nor::NOR_SIZE];
+    flash[0x9_0000] = 0xA5;
+    let mut secregs = vec![0xFF; evo_hw::nor::SECREGS_LEN];
+    secregs[0] = 0x12;
+    evo_core::NvState::new(flash, secregs).expect("sizes")
+}
+
+#[test]
+fn nv_roundtrip_keeps_data_outside_slots() {
+    let b = looping().bundle();
+    let m = Machine::from_bundle_nv(&b, &Layout::EVO_7_1, Some(nv_with_marks(0xFF))).expect("boot");
+    assert_eq!(m.bus.peek(0x9_0000, 1), Some(0xA5));
+    assert_eq!(m.bus.peek(0x1009_0000, 1), Some(0xA5));
+    let nv = m.nv_state();
+    assert_eq!(nv.flash()[0x9_0000], 0xA5);
+    assert_eq!(nv.secregs()[0], 0x12);
+    assert_eq!(nv.secregs()[1], 0xFF);
+    // The bundle's images are in the saved flash too.
+    assert_eq!(
+        nv.flash()[0x000B_0000..0x000B_0004],
+        0x96f3_b83du32.to_le_bytes()
+    );
+
+    // `from_bundle` starts from an erased part.
+    let m = Machine::from_bundle(&b, &Layout::EVO_7_1).expect("boot");
+    assert_eq!(m.bus.peek(0x9_0000, 1), Some(0xFF));
+    assert!(m.nv_state().secregs().iter().all(|&b| b == 0xFF));
+}
+
+#[test]
+fn bundle_images_win_over_nv() {
+    let b = looping().bundle();
+    let m = Machine::from_bundle_nv(&b, &Layout::EVO_7_1, Some(nv_with_marks(0x00))).expect("boot");
+    assert_eq!(
+        m.bus.peek(0x000B_0000, 4),
+        Some(0x96f3_b83d),
+        "MCUboot magic"
+    );
+    assert_eq!(m.bus.peek(0x100B_0400, 4), Some(SP_INIT));
+    // Outside the images the saved bytes stay.
+    assert_eq!(m.bus.peek(0x0000_0000, 4), Some(0));
+    assert_eq!(m.bus.peek(0x9_0000, 1), Some(0xA5));
+}
