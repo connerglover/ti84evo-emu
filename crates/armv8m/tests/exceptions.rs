@@ -510,6 +510,62 @@ fn systick_tick_counts_and_reloads() {
     assert_eq!(cpu.ppb_read32(SYST_CVR), 50);
 }
 
+/// A debugger reads the PPB with `ppb_peek32`, which must not disturb the guest: reading
+/// `SYST_CSR` that way leaves COUNTFLAG set, and nothing is logged for unimplemented space.
+#[test]
+fn ppb_peek32_has_no_side_effects() {
+    const COUNTFLAG: u32 = 1 << 16;
+    let (mut cpu, _bus) = cpu_with_code(&[B_SELF]);
+    cpu.ppb_write32(SYST_RVR, 9);
+    cpu.ppb_write32(SYST_CSR, 0b101);
+    cpu.tick_systick(11); // reload, 9 to zero (COUNTFLAG), reload
+    assert_eq!(
+        cpu.ppb_peek32(SYST_CSR, Sec::Secure),
+        Some(0b101 | COUNTFLAG)
+    );
+    assert_eq!(
+        cpu.ppb_peek32(SYST_CSR, Sec::Secure),
+        Some(0b101 | COUNTFLAG),
+        "a peek leaves COUNTFLAG set"
+    );
+    assert_eq!(cpu.ppb_read32(SYST_CSR), 0b101 | COUNTFLAG);
+    assert_eq!(
+        cpu.ppb_peek32(SYST_CSR, Sec::Secure),
+        Some(0b101),
+        "a read clears it"
+    );
+
+    // Otherwise a peek sees what a read sees, in the given security state's view.
+    assert_eq!(
+        cpu.ppb_peek32(CPUID, Sec::Secure),
+        Some(cpu.ppb_read32(CPUID))
+    );
+    assert_eq!(cpu.ppb_peek32(SYST_RVR, Sec::Secure), Some(9));
+    assert_eq!(
+        cpu.ppb_peek32(SYST_RVR + 3, Sec::Secure),
+        Some(9),
+        "containing word"
+    );
+    assert_eq!(
+        cpu.ppb_peek32(SYST_RVR, Sec::NonSecure),
+        Some(0),
+        "the NS SysTick"
+    );
+    assert_eq!(
+        cpu.ppb_peek32(SYST_RVR + 0x2_0000, Sec::Secure),
+        Some(0),
+        "the Non-secure alias shows the NS view"
+    );
+    cpu.ppb_write32(SYST_RVR + 0x2_0000, 7);
+    assert_eq!(cpu.ppb_peek32(SYST_RVR, Sec::NonSecure), Some(7));
+
+    // No register there, or outside the PPB.
+    assert_eq!(cpu.ppb_peek32(0xE000_1000, Sec::Secure), None);
+    assert_eq!(cpu.ppb_peek32(0xE00F_FFFC, Sec::Secure), None);
+    assert_eq!(cpu.ppb_peek32(0x2000_0000, Sec::Secure), None);
+    assert_eq!(cpu.ppb_peek32(0xE010_0000, Sec::Secure), None);
+}
+
 const PENDSTSET: u32 = 1 << 26;
 
 #[test]

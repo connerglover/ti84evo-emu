@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{self, BufWriter, Write};
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -49,14 +49,18 @@ pub fn main(args: RunArgs) -> ExitCode {
 
     // Written as the run goes, in buffered blocks: a trace can be gigabytes.
     let mut out = BufWriter::new(io::stdout().lock());
-    // The first stdout error. After one (e.g. `| head` closed the pipe) nothing more is
-    // printed, but the run and the unmapped log still complete.
+    // The first stdout error. A trace stops the run at the first one (e.g. `| head` closed
+    // the pipe): nothing more can be printed. The unmapped log is still written.
     let mut stdout_err: Option<io::Error> = None;
     let stop = if args.trace || args.trace_range.is_some() {
         let range = args.trace_range.clone().unwrap_or(0..u32::MAX);
         machine.run_with(args.max_cycles, |m| {
-            if stdout_err.is_none() && range.contains(&m.cpu.regs.pc) {
+            if range.contains(&m.cpu.regs.pc) {
                 stdout_err = writeln!(out, "{}", m.trace_line()).err();
+            }
+            match stdout_err {
+                Some(_) => ControlFlow::Break(()),
+                None => ControlFlow::Continue(()),
             }
         })
     } else {
@@ -88,6 +92,10 @@ pub fn main(args: RunArgs) -> ExitCode {
 fn summary(out: &mut impl Write, m: &Machine, stop: StopReason) -> io::Result<()> {
     let (reason, pc) = match stop {
         StopReason::CycleLimit => ("cycle-limit", m.cpu.regs.pc),
+        StopReason::Idle => ("idle", m.cpu.regs.pc),
+        // `run` reports neither; `Halted` only when the trace output is gone.
+        StopReason::Stepped => ("stepped", m.cpu.regs.pc),
+        StopReason::Halted => ("halted", m.cpu.regs.pc),
         StopReason::Breakpoint(pc) => ("breakpoint", pc),
         StopReason::Lockup { pc } => ("lockup", pc),
         StopReason::Bkpt { pc, .. } => ("bkpt", pc),
@@ -97,10 +105,15 @@ fn summary(out: &mut impl Write, m: &Machine, stop: StopReason) -> io::Result<()
         write!(out, " imm=0x{imm:02x}")?;
     }
     writeln!(out)?;
-    if stop == StopReason::CycleLimit && m.asleep() {
+    if stop == StopReason::Idle {
         writeln!(
             out,
-            "idle: the CPU is asleep (WFI/WFE) and no event or interrupt is pending"
+            "idle: the CPU is asleep (WFI/WFE) and nothing is pending or scheduled to wake it"
+        )?;
+    } else if m.asleep() {
+        writeln!(
+            out,
+            "asleep: the CPU is in WFI/WFE, waiting for an interrupt or event"
         )?;
     }
     writeln!(
@@ -119,9 +132,12 @@ fn summary(out: &mut impl Write, m: &Machine, stop: StopReason) -> io::Result<()
 fn exit_code(stop: StopReason) -> ExitCode {
     match stop {
         StopReason::Lockup { .. } => ExitCode::from(EXIT_LOCKUP),
-        StopReason::CycleLimit | StopReason::Breakpoint(_) | StopReason::Bkpt { .. } => {
-            ExitCode::SUCCESS
-        }
+        StopReason::CycleLimit
+        | StopReason::Idle
+        | StopReason::Stepped
+        | StopReason::Halted
+        | StopReason::Breakpoint(_)
+        | StopReason::Bkpt { .. } => ExitCode::SUCCESS,
     }
 }
 

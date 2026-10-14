@@ -18,9 +18,11 @@
 //! an exception is pending, or, after WFE only, once the event register is set (e.g. by an
 //! interrupt pended with `SCR.SEVONPEND`, even a disabled one); that wake-up consumes the
 //! event. If no wake-up time exists the CPU would sleep forever, and `run` returns
-//! [`StopReason::CycleLimit`] at once instead of waiting out its budget.
+//! [`StopReason::Idle`] at once instead of waiting out its budget. A debugger halt also ends
+//! the sleep ([`Machine::wake`]).
 
 use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 
 use armv8m::decode::is_32bit;
 use armv8m::{Cpu, Sec, SleepKind, StepResult, decode16, decode32, disasm};
@@ -48,9 +50,20 @@ const ERASED: u8 = 0xFF;
 /// Why [`Machine::run`] or [`Machine::step`] returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopReason {
-    /// The cycle budget is used up (for `step`: the one step is done), or the CPU is asleep
-    /// with nothing left that could wake it ([`Machine::asleep`] tells these apart).
+    /// `run`: the cycle budget is used up. The CPU may be asleep, waiting for a wake-up that
+    /// lies beyond the budget.
     CycleLimit,
+    /// `step`: the step is done. It executed an instruction or entered an exception, or, while
+    /// asleep, advanced time to the next wake-up.
+    Stepped,
+    /// The CPU is asleep (WFI/WFE) and nothing can wake it: no exception (or, for WFE, event)
+    /// is pending, no scheduler event is scheduled and SysTick will not fire. Time stands
+    /// still; only a host action (an interrupt line, a register write, [`Machine::wake`]) can
+    /// change that.
+    Idle,
+    /// The `run_with` callback returned `ControlFlow::Break` before the instruction at the PC,
+    /// which has not run.
+    Halted,
     /// The next instruction is at this address in [`Machine::breakpoints`]; it has not run.
     Breakpoint(u32),
     /// The CPU locked up; `pc` is the instruction (or exception entry) it locked up on. If the
@@ -117,26 +130,35 @@ impl Machine {
         })
     }
 
-    /// True while the CPU sleeps in WFI/WFE waiting for an exception.
+    /// True while the CPU sleeps in WFI/WFE, waiting for an exception (or, after WFE, an
+    /// event).
     pub fn asleep(&self) -> bool {
         self.sleep.is_some()
+    }
+
+    /// End the sleep as a debugger halt does: the next step executes the instruction after
+    /// the WFI/WFE, whether or not anything is pending. Does nothing while awake.
+    pub fn wake(&mut self) {
+        self.sleep = None;
     }
 
     /// Run for up to `max_cycles` cycles from now.
     ///
     /// Stops before an instruction at a breakpoint (a run that starts on the breakpoint the
     /// previous run stopped at executes it first), on lockup, on a guest `BKPT`, when the
-    /// budget is used up, or when the CPU is asleep with nothing left to wake it.
+    /// budget is used up, or when the CPU is asleep with nothing left to wake it
+    /// ([`StopReason::Idle`]).
     pub fn run(&mut self, max_cycles: u64) -> StopReason {
-        self.run_with(max_cycles, |_| {})
+        self.run_with(max_cycles, |_| ControlFlow::Continue(()))
     }
 
     /// [`run`](Self::run), calling `before_step` with the machine before each CPU step (not
-    /// while asleep): e.g. to trace with [`trace_line`](Self::trace_line).
+    /// while asleep): e.g. to trace with [`trace_line`](Self::trace_line). When it returns
+    /// `ControlFlow::Break`, the run stops with [`StopReason::Halted`] before that step.
     pub fn run_with(
         &mut self,
         max_cycles: u64,
-        mut before_step: impl FnMut(&mut Self),
+        mut before_step: impl FnMut(&mut Self) -> ControlFlow<()>,
     ) -> StopReason {
         let end = self.sched.now.saturating_add(max_cycles);
         loop {
@@ -150,11 +172,18 @@ impl Machine {
                 continue;
             }
             let pc = self.cpu.regs.pc;
-            if self.breakpoints.contains(&pc) && self.stopped_at.take() != Some(pc) {
+            let resumed = self.stopped_at.take() == Some(pc);
+            if self.breakpoints.contains(&pc) && !resumed {
                 self.stopped_at = Some(pc);
                 return StopReason::Breakpoint(pc);
             }
-            before_step(self);
+            if before_step(self).is_break() {
+                // Still on the breakpoint this run resumed from: the next run steps over it.
+                if resumed {
+                    self.stopped_at = Some(pc);
+                }
+                return StopReason::Halted;
+            }
             if let Some(stop) = self.step_cpu() {
                 return stop;
             }
@@ -163,18 +192,19 @@ impl Machine {
 
     /// Execute one CPU step (one instruction, or the entry to a pending exception), ignoring
     /// breakpoints. While asleep, wake if a wake-up is due (and then step), else jump to the
-    /// next wake-up time without stepping. Returns `CycleLimit` unless the step locked
-    /// up or hit a guest `BKPT`.
+    /// next wake-up time without stepping. Returns `Stepped` unless the step locked up or hit
+    /// a guest `BKPT`, or the CPU is asleep with nothing left to wake it (`Idle`: nothing
+    /// changes).
     pub fn step(&mut self) -> StopReason {
         if self.asleep() {
             if let Some(stop) = self.idle(u64::MAX) {
                 return stop;
             }
             if self.asleep() {
-                return StopReason::CycleLimit;
+                return StopReason::Stepped;
             }
         }
-        self.step_cpu().unwrap_or(StopReason::CycleLimit)
+        self.step_cpu().unwrap_or(StopReason::Stepped)
     }
 
     /// One trace line for the instruction at the PC, which is about to execute:
@@ -229,7 +259,7 @@ impl Machine {
     }
 
     /// While asleep: wake if a wake-up is due, else advance time to the next wake-up time (at
-    /// most to `end`). `Some(CycleLimit)` if nothing will ever wake the CPU.
+    /// most to `end`). `Some(Idle)` if nothing will ever wake the CPU.
     fn idle(&mut self, end: u64) -> Option<StopReason> {
         if self.wake_if_due() {
             return None;
@@ -244,7 +274,7 @@ impl Machine {
             .flatten()
             .min()
         else {
-            return Some(StopReason::CycleLimit);
+            return Some(StopReason::Idle);
         };
         let target = wake.clamp(now, end.max(now));
         let mut left = target - now;

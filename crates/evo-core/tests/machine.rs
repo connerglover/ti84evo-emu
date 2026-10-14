@@ -3,6 +3,8 @@
 //! Every test boots a synthetic bundle whose secure image is a hand-assembled Thumb program,
 //! placed by `Layout::EVO_7_1` like the real OS.
 
+use std::ops::ControlFlow;
+
 use armv8m::Sec;
 use evo_core::{EventKind, Machine, StopReason};
 use evo_image::testutil::secure_image_bundle;
@@ -218,24 +220,25 @@ fn breakpoint_stops() {
 fn step_executes_one_instruction() {
     let mut m = looping().boot();
     m.breakpoints.insert(addr(CODE));
-    assert_eq!(
-        m.step(),
-        StopReason::CycleLimit,
-        "a step ignores breakpoints"
-    );
+    assert_eq!(m.step(), StopReason::Stepped, "a step ignores breakpoints");
     assert_eq!((m.cpu.regs.pc, m.sched.now), (addr(CODE + 2), 1));
     assert_eq!(m.cpu.regs.r[0], 1);
 
     // While asleep, a step skips to the next event instead.
     let mut m = sleeper().boot();
     m.sched.schedule(500, EventKind::Peripheral(1));
-    assert_eq!(m.step(), StopReason::CycleLimit);
+    assert_eq!(m.step(), StopReason::Stepped);
     assert!(m.asleep());
     assert_eq!(m.sched.now, 1);
-    assert_eq!(m.step(), StopReason::CycleLimit);
+    assert_eq!(m.step(), StopReason::Stepped);
     assert_eq!(m.sched.now, 500);
     assert!(m.asleep());
     assert_eq!(m.cpu.regs.pc, addr(CODE + 2), "nothing executed");
+
+    // With nothing left that could wake it, a step reports that instead of stepping.
+    assert_eq!(m.step(), StopReason::Idle);
+    assert_eq!((m.sched.now, m.cpu.regs.pc), (500, addr(CODE + 2)));
+    assert!(m.asleep());
 }
 
 #[test]
@@ -260,15 +263,16 @@ fn wfi_skips_to_next_event() {
     m.sched.schedule(10_000, EventKind::Peripheral(7));
     // `wfi` (1 cycle), then the machine jumps to the event. The event wakes nobody (no
     // peripheral raises an IRQ yet), and with nothing else due the CPU would sleep forever,
-    // which `run` reports as `CycleLimit` long before the budget.
-    assert_eq!(m.run(1_000_000), StopReason::CycleLimit);
+    // which `run` reports as `Idle` long before the budget.
+    assert_eq!(m.run(1_000_000), StopReason::Idle);
     assert_eq!(m.sched.now, 10_000);
     assert_eq!(m.sched.next_deadline(), None, "the event fired");
     assert!(m.asleep());
     assert_eq!(m.cpu.regs.r[0], 0, "still asleep");
     assert_eq!(m.cpu.regs.pc, addr(CODE + 2));
 
-    // An event beyond the budget: time advances to the end of the budget.
+    // An event beyond the budget: time advances to the end of the budget. That is a
+    // `CycleLimit`, not `Idle`: the CPU is asleep, but something will wake it.
     m.sched.schedule(50_000, EventKind::Peripheral(7));
     assert_eq!(m.run(1_000), StopReason::CycleLimit);
     assert_eq!(m.sched.now, 11_000);
@@ -295,28 +299,87 @@ fn wfe_wakes_on_event_wfi_does_not() {
     let mut p = Payload::new();
     p.vector(1, CODE).code(CODE, &[WFE, ADDS_R0_1, 0xE7FC]);
     let mut m = p.boot();
-    assert_eq!(m.run(1_000), StopReason::CycleLimit);
+    assert_eq!(m.run(1_000), StopReason::Idle);
     assert!(m.asleep(), "no event yet: WFE sleeps");
     assert_eq!(m.cpu.regs.r[0], 0);
 
     m.cpu.ppb_write32(SCR, SEVONPEND);
     m.cpu.pulse_irq(5); // disabled: pending, but no exception will be taken
     assert!(m.cpu.event);
-    assert_eq!(m.run(1_000), StopReason::CycleLimit);
+    assert_eq!(m.run(1_000), StopReason::Idle);
     assert_eq!(m.cpu.regs.r[0], 1, "woke once, then slept in the next WFE");
     assert!(m.asleep());
     assert!(!m.cpu.event, "the wake-up consumed the event");
 
     // The same with WFI: the event does not wake it.
     let mut m = sleeper().boot();
-    assert_eq!(m.run(1_000), StopReason::CycleLimit);
+    assert_eq!(m.run(1_000), StopReason::Idle);
     m.cpu.ppb_write32(SCR, SEVONPEND);
     m.cpu.pulse_irq(5);
     assert!(m.cpu.event);
-    assert_eq!(m.run(1_000), StopReason::CycleLimit);
+    assert_eq!(m.run(1_000), StopReason::Idle);
     assert_eq!(m.cpu.regs.r[0], 0, "WFI still asleep");
     assert!(m.asleep());
     assert!(m.cpu.event, "left for a later WFE");
+}
+
+#[test]
+fn run_with_callback_can_halt_the_run() {
+    let mut m = looping().boot();
+    let mut calls = 0;
+    let stop = m.run_with(10_000, |_| {
+        calls += 1;
+        if calls == 4 {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    assert_eq!(stop, StopReason::Halted);
+    assert_eq!(
+        m.cpu.regs.pc,
+        addr(CODE + 6),
+        "the fourth instruction did not run"
+    );
+    assert_eq!((m.sched.now, m.cpu.regs.r[0]), (3, 1));
+    // The next run goes on from there.
+    assert_eq!(m.run(1), StopReason::CycleLimit);
+    assert_eq!(m.cpu.regs.pc, addr(CODE + 8));
+
+    // A run resumed from a breakpoint and halted before its first step still steps over the
+    // breakpoint when it is resumed again.
+    let mut m = looping().boot();
+    let bp = addr(CODE + 4);
+    m.breakpoints.insert(bp);
+    assert_eq!(m.run(10_000), StopReason::Breakpoint(bp));
+    assert_eq!(
+        m.run_with(10_000, |_| ControlFlow::Break(())),
+        StopReason::Halted
+    );
+    assert_eq!((m.cpu.regs.pc, m.sched.now), (bp, 2));
+    assert_eq!(m.run(10_000), StopReason::Breakpoint(bp));
+    assert_eq!(
+        m.cpu.regs.r[2],
+        u32::MAX,
+        "the breakpointed instruction ran once"
+    );
+    assert_eq!(m.sched.now, 9);
+}
+
+#[test]
+fn wake_ends_sleep_like_a_debug_halt() {
+    let mut m = sleeper().boot();
+    assert_eq!(m.run(1_000), StopReason::Idle);
+    assert!(m.asleep());
+    m.wake();
+    assert!(!m.asleep());
+    // Execution continues after the WFI, although no interrupt is pending.
+    assert_eq!(m.step(), StopReason::Stepped);
+    assert_eq!(m.cpu.regs.r[0], 1);
+    m.wake();
+    assert!(!m.asleep(), "waking an awake CPU does nothing");
+    assert_eq!(m.run(1_000), StopReason::Idle, "the next WFI sleeps again");
+    assert!(m.asleep());
 }
 
 #[test]

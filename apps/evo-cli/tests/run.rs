@@ -1,6 +1,9 @@
 //! `evo-cli run` end to end, on synthetic bundles written to the target's temp directory.
 
+use std::io::Read;
 use std::path::PathBuf;
+use std::process::{Child, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use assert_cmd::cargo::cargo_bin_cmd;
@@ -43,6 +46,26 @@ fn locking_up() -> Vec<u8> {
         &[(1, CODE), (3, 0x210)],
         &[(CODE, &[0xDE00]), (0x210, &[0xDE00])],
     )
+}
+
+/// Reset handler: `wfi ; adds r0, #1 ; b <start>`, with no interrupt that could wake it.
+fn sleeping() -> Vec<u8> {
+    payload(&[(1, CODE)], &[(CODE, &[0xBF30, 0x3001, 0xE7FC])])
+}
+
+/// Wait up to `limit` for `child` to exit; kill it and fail if it does not.
+fn wait_exit(child: &mut Child, limit: Duration, what: &str) -> ExitStatus {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().expect("wait for evo-cli") {
+            return status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("evo-cli still running after {limit:?}: {what}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Write a bundle around `payload` to a temp file named after the test.
@@ -136,6 +159,36 @@ fn cli_breakpoint_exits_zero() {
         out.contains("stop: breakpoint pc=0x100b0604 cycles=2"),
         "{out}"
     );
+}
+
+/// A guest asleep with nothing to wake it stops the run at once, as `idle`, not `cycle-limit`.
+#[test]
+fn cli_idle_guest_stops_as_idle() {
+    let bundle = bundle_file("cli_idle", sleeping());
+    let out = stdout(evo_cli().arg("run").arg(&bundle), 0);
+    assert!(out.contains("stop: idle pc=0x100b0602 cycles=1\n"), "{out}");
+    assert!(out.contains("\nidle: "), "{out}");
+}
+
+/// Once stdout is closed (`| head`), tracing stops the run instead of running out the budget.
+#[test]
+fn cli_trace_stops_when_stdout_closes() {
+    let bundle = bundle_file("cli_trace_closed_stdout", looping());
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_evo-cli"))
+        .arg("run")
+        .arg(&bundle)
+        .args(["--max-cycles", "1_000_000_000_000", "--trace"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn evo-cli");
+    let mut stdout = child.stdout.take().expect("stdout");
+    let mut first = [0u8; 4096];
+    stdout.read_exact(&mut first).expect("trace output");
+    drop(stdout);
+    // Tracing 10^12 cycles takes hours.
+    let status = wait_exit(&mut child, Duration::from_secs(30), "stdout closed");
+    assert_eq!(status.code(), Some(0));
 }
 
 #[test]

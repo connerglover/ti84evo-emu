@@ -108,6 +108,14 @@ fn ppb_view(word: u32, from: Sec) -> Option<(u32, Sec)> {
     }
 }
 
+/// The register word and view a host (debugger/test) access from security state `sec` to
+/// `addr` reaches: as for `ppb_view`, except that the Non-secure alias always shows the
+/// Non-secure view.
+fn host_view(addr: u32, sec: Sec) -> (u32, Sec) {
+    let word = addr & !3;
+    ppb_view(word, sec).unwrap_or((word - NS_ALIAS_OFFSET, Sec::NonSecure))
+}
+
 fn size_bytes(size: MemSize) -> u32 {
     match size {
         MemSize::Byte => 1,
@@ -177,23 +185,32 @@ impl Cpu {
         Ok(())
     }
 
-    /// The view a host access uses: the current security state's, except that the Non-secure
-    /// alias always shows the Non-secure view.
-    fn host_view(&self, addr: u32) -> (u32, Sec) {
-        let word = addr & !3;
-        ppb_view(word, self.regs.sec).unwrap_or((word - NS_ALIAS_OFFSET, Sec::NonSecure))
-    }
-
     /// Host (debugger/test) read of a PPB word: privileged, no fault, in the current security
     /// state's view; the Non-secure alias (`0xE002_xxxx`) always reads the Non-secure view.
     pub fn ppb_read32(&mut self, addr: u32) -> u32 {
-        let (word, view) = self.host_view(addr);
+        let (word, view) = host_view(addr, self.regs.sec);
         self.scs_read(word, view)
+    }
+
+    /// Side-effect-free host read for a debugger: what `ppb_read32` would return for the word
+    /// containing `addr` if the CPU were in security state `sec`, except that reading
+    /// `SYST_CSR` leaves COUNTFLAG set. `None` outside the PPB and for registers that are not
+    /// implemented (which `ppb_read32` reads as zero, with a warning; this logs nothing).
+    pub fn ppb_peek32(&self, addr: u32, sec: Sec) -> Option<u32> {
+        if !is_ppb(addr) {
+            return None;
+        }
+        let (word, view) = host_view(addr, sec);
+        if (SCS_START..=SCS_END).contains(&word) {
+            self.scs_reg_peek(word, view)
+        } else {
+            None
+        }
     }
 
     /// Host (debugger/test) write of a PPB word, with the views of `ppb_read32`.
     pub fn ppb_write32(&mut self, addr: u32, v: u32) {
-        let (word, view) = self.host_view(addr);
+        let (word, view) = host_view(addr, self.regs.sec);
         self.scs_write(word, v, u32::MAX, view);
     }
 
@@ -212,8 +229,12 @@ impl Cpu {
     /// Read the PPB word at `word` in view `view`; unimplemented registers read as zero with a
     /// warning.
     fn scs_read(&mut self, word: u32, view: Sec) -> u32 {
+        // The one read with a side effect: reading SYST_CSR clears COUNTFLAG.
+        if word == SYSTICK {
+            return self.scs.systick.get_mut(view).read(0);
+        }
         let v = if (SCS_START..=SCS_END).contains(&word) {
-            self.scs_reg_read(word, view)
+            self.scs_reg_peek(word, view)
         } else {
             None
         };
@@ -261,7 +282,9 @@ impl Cpu {
         }
     }
 
-    fn scs_reg_read(&mut self, word: u32, view: Sec) -> Option<u32> {
+    /// The value of the SCS register at `word` in view `view`, without read side effects (see
+    /// `scs_read`); `None` if it is not implemented.
+    fn scs_reg_peek(&self, word: u32, view: Sec) -> Option<u32> {
         let secure = view == Sec::Secure;
         let bf = self.sees_bf_nmi(view);
         let scb = &self.scs.scb;
@@ -269,7 +292,7 @@ impl Cpu {
             ICTR => ICTR_VALUE,
             ACTLR => self.scs.actlr,
             CPPWR => self.scs.cppwr,
-            SYSTICK..=0xE000_E01C => self.scs.systick.get_mut(view).read(word - SYSTICK),
+            SYSTICK..=0xE000_E01C => self.scs.systick.get(view).peek(word - SYSTICK),
             NVIC..=NVIC_END => return self.scs.nvic.read(word - NVIC, !secure),
             CPUID => scb::CPUID,
             ICSR => self.icsr(view),

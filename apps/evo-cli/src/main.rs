@@ -33,7 +33,8 @@ enum Command {
     /// Boot a .84b2 bundle (images placed per Layout::EVO_7_1) and run it headless.
     ///
     /// Prints `stop: <reason> pc=<hex> cycles=<n>` at the end. Exit status: 0 when the
-    /// cycle budget runs out or a breakpoint is reached, 2 on CPU lockup, 1 on errors.
+    /// cycle budget runs out, the guest sleeps with nothing left to wake it (idle), or a
+    /// breakpoint or guest BKPT is reached; 2 on CPU lockup; 1 on errors.
     Run {
         /// Path to the .84b2 bundle.
         bundle: PathBuf,

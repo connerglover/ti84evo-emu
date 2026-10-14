@@ -28,12 +28,17 @@ impl SysTick {
     /// Read the register at `off` (0x0 CSR, 0x4 RVR, 0x8 CVR, 0xC CALIB). Reading CSR clears
     /// COUNTFLAG.
     pub fn read(&mut self, off: u32) -> u32 {
+        let v = self.peek(off);
+        if off == 0x0 {
+            self.countflag = false;
+        }
+        v
+    }
+
+    /// The value `read` returns, without clearing COUNTFLAG.
+    pub fn peek(&self, off: u32) -> u32 {
         match off {
-            0x0 => {
-                let v = self.csr | if self.countflag { COUNTFLAG } else { 0 };
-                self.countflag = false;
-                v
-            }
+            0x0 => self.csr | if self.countflag { COUNTFLAG } else { 0 },
             0x4 => self.rvr,
             0x8 => self.cvr,
             _ => CALIB,
