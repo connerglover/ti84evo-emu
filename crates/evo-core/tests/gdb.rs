@@ -405,6 +405,26 @@ fn oversized_or_wrapping_memory_access_is_refused() {
         assert_eq!(c.cmd("m30000000,801"), "E01", "one byte over the limit");
         assert_eq!(c.cmd("Mffffffff,2:0102"), "E01", "write that wraps");
         assert_eq!(c.cmd("Xfffffffe,4:abcd"), "E01", "binary write that wraps");
+        // Headers that are not canonical `addr,len` (1-8 hex digits each) are refused too:
+        // `gdbstub` would accept them and get around the checks above.
+        let bypasses = [
+            "m000000000000000000fffff000,2000", // zero-padded address, wraps
+            "m30000000,0000000000000000004000", // zero-padded length, too long
+            "m00000000000000000,ffffffff",      // both padded, 4 GiB
+            "m30000000,4000,0",                 // a third field, too long
+            "m0,ffffffff,0",                    // a third field, 4 GiB
+            "M0000000000ffffffff,2:0102",       // zero-padded address, wraps
+            "M30000000,2,0:0102",               // a third field
+            "X00000000030000000,1:a",           // zero-padded address
+        ];
+        for packet in bypasses {
+            assert_eq!(c.cmd(packet), "E01", "{packet}");
+        }
+        assert_eq!(
+            c.cmd("m30000000,4"),
+            "00000000",
+            "a canonical read still works"
+        );
         // GDB's own largest read (PacketSize / 2 bytes) and reads up to the top of memory
         // are served.
         assert_eq!(c.cmd("m30000000,800"), "0".repeat(0x1000));

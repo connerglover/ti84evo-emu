@@ -38,8 +38,9 @@
 //! session on a bad checksum, a NAK or a stray byte: packets with a bad checksum are NAKed
 //! (`-`) and dropped, a reply the client NAKs is sent again, line noise between packets is
 //! skipped, and a well-formed packet that `gdbstub` rejects gets an `E01` reply. Memory
-//! accesses whose range wraps past 0xFFFF_FFFF, and `m` reads longer than `MAX_READ` (2048)
-//! bytes, get `E01` from the link without reaching `gdbstub`.
+//! accesses (`m`, `M`, `X`) get `E01` from the link, without reaching `gdbstub`, when their
+//! range wraps past 0xFFFF_FFFF, when an `m` reads more than `MAX_READ` (2048) bytes, and
+//! whenever their `addr,len` header is not canonical (1-8 hex digits each).
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -829,31 +830,46 @@ const ERROR_REPLY: &[u8] = b"$E01#a6";
 /// bytes, and `gdbstub` reads it in one chunk.
 const MAX_READ: u64 = MAX_PACKET as u64 / 2;
 
-/// Whether the link answers `body` with `E01` itself instead of passing it to `gdbstub`: a
-/// memory access (`m`, `M`, `X`) whose range wraps past 0xFFFF_FFFF, or an `m` read longer
-/// than `MAX_READ`. `gdbstub` 0.7.10 overflows its address on a wrapping read of several
-/// chunks (a panic in debug builds), and the link holds a whole reply in memory (8 GiB for
-/// `m0,ffffffff`). Packets that do not parse are left to `gdbstub`.
+/// Whether the link answers `body` with `E01` itself instead of passing it to `gdbstub`. It
+/// does for every memory access (`m`, `M`, `X`) except one with a canonical header, `addr,len`
+/// with 1 to 8 hex digits each (then `:` and the data for `M` and `X`), whose range ends by
+/// 0xFFFF_FFFF and which, for `m`, reads at most `MAX_READ` bytes.
+///
+/// `gdbstub` 0.7.10 overflows its address on a wrapping read of several chunks (a panic in
+/// debug builds), and the link holds a whole reply in memory (8 GiB for `m0,ffffffff`). The
+/// check fails closed because `gdbstub` parses more liberally than it does: it accepts any
+/// number of leading zeros and ignores fields after the length.
 fn refused(body: &[u8]) -> bool {
     let Some((&kind @ (b'm' | b'M' | b'X'), rest)) = body.split_first() else {
         return false;
     };
-    // `addr,len`, then (for `M` and `X`) `:` and the data.
-    let header = rest.split(|&b| b == b':').next().unwrap_or_default();
-    let mut fields = header.split(|&b| b == b',');
-    let (Some(addr), Some(len), None) = (fields.next(), fields.next(), fields.next()) else {
-        return false;
+    let header = if kind == b'm' {
+        rest
+    } else {
+        match rest.iter().position(|&b| b == b':') {
+            Some(colon) => &rest[..colon],
+            None => return true,
+        }
     };
-    let (Some(addr), Some(len)) = (parse_hex(addr), parse_hex(len)) else {
-        return false;
+    let Some((addr, len)) = canonical_range(header) else {
+        return true;
     };
-    let wraps = addr.checked_add(len).is_none_or(|end| end > 1 << 32);
+    let wraps = addr + len > 1 << 32;
     wraps || (kind == b'm' && len > MAX_READ)
 }
 
-/// A hex number of 1 to 16 digits.
-fn parse_hex(digits: &[u8]) -> Option<u64> {
-    if !(1..=16).contains(&digits.len()) {
+/// `addr,len` with 1 to 8 hex digits each, and nothing else.
+fn canonical_range(header: &[u8]) -> Option<(u64, u64)> {
+    let mut fields = header.split(|&b| b == b',');
+    let (Some(addr), Some(len), None) = (fields.next(), fields.next(), fields.next()) else {
+        return None;
+    };
+    Some((parse_hex32(addr)?, parse_hex32(len)?))
+}
+
+/// A hex number of 1 to 8 digits.
+fn parse_hex32(digits: &[u8]) -> Option<u64> {
+    if !(1..=8).contains(&digits.len()) {
         return None;
     }
     digits.iter().try_fold(0u64, |n, &c| {
@@ -951,12 +967,35 @@ mod tests {
             !refused("M30000000,1000:00"),
             "long writes are bounded by the packet"
         );
-        assert!(refused("mffffffffffffffff,1"), "u64 overflow");
-        // Not a memory access, or not parseable: left to `gdbstub`.
+        assert!(refused("mffffffffffffffff,1"), "16 digits");
+        assert!(!refused("M100b0600,2:00Bf"), "upper-case data");
+        assert!(!refused("mA,B"), "upper-case hex");
+        // Anything but a canonical `addr,len` header (1-8 hex digits each) is refused, since
+        // `gdbstub` parses more liberally than this check.
+        assert!(refused("m10000000000000000,1"), "17 digits");
+        assert!(
+            refused("m000000000000000000fffff000,2000"),
+            "zero-padded address"
+        );
+        assert!(
+            refused("m30000000,0000000000000000004000"),
+            "zero-padded length"
+        );
+        assert!(refused("m030000000,4"), "9 digits");
+        assert!(refused("m30000000,000000004"), "9 digits");
+        assert!(refused("m1,2,3"), "a third field");
+        assert!(refused("m0,ffffffff,0"), "a third field");
+        assert!(refused("M30000000,1,0:aa"), "a third field");
+        assert!(refused("mzz,4"));
+        assert!(refused("m10"));
+        assert!(refused("m,4"));
+        assert!(refused("m10,"));
+        assert!(refused("m"));
+        assert!(refused("m10,4:"), "`m` has no data");
+        assert!(refused("M30000000,1"), "no `:` before the data");
+        assert!(refused("X+1,1:a"));
+        // Not a memory access: left to `gdbstub`.
         assert!(!refused("qSupported:multiprocess+"));
-        assert!(!refused("mzz,4"));
-        assert!(!refused("m10"));
-        assert!(!refused("m1,2,3"));
-        assert!(!refused("m10000000000000000,1"), "17 digits");
+        assert!(!refused("vMustReplyEmpty"));
     }
 }
