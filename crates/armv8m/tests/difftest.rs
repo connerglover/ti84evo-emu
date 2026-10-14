@@ -1187,7 +1187,12 @@ const MEM: &[Template] = &[
             let rn = gp(f[2]);
             let avoid: &[u32] = if w != 0 { &[rn] } else { &[] };
             let rt = gp_not(f[3], avoid);
-            let rt2 = gp_not(f[4], &[rt, if w != 0 { rn } else { rt }]);
+            // LDRD needs Rt != Rt2; STRD does not (a quarter of the stores use Rt2 == Rt).
+            let rt2 = if l == 0 && (f[4] >> 8) & 3 == 0 {
+                rt
+            } else {
+                gp_not(f[4], &[rt, if w != 0 { rn } else { rt }])
+            };
             let b = base(f[5]);
             let imm8 = match (p, u) {
                 (0, _) => (f[1] >> 1) & 0xFF,

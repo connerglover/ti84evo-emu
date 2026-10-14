@@ -67,7 +67,8 @@ fn dual(h1: u32, h2: u32, (p, u, w): (bool, bool, bool), load: bool) -> Option<I
     let imm = field(h2, 0, 8) * 4;
     let ok = gp(rt)
         && gp(rt2)
-        && rt != rt2
+        // Only LDRD requires two different registers; `strd r2, r2, [ip]` is valid.
+        && !(load && rt == rt2)
         && !(w && (rn == rt || rn == rt2))
         // STRD has no literal form; LDRD literal cannot write back.
         && !(rn == 15 && (!load || w));

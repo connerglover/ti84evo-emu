@@ -233,6 +233,24 @@ fn ldrd_strd() {
 }
 
 #[test]
+fn strd_with_rt_equal_rt2_stores_it_twice() {
+    // DDI0553 STRD (immediate) T1 has no `t == t2` rule (only LDRD does). Compilers use it:
+    // the TI-84 Evo secure firmware's memset fills with `strd r2, r2, [ip]`.
+    let (mut cpu, mut bus) = cpu_with_code(&[0xE9CC, 0x2200]);
+    cpu.regs.r[2] = 0xDEAD_BEEF;
+    cpu.regs.r[12] = A;
+    assert_eq!(exec(&mut cpu, &mut bus), "strd r2, r2, [r12]");
+    assert_eq!((get(&bus, A), get(&bus, A + 4)), (0xDEAD_BEEF, 0xDEAD_BEEF));
+    assert_eq!(cpu.regs.r[12], A);
+    // With writeback: strd r1, r1, [r0, #8]!
+    let (mut cpu, mut bus) = cpu_with_code(&[0xE9E0, 0x1102]);
+    cpu.regs.r[..2].copy_from_slice(&[A, 7]);
+    assert_eq!(exec(&mut cpu, &mut bus), "strd r1, r1, [r0, #8]!");
+    assert_eq!((get(&bus, A + 8), get(&bus, A + 12)), (7, 7));
+    assert_eq!(cpu.regs.r[0], A + 8);
+}
+
+#[test]
 fn ldrd_requires_word_alignment() {
     let (mut cpu, mut bus) = cpu_with_code(&[0xE9D2, 0x0100]);
     cpu.regs.r[2] = A + 2;
@@ -705,7 +723,7 @@ fn sp_pc_operand_rules() {
     assert!(is_undef(0xE890, 0xC006)); // ldm with pc and lr
     assert!(is_undef(0xE8BD, 0x2010)); // pop.w with sp
     assert!(is_undef(0xE92D, 0x0010)); // push.w with one register
-    assert!(is_undef(0xE9C2, 0x1101)); // strd t == t2
+    assert!(is_undef(0xE9D2, 0x1101)); // ldrd t == t2 (STRD allows it)
     assert!(is_undef(0xE9C2, 0xD001)); // strd sp
     assert!(is_undef(0xE9CF, 0x0102)); // strd [pc]
     assert!(is_undef(0xE8DF, 0xF00D)); // tbb rm = sp
