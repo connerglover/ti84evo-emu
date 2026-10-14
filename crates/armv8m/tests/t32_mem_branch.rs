@@ -717,3 +717,19 @@ fn unsupported_32bit_encodings_stay_undefined() {
     assert!(is_undef(0xF7F0, 0xA000)); // udf.w
     assert!(is_undef(0xF3BF, 0x8F00)); // reserved barrier op
 }
+
+#[test]
+fn unprivileged_mrs_reads_control_but_not_primask() {
+    // mrs r0, CONTROL ; mrs r1, PRIMASK ; msr CONTROL, r2 (ignored)
+    let (mut cpu, mut bus) = cpu_with_code(&[0xF3EF, 0x8014, 0xF3EF, 0x8110, 0xF382, 0x8814]);
+    cpu.regs.control.s = 1;
+    cpu.regs.primask.s = true;
+    cpu.regs.r[1] = 0x77;
+    cpu.regs.r[2] = 0;
+    assert_eq!(exec(&mut cpu, &mut bus), "mrs r0, CONTROL");
+    assert_eq!(cpu.regs.r[0], 1);
+    exec(&mut cpu, &mut bus);
+    assert_eq!(cpu.regs.r[1], 0);
+    exec(&mut cpu, &mut bus);
+    assert_eq!(cpu.regs.control.s, 1);
+}

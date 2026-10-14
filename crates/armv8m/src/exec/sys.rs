@@ -11,8 +11,8 @@ const APSR_GE: u32 = 0x000F_0000;
 
 /// Resolve a SYSm value to the bank it addresses and its unbanked number. The `_NS` aliases
 /// (0x88..=0x94) reach the Non-Secure bank from Secure state and do not exist otherwise;
-/// everything numbered 8 and up is privileged-only.
-fn resolve_sysm(cpu: &Cpu, sysm: u8) -> Option<(Sec, u8)> {
+/// everything numbered 8 and up is privileged-only except reads of CONTROL.
+fn resolve_sysm(cpu: &Cpu, sysm: u8, write: bool) -> Option<(Sec, u8)> {
     let sec = cpu.regs.sec;
     let (bank, base) = if sysm & 0x80 != 0 {
         if sec != Sec::Secure || !(0x88..=0x94).contains(&sysm) {
@@ -22,12 +22,13 @@ fn resolve_sysm(cpu: &Cpu, sysm: u8) -> Option<(Sec, u8)> {
     } else {
         (sec, sysm)
     };
-    (base < 8 || cpu.is_privileged()).then_some((bank, base))
+    // CONTROL (20) can be read, but not written, without privilege.
+    (base < 8 || cpu.is_privileged() || (!write && base == 20)).then_some((bank, base))
 }
 
 /// `MRS`: unknown, inaccessible or reserved registers read as zero.
 fn read_sysreg(cpu: &Cpu, sysm: u8) -> u32 {
-    let Some((bank, base)) = resolve_sysm(cpu, sysm) else {
+    let Some((bank, base)) = resolve_sysm(cpu, sysm, false) else {
         return 0;
     };
     let r = &cpu.regs;
@@ -60,7 +61,7 @@ fn read_sysreg(cpu: &Cpu, sysm: u8) -> u32 {
 
 /// `MSR`: writes to unknown, inaccessible or read-only registers are ignored.
 fn write_sysreg(cpu: &mut Cpu, sysm: u8, mask: u8, v: u32) {
-    let Some((bank, base)) = resolve_sysm(cpu, sysm) else {
+    let Some((bank, base)) = resolve_sysm(cpu, sysm, true) else {
         return;
     };
     let handler = cpu.regs.handler_mode();
