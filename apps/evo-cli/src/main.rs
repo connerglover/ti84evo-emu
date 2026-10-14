@@ -69,6 +69,12 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // Core diagnostics (`log::warn!`: undefined instructions with their PC, lockup,
+    // unimplemented PPB registers, bad EXC_RETURN values, GDB protocol errors) go to stderr.
+    // `RUST_LOG` overrides the default `warn` filter (e.g. `RUST_LOG=debug`, `RUST_LOG=off`).
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .target(env_logger::Target::Stderr)
+        .init();
     // Not `Cli::parse()`: clap exits with 2 on a usage error, which `run` uses for lockup.
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,

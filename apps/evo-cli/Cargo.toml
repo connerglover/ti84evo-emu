@@ -10,6 +10,7 @@ armv8m = { path = "../../crates/armv8m" }
 evo-core = { path = "../../crates/evo-core" }
 evo-image = { path = "../../crates/evo-image" }
 clap.workspace = true
+env_logger.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2.2"

@@ -98,6 +98,65 @@ fn cli_lockup_exit_code() {
     assert!(out.contains("stop: lockup pc=0x100b0610 cycles="), "{out}");
 }
 
+/// Core diagnostics (`log::warn!`) reach stderr by default: the undefined instruction is
+/// reported with its PC.
+#[test]
+fn cli_logs_warnings_to_stderr() {
+    let bundle = bundle_file("cli_logs_warnings", locking_up());
+    let out = evo_cli()
+        .env_remove("RUST_LOG")
+        .arg("run")
+        .arg(&bundle)
+        .args(["--max-cycles", "1000"])
+        .assert()
+        .code(2)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("undefined instruction 0xde00 at 0x100b0600"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("lockup"), "{stderr}");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("undefined"),
+        "logs go to stderr only"
+    );
+
+    // RUST_LOG overrides the default filter.
+    let out = evo_cli()
+        .env("RUST_LOG", "off")
+        .arg("run")
+        .arg(&bundle)
+        .args(["--max-cycles", "1000"])
+        .assert()
+        .code(2)
+        .get_output()
+        .clone();
+    assert!(
+        out.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A clean run prints nothing on stderr.
+    let bundle = bundle_file("cli_logs_quiet", looping());
+    let out = evo_cli()
+        .env_remove("RUST_LOG")
+        .arg("run")
+        .arg(&bundle)
+        .args(["--max-cycles", "1000"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    assert!(
+        out.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn cli_cycle_limit_exits_zero_and_traces() {
     let bundle = bundle_file("cli_cycle_limit", looping());
