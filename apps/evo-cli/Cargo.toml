@@ -7,5 +7,10 @@ description = "Command-line front end of the TI-84 Evo emulator"
 
 [dependencies]
 armv8m = { path = "../../crates/armv8m" }
+evo-core = { path = "../../crates/evo-core" }
 evo-image = { path = "../../crates/evo-image" }
 clap.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2.2"
+evo-image = { path = "../../crates/evo-image", features = ["testutil"] }

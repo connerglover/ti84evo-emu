@@ -7,8 +7,8 @@
 mod bundle;
 mod layout;
 mod mcuboot;
-#[cfg(test)]
-mod testutil;
+#[cfg(any(test, feature = "testutil"))]
+pub mod testutil;
 
 pub use bundle::{Bundle, Metadata};
 pub use layout::Layout;

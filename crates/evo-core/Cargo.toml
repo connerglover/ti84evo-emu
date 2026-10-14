@@ -5,7 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+armv8m = { path = "../armv8m" }
+evo-hw = { path = "../evo-hw" }
+evo-image = { path = "../evo-image" }
+log.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+evo-image = { path = "../evo-image", features = ["testutil"] }
 serde_json.workspace = true

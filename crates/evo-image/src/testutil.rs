@@ -165,3 +165,13 @@ pub fn bundle_bytes(pkg: &[u8], method: CompressionMethod) -> Vec<u8> {
         method,
     )
 }
+
+/// A `.84b2` whose package holds one image with a 0x400-byte header (like the
+/// real secure image) and `body` as its payload. Placed by
+/// `Layout::EVO_7_1`, the payload starts at flash offset 0x000B_0400, which
+/// is `VTOR_S` (0x100B_0400) through the Secure alias, so `body` starts with
+/// the vector table.
+pub fn secure_image_bundle(body: Vec<u8>) -> Vec<u8> {
+    let img = Img::new(0x400, body);
+    bundle_bytes(&package(&[(0, &img)]), CompressionMethod::Stored)
+}
