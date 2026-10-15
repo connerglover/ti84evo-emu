@@ -816,7 +816,13 @@ fn code_epoch_changes_when_cached_code_can_change() {
     assert!(m.cache_code(0x3000_0100, 2));
     m.write32(0x2001_0000, 1, write_acc()).unwrap();
     assert_eq!(m.code_epoch(), e0, "a write to another page");
-    m.write8(0x2000_FFFF, 1, write_acc()).unwrap();
+    m.write32(0x2000_1000, 1, write_acc()).unwrap();
+    assert_eq!(
+        m.code_epoch(),
+        e0,
+        "another 4 KiB page of the same 64 KiB page"
+    );
+    m.write8(0x2000_0FFF, 1, write_acc()).unwrap();
     let e1 = m.code_epoch();
     assert_ne!(e1, e0, "a write to the code page through the other alias");
     m.write16(0x2000_0010, 1, write_acc()).unwrap();
@@ -838,4 +844,76 @@ fn code_epoch_changes_when_cached_code_can_change() {
     assert_ne!(e4, e3, "poke");
     m.buffer_mut("ram").unwrap()[0] = 1;
     assert_ne!(m.code_epoch(), e4, "buffer_mut");
+}
+
+#[test]
+fn code_is_tracked_per_4k_page() {
+    let mut m = code_map();
+    assert!(m.cache_code(0x2000_2000, 2));
+    let e0 = m.code_epoch();
+    for addr in [0x2000_1FF0, 0x2000_3000, 0x2000_1000] {
+        m.write32(addr, 1, write_acc()).unwrap();
+    }
+    assert_eq!(m.code_epoch(), e0, "neighbouring 4 KiB pages");
+    // An unaligned word checks both pages it touches.
+    m.write32(0x2000_1FFE, 1, write_acc()).unwrap();
+    let e1 = m.code_epoch();
+    assert_ne!(e1, e0, "a word whose last bytes land in the code page");
+    m.write32(0x2000_2FFE, 1, write_acc()).unwrap();
+    assert_ne!(
+        m.code_epoch(),
+        e1,
+        "a word whose first bytes are in the code page"
+    );
+}
+
+/// Changes byte `v >> 8` of "rom" to `v as u8`, declaring just that byte; a write at offset 4
+/// also declares a range in "ram".
+struct RangeProgrammer;
+
+impl Device for RangeProgrammer {
+    fn read(&mut self, _off: u32, _width: u8, _ctx: &mut DevCtx<'_>) -> u32 {
+        0
+    }
+    fn write(&mut self, off: u32, _width: u8, v: u32, ctx: &mut DevCtx<'_>) {
+        let at = (v >> 8) as usize;
+        if let Some(rom) = ctx.buffer_mut_range("rom", at..at + 1) {
+            rom[at] = v as u8;
+        }
+        if off == 4 {
+            ctx.buffer_mut_range("ram", 0x1_0000..0x1_0001);
+        }
+    }
+    fn reset(&mut self, _kind: ResetKind, _ctx: &mut DevCtx<'_>) {}
+    fn save(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    fn load(&mut self, _state: &[u8]) -> Result<(), StateError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_device_declaring_a_range_ends_only_code_cached_from_it() {
+    let mut m = code_map();
+    m.add_device("range", 0x4100_0000, 0x10, Box::new(RangeProgrammer));
+    assert!(m.cache_code(0x0000_3000, 2));
+    let e0 = m.code_epoch();
+    m.write32(0x4100_0000, 0x0000_4011, write_acc()).unwrap();
+    assert_eq!(
+        m.read8(0x0000_0040, acc(S)),
+        Ok(0x11),
+        "the device changed the byte"
+    );
+    m.write32(0x4100_0000, 0x0002_FF22, write_acc()).unwrap();
+    assert_eq!(m.code_epoch(), e0, "bytes in pages without code");
+    m.write32(0x4100_0000, 0x0030_0033, write_acc()).unwrap();
+    let e1 = m.code_epoch();
+    assert_ne!(e1, e0, "a byte in the code page");
+    assert_eq!(m.read8(0x1000_3000, fetch(S)), Ok(0x33));
+    // Ranges in two buffers in one call: the map assumes anything changed.
+    assert!(m.cache_code(0x2000_8000, 2));
+    let e2 = m.code_epoch();
+    m.write32(0x4100_0004, 0x0000_4011, write_acc()).unwrap();
+    assert_ne!(m.code_epoch(), e2, "two buffers");
 }

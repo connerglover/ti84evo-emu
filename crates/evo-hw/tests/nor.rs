@@ -405,12 +405,12 @@ fn nvstate_rejects_truncated() {
 
 #[test]
 fn nvstate_rejects_oversized_file_by_its_size() {
-    // A valid header on a file 256 MiB too long: rejected from its metadata, with the size
+    // A valid header on a file 4 MiB too long: rejected from its metadata, with the size
     // the file has.
     let p = tmp("oversized");
     let good = good_file_bytes();
     std::fs::write(&p, &good[..64]).unwrap();
-    let len = good.len() + (256 << 20);
+    let len = good.len() + (4 << 20);
     std::fs::File::options()
         .write(true)
         .open(&p)

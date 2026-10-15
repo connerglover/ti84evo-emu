@@ -239,3 +239,171 @@ structural change rather than another lever, for example executing straight-line
 without the per-instruction exception and SysTick bookkeeping, or a banked register file
 where SP is a plain register. Inlining choices visibly move the result by ±20 % (see steps 7
 and 10), so any such change should be measured with the thread-CPU harness.
+
+## Round 2
+
+Starting point (commit 4b00b45), thread CPU time, best of three: `busy_loop` 62.5 M cycles/s,
+raw `Cpu::step` loop 77.1 M cycles/s, `boot_to_self_test` 159.0 M cycles/s (138 149 424 awake
+cycles, 15 090 code-epoch changes). The in-repo bench (wall time, host busy with other builds)
+gave 46.4 M and 123.6 M cycles/s.
+
+The sampling harness from step 4 now also prints a histogram by instruction address, which
+`dumpbin /disasm` turns into the hot instructions; the line tables alone attribute most samples
+to the caller once everything is inlined.
+
+### 11. A cloned CPU starts with an empty instruction cache
+
+`Cpu::clone` (e.g. in `Machine::save_state`) copied the 4096-entry instruction cache, 128 KiB.
+The cache is not state, so a clone now starts empty and fills its own.
+
+| | Before | After |
+|---|---|---|
+| `Cpu::clone` | 4 063 ns | 99 ns |
+| `Machine::save_state` | 11.3 ms | 11.4 ms (dominated by SRAM) |
+
+### 12. The registers behind the hint caches are private to `armv8m`
+
+`Nvic::enabled` / `Nvic::pending` (behind the "nothing pending" hint of step 4) and the SAU
+configuration `Sau::ctrl` / `rnr` / `rbar` / `rlar` with `Sau::write` (behind the attribution
+and instruction caches of steps 5 and 9) were public, so code outside the crate could change them
+without updating the hints. They are `pub(crate)` now: the NVIC words change through
+`Nvic::set_enabled` (new) / `set_pending` / `write`, the SAU through the CPU (`Cpu::ppb_write32`
+or a guest store), and `Sau::ctrl()` / `Sau::region(r)` read them. Compile-fail doc tests pin
+both. No throughput change (nothing outside the crate used them).
+
+### 13. SPIF commands that only read the flash leave cached code alone
+
+Starting any SPIF command borrowed the flash buffer for writing (`DevCtx::buffer_mut`), and
+every such borrow starts a new code epoch: the OS's flash reads through the SPIF FIFO threw away
+every decoded instruction. `NorFlash::begin_changes_array` (an erase with WEL set) and
+`NorFlash::write_changes_array` (program data with WEL set) now say when the array can change;
+only then does `Spif` borrow it for writing, and every other command gets an empty slice, which
+the NOR engine never touches for them.
+
+From here on, before/after rows come from alternating runs of the two builds (best of five
+each), because the host's load moves absolute numbers by ±15 % between sessions.
+
+| | Before | After |
+|---|---|---|
+| `boot_to_self_test`, code-epoch changes | 15 090 | 12 253 |
+| `boot_to_self_test`, thread CPU time | 139.4 M cycles/s | 141.0 M cycles/s (awake cycles unchanged) |
+| `busy_loop`, thread CPU time | 53.8 M cycles/s | 53.9 M cycles/s |
+
+### 14. Cached code is tracked by 4 KiB page
+
+After step 13 all 12 253 remaining epoch changes in the boot came from the OS programming
+flash (settings and file-system writes through the SPIF FIFO, far from any code): a device
+that borrowed a buffer for writing invalidated every decoded instruction, and so did any guest
+store into a 64 KiB page that held code anywhere.
+
+- `MemoryMap` remembers cached code per 4 KiB page of each buffer instead of per 64 KiB page,
+  and a store changes the epoch only if it touches such a page (both ends of the access are
+  checked).
+- `DevCtx::buffer_mut_range(name, range)` hands a device the buffer with the promise that it
+  changes only `range`; the map then checks just the code pages in that range.
+  `DevCtx::buffer_mut` still means "anything may have changed".
+  `NorFlash::begin_changes` / `write_changes` give the range an erase or a programmed byte
+  covers, and `Spif` declares exactly that.
+
+Decision: the epoch stays one value per map, so an instruction-cache hit is still a single
+compare; only the trigger is per page. A true per-page epoch would add a dependent load to
+every fetch to save work that, in the real boot, never happens any more.
+
+| | Before | After |
+|---|---|---|
+| `boot_to_self_test`, code-epoch changes | 12 253 | 0 |
+| `boot_to_self_test`, thread CPU time | 131.4 M cycles/s | 136.4 M cycles/s (awake cycles unchanged) |
+| `busy_loop`, thread CPU time | 52.7 M cycles/s | 54.7 M cycles/s |
+
+### 15. `Machine::run` steps in batches inside the CPU
+
+`Cpu::run_steps(bus, budget, before, stop)` calls the step in a loop of its own and returns
+after the step that uses up `budget`, after a step that `stop` (here: "a device ran"), PPB
+misses or a system-reset request end, or on a step that sleeps, hits `BKPT` or locks up.
+`before(bus, pc, secure, elapsed)` runs ahead of every step. With no breakpoint set,
+`Machine::run` hands it the cycles to the next due event or the end of the run. The hook
+writes the trace entry, `pc_hint` and the step's own start time into the map, so every
+device access sees exactly the time it saw before. After the run the machine syncs the bus
+and advances time once. Before the last step of a run no device ran, nothing was queued and
+no event was due, so per-step syncing and advancing would have done nothing there.
+
+`Machine::set_batching(false)` restores the step-by-step loop (`run_with`'s path). Two tests
+pin the equivalence. `batching_matches_single_steps` runs a synthetic program with SysTick
+and device interrupts, device events, pulses and WFI in uneven slices both ways and compares
+the whole machine after every slice (save state, trace, awake cycles). The milestone test
+`batching_is_invisible` boots the real OS with a key script both ways and compares UART0,
+screen and state hashes every 25 M cycles up to 400 M. Breaking any of the moved bookkeeping
+(for example the per-step bus time) fails the first one.
+
+Decision: the batch is a CPU-side loop with host hooks rather than a loop in `Machine` around
+`Cpu::step`. A machine-side loop was tried first and measured 20 % *slower* than the per-step
+loop. It changed how the compiler inlined `Cpu::step`, which costs more than the checks it
+skipped. Inside the CPU the step is inlined into the loop once, and its setup is paid once per
+batch.
+
+| | Before | After |
+|---|---|---|
+| `busy_loop`, thread CPU time | 59.3 M cycles/s | 65.6 M cycles/s (42 %) |
+| `boot_to_self_test`, thread CPU time | 158.0 M cycles/s | 166.4 M cycles/s (107 %; awake cycles unchanged) |
+
+### 16. Timer reads without 128-bit division
+
+The OS polls the TIMER block's counters, and every read computed the elapsed ticks as
+`elapsed * hz / CPU_HZ` in `u128`, a call to `__udivti3` (1.6 % of the boot). The product fits in
+64 bits for 2^48 cycles after a channel's time base (weeks of guest time), so `ticks`, `cur`
+and `latch` now work in `u64` and fall back to the exact 128-bit form only past that.
+`count_is_exact_past_64_bit_products` pins the count on both sides of the boundary.
+
+| | Before | After |
+|---|---|---|
+| `boot_to_self_test`, thread CPU time | 166.4 M cycles/s | 168.6 M cycles/s (awake cycles unchanged) |
+| `busy_loop` | — | unchanged (no timer reads) |
+
+### 17. A larger attribution cache
+
+In the boot profile `Sau::check` and the attribution lookup behind it took about 3 %: the
+256-entry attribution cache of step 5 covers 8 KiB, less than the OS's working set of code,
+stack and data, so lookups kept missing into the SAU region walk. It has 4096 entries now
+(128 KiB covered, 16 KiB of state that is not saved). A flush, on an SAU or IDAU change,
+clears 16 KiB instead of 1 KiB. The boot to the Self-Test screen flushes 13 times.
+
+| | Before | After |
+|---|---|---|
+| `boot_to_self_test`, thread CPU time | 167.5 M cycles/s | 172.1 M cycles/s (awake cycles unchanged) |
+| `busy_loop` | — | unchanged (two blocks) |
+
+### Round 2 result
+
+Branch point 4b00b45 against the final state. Thread CPU time is best of five alternating runs
+of both builds in one session. Wall time is the in-repo bench (`bench.rs`), first and last run
+of this round, with other builds on the host.
+
+| Benchmark | 4b00b45 | Final |
+|---|---|---|
+| `busy_loop`, thread CPU time | 57.8 M cycles/s (37 %) | 67.8 M cycles/s (43 %) |
+| `busy_loop`, in-repo bench (wall) | 48.0 M cycles/s | 60.9 M cycles/s (39 %) |
+| `boot_to_self_test`, thread CPU time | 146.0 M cycles/s | 174.5 M cycles/s (112 %) |
+| `boot_to_self_test`, in-repo bench (wall) | 127.1 M cycles/s | 148.5 M cycles/s (95 %), 52.6 M awake |
+| `boot_to_self_test`, code-epoch changes | 15 090 | 0 |
+
+The boot reaches the same awake-cycle count (138 149 424), the same milestone cycles and the
+same M3 and M4 screen hashes. Difftest (`DIFFTEST_CASES=2000`), the `tools/testprogs`
+programs and every milestone test pass, including the new `batching_is_invisible`.
+
+The target (156 M cycles/s on busy code) is not reached; busy code runs at about 43 % of real
+time. The OS boot is faster than real time because of the WFI skipping.
+
+What was tried and dropped, all measured with alternating runs:
+- A batch loop in `Machine` around `Cpu::step`: 20 % slower (step 15).
+- Inlining the SysTick enable check: +2 % on `busy_loop`, −4 % on the boot.
+- An always-inlined `advance`: neutral to −4 %.
+- `#[repr(align(8))]` / `align(16)` on `Instr`, and handing out the decoded instruction by
+  reference from the cache: all neutral.
+
+The samples that collect where the fetched instruction is first used (about a quarter of
+`busy_loop`) are the serial chain of the interpreter: PC, cache slot, decoded entry, dispatch,
+execute, the next PC. None of the above shortened it. Getting busy code to real time needs a
+structural change that breaks that chain: decoded basic blocks walked by index (the next
+entry's load no longer waits for the previous instruction's PC write), with the PC
+materialized only at block exits, exceptions and device accesses. This is a larger project
+than the levers of this round.

@@ -3,6 +3,7 @@
 //! state, and [`DevHarness`] for driving one device in unit tests.
 
 use std::any::Any;
+use std::ops::Range;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -72,9 +73,42 @@ pub struct DevCtx<'a> {
     pc: u32,
     /// Security of the access (host calls use secure).
     secure: bool,
-    /// Set by [`DevCtx::buffer_mut`]: the map then assumes the buffer changed (cached code
-    /// in it is stale).
-    buffers_written: bool,
+    /// What the device declared it changed in the buffers ([`DevCtx::buffer_mut`],
+    /// [`DevCtx::buffer_mut_range`]): the map checks cached code against it.
+    written: Written,
+}
+
+/// The buffer bytes a device call may have changed, as the device declared them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Written {
+    Nothing,
+    /// Bytes `start..end` of buffer `buf` (an index into the map's buffers).
+    Range {
+        buf: usize,
+        start: usize,
+        end: usize,
+    },
+    /// Anything in any buffer.
+    Everything,
+}
+
+impl Written {
+    /// This declaration widened by bytes `start..end` of buffer `buf`.
+    fn with(self, buf: usize, start: usize, end: usize) -> Written {
+        match self {
+            Written::Nothing => Written::Range { buf, start, end },
+            Written::Range {
+                buf: b,
+                start: s,
+                end: e,
+            } if b == buf => Written::Range {
+                buf,
+                start: s.min(start),
+                end: e.max(end),
+            },
+            _ => Written::Everything,
+        }
+    }
 }
 
 impl<'a> DevCtx<'a> {
@@ -102,15 +136,15 @@ impl<'a> DevCtx<'a> {
             base,
             pc,
             secure,
-            buffers_written: false,
+            written: Written::Nothing,
         }
     }
 }
 
 impl DevCtx<'_> {
-    /// Whether [`buffer_mut`](Self::buffer_mut) was called on this context.
-    pub(crate) fn buffers_written(&self) -> bool {
-        self.buffers_written
+    /// What the device declared it changed through this context.
+    pub(crate) fn written(&self) -> Written {
+        self.written
     }
 
     /// Drive level-sensitive IRQ line `irq` (`irq < 64`; anything else is logged and ignored).
@@ -160,11 +194,21 @@ impl DevCtx<'_> {
     /// them. The map then treats the buffer as changed (code the CPU cached from it is stale),
     /// so a device that only reads uses [`buffer`](Self::buffer).
     pub fn buffer_mut(&mut self, name: &str) -> Option<&mut [u8]> {
-        self.buffers_written = true;
+        self.written = Written::Everything;
         self.buffers
             .iter_mut()
             .find(|b| b.name == name)
             .map(|b| b.data.as_mut_slice())
+    }
+
+    /// The whole RAM or ROM called `name`, like [`buffer_mut`](Self::buffer_mut), with the
+    /// promise that the device changes only bytes `range` of it: the map then treats only code
+    /// cached from `range` as stale. Changing bytes outside `range` is a device bug (the CPU
+    /// may keep running the old instructions there).
+    pub fn buffer_mut_range(&mut self, name: &str, range: Range<usize>) -> Option<&mut [u8]> {
+        let i = self.buffers.iter().position(|b| b.name == name)?;
+        self.written = self.written.with(i, range.start, range.end);
+        Some(self.buffers[i].data.as_mut_slice())
     }
 
     /// Report an access to a register the device does not model: it goes to the unmapped log

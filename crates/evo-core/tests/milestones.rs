@@ -610,13 +610,7 @@ fn m4_image1_launches() {
 
     // The OS runs: by M4_HOME_CYCLES it shows its home screen (the app launcher).
     let stop = os.run_until(M4_HOME_CYCLES.saturating_sub(os.m.sched.now), |_| false);
-    assert_eq!(
-        stop,
-        StopReason::CycleLimit,
-        "UART0:
-{}",
-        os.uart_text()
-    );
+    assert_eq!(stop, StopReason::CycleLimit, "UART0:\n{}", os.uart_text());
     let frame = os.m.screen().expect("the LCD is on");
     let hash = sha256_hex(&frame.rgb);
     let path = scratch_dir().join("m4-home.png");
@@ -1038,7 +1032,7 @@ fn boot_without_keys(nv: NvState) -> Option<Result<u64, StopReason>> {
 /// A fresh unit boots into the diagnostic app; `evo_core::provision` drives the Engineering
 /// menu (Boot Select: Calc OS) and leaves a flash that boots straight to the OS, with no key
 /// input, on every later power-on: through a flash file, and again from the flash that boot
-/// re-saved (`boot-flow.md` §3.5).
+/// re-saved (`boot-flow.md` §3.5). Provisioning that unit again succeeds without toggling.
 #[test]
 fn provisioned_flash_boots_to_os_without_keys() {
     let Some(os) = Os::boot() else {
@@ -1076,4 +1070,66 @@ fn provisioned_flash_boots_to_os_without_keys() {
     let third = boot_without_keys(second.m.nv_state()).expect("not skipped");
     println!("provision: power-on 3 from the re-saved flash: {third:?}");
     assert!(third.is_ok(), "{third:?}");
+
+    // Provisioning an already provisioned unit succeeds and leaves Boot Select alone.
+    let again = evo_core::provision(&mut second.m).expect("re-provisioning succeeds");
+    println!("provision again: {again:?}");
+    assert!(!again.toggled, "Boot Select already read Calc OS");
+}
+
+/// Batched stepping (`Machine::set_batching`, on by default) changes nothing the guest or the
+/// host can see: the same boot with the same key script, batched and one step at a time,
+/// writes the same UART0 bytes, shows the same screen and reaches the same state at every
+/// checkpoint.
+#[test]
+fn batching_is_invisible() {
+    /// Checkpoint spacing and the end of the run.
+    const EVERY: u64 = 25_000_000;
+    const END: u64 = 400_000_000;
+    let script = evo_core::parse_key_script("wait=1000 +alpha wait=300 -alpha 2 enter down enter")
+        .expect("script");
+    let run = |batched: bool| -> Option<Vec<String>> {
+        let mut os = Os::boot()?;
+        os.m.set_batching(batched);
+        // Key changes and checkpoints, in time order (a key change first on a tie).
+        let mut stops: Vec<(u64, Option<usize>)> = script
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (a.at_ms * evo_core::CPU_HZ / 1000, Some(i)))
+            .chain((EVERY..=END).step_by(EVERY as usize).map(|c| (c, None)))
+            .collect();
+        stops.sort_by_key(|&(at, key)| (at, key.is_none()));
+        let mut seen = Vec::new();
+        for (at, key) in stops {
+            while os.m.sched.now < at {
+                let stop = os.m.run(at - os.m.sched.now);
+                let tx = os.m.take_uart_tx(UartPort::Uart0);
+                os.uart0.extend_from_slice(&tx);
+                assert_eq!(stop, StopReason::CycleLimit, "UART0:\n{}", os.uart_text());
+            }
+            match key {
+                Some(i) => os.m.set_key(script[i].key, script[i].pressed),
+                None => seen.push(format!(
+                    "{} awake {} uart {} screen {}",
+                    os.m.sched.now,
+                    os.m.awake_cycles(),
+                    sha256_hex(&os.uart0),
+                    os.m.screen()
+                        .map_or_else(String::new, |f| sha256_hex(&f.rgb)),
+                )),
+            }
+        }
+        seen.push(sha256_hex(&os.m.save_state()));
+        Some(seen)
+    };
+    let Some(batched) = run(true) else {
+        return;
+    };
+    let single = run(false).expect("booted once already");
+    println!(
+        "batching: {} checkpoints, last {}",
+        batched.len(),
+        batched[batched.len() - 2]
+    );
+    assert_eq!(batched, single);
 }

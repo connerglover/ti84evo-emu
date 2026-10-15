@@ -186,6 +186,11 @@ pub struct Machine {
     /// without the time skipped while asleep. Statistics only: not saved.
     #[serde(skip)]
     pub(crate) awake_cycles: u64,
+    /// Set by [`set_batching(false)`](Self::set_batching): `run` checks breakpoints, sleep and
+    /// due events before every step instead of in batches. Not machine state: not saved, and
+    /// a restore keeps it.
+    #[serde(skip)]
+    pub(crate) unbatched: bool,
 }
 
 impl Machine {
@@ -241,12 +246,14 @@ impl Machine {
     /// start over as at power-on.
     pub fn power_cycle(&mut self) {
         let nv = self.nv_state();
+        let unbatched = self.unbatched;
         *self = Self::power_on(
             nv.flash().to_vec(),
             Some(nv.secregs()),
             self.boot_vtor,
             self.bundle_id,
         );
+        self.unbatched = unbatched;
     }
 
     /// The machine at power-on with `flash` (images already placed) and, if given, these NOR
@@ -274,6 +281,7 @@ impl Machine {
             recent: RecentSteps::default(),
             bundle_id,
             awake_cycles: 0,
+            unbatched: false,
         };
         if let Some(secregs) = secregs {
             m.with_dev("spif", |s: &mut Spif, _| s.nor_mut().set_secregs(secregs));
@@ -407,8 +415,114 @@ impl Machine {
     /// previous run stopped at executes it first), on lockup, on a guest `BKPT`, when the
     /// budget is used up, or when the CPU is asleep with nothing left to wake it
     /// ([`StopReason::Idle`]).
+    ///
+    /// While no breakpoint is set, the CPU steps in batches that end at the next due event, when
+    /// a device runs, or when the CPU sleeps; each step does exactly what it does one at a
+    /// time, so the result is the same as [`set_batching(false)`](Self::set_batching).
     pub fn run(&mut self, max_cycles: u64) -> StopReason {
-        self.run_with(max_cycles, |_| ControlFlow::Continue(()))
+        if self.unbatched {
+            return self.run_with(max_cycles, |_| ControlFlow::Continue(()));
+        }
+        let end = self.sched.now.saturating_add(max_cycles);
+        loop {
+            if self.sched.now >= end {
+                return StopReason::CycleLimit;
+            }
+            if self.asleep() {
+                if let Some(stop) = self.idle(end) {
+                    return stop;
+                }
+                continue;
+            }
+            let stop = if self.breakpoints.is_empty() && self.stopped_at.is_none() {
+                self.run_batch(end)
+            } else {
+                self.checked_step(&mut |_| ControlFlow::Continue(()))
+            };
+            if let Some(stop) = stop {
+                return stop;
+            }
+        }
+    }
+
+    /// Whether [`run`](Self::run) steps in batches (the default). Off, it checks breakpoints,
+    /// sleep and due events before every step, like [`run_with`](Self::run_with); the outcome
+    /// is the same either way (this exists to test that). Not saved in a save state.
+    pub fn set_batching(&mut self, on: bool) {
+        self.unbatched = !on;
+    }
+
+    /// Step the awake CPU, with no breakpoint set and nothing to step over, in one
+    /// [`Cpu::run_steps`] run. The run ends when time reaches `end` or the next due event,
+    /// after a step that ran a device (its event requests may move the next deadline), queued
+    /// PPB misses or requested a system reset, or when a step sleeps, hits `BKPT` or locks up.
+    /// At least one step runs.
+    ///
+    /// Each step sees what it sees under `run_with`: its own start time and PC on the bus, and
+    /// the recent trace records it. Only bookkeeping that has nothing to do before the last
+    /// step moves to the end of the run: until then no device ran and nothing was queued, so
+    /// syncing the bus was a no-op, and no event was due, so advancing time fired nothing.
+    fn run_batch(&mut self, end: u64) -> Option<StopReason> {
+        self.stopped_at = None;
+        let start = self.sched.now;
+        let limit = self.sched.next_deadline().map_or(end, |d| d.min(end));
+        let recent = &mut self.recent;
+        let run = self.cpu.run_steps(
+            &mut self.bus,
+            limit.saturating_sub(start),
+            |bus, pc, secure, elapsed| {
+                let now = start + elapsed;
+                recent.push(RecentStep {
+                    cycles: now,
+                    pc,
+                    secure,
+                });
+                bus.pc_hint = pc;
+                bus.now = now;
+            },
+            MemoryMap::device_activity,
+        );
+        self.sync_bus();
+        let (cycles, sleep, stop) = match run.last {
+            StepResult::Executed { .. } => (run.cycles, None, None),
+            // The step does not report its cycles; WFI/WFE cost 1.
+            StepResult::Sleep(kind) => (run.cycles + 1, Some(kind), None),
+            StepResult::Bkpt(imm) => (run.cycles, None, Some(StopReason::Bkpt { pc: run.pc, imm })),
+            StepResult::Lockup => (run.cycles, None, Some(StopReason::Lockup { pc: run.pc })),
+        };
+        self.awake_cycles += cycles;
+        self.advance(cycles);
+        if let Some(kind) = sleep {
+            self.sleep = Some(kind);
+            self.wake_if_due();
+        }
+        if self.cpu.take_sysreset_request() {
+            self.system_reset();
+        }
+        stop
+    }
+
+    /// One step of `run_with` on the awake CPU: stop at a breakpoint (unless it is the one the
+    /// last run stopped at), call `before_step`, step.
+    #[inline(always)]
+    fn checked_step(
+        &mut self,
+        before_step: &mut impl FnMut(&mut Self) -> ControlFlow<()>,
+    ) -> Option<StopReason> {
+        let pc = self.cpu.regs.pc;
+        let resumed = self.stopped_at.take() == Some(pc);
+        if !resumed && !self.breakpoints.is_empty() && self.breakpoints.contains(&pc) {
+            self.stopped_at = Some(pc);
+            return Some(StopReason::Breakpoint(pc));
+        }
+        if before_step(self).is_break() {
+            // Still on the breakpoint this run resumed from: the next run steps over it.
+            if resumed {
+                self.stopped_at = Some(pc);
+            }
+            return Some(StopReason::Halted);
+        }
+        self.step_cpu()
     }
 
     /// [`run`](Self::run), calling `before_step` with the machine before each CPU step (not
@@ -430,20 +544,7 @@ impl Machine {
                 }
                 continue;
             }
-            let pc = self.cpu.regs.pc;
-            let resumed = self.stopped_at.take() == Some(pc);
-            if !resumed && !self.breakpoints.is_empty() && self.breakpoints.contains(&pc) {
-                self.stopped_at = Some(pc);
-                return StopReason::Breakpoint(pc);
-            }
-            if before_step(self).is_break() {
-                // Still on the breakpoint this run resumed from: the next run steps over it.
-                if resumed {
-                    self.stopped_at = Some(pc);
-                }
-                return StopReason::Halted;
-            }
-            if let Some(stop) = self.step_cpu() {
+            if let Some(stop) = self.checked_step(&mut before_step) {
                 return stop;
             }
         }

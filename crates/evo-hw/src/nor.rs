@@ -14,6 +14,7 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -113,6 +114,29 @@ impl NorFlash {
 
     fn clear_wel(&mut self) {
         self.sr1 &= !WEL;
+    }
+
+    /// The bytes of a `flash_len`-byte array that [`begin`](Self::begin) of `op` at `addr` would
+    /// change now: an erase with the write-enable latch set. `None` for any other command;
+    /// `begin` then leaves `flash` alone (an empty slice does), so the caller need not borrow
+    /// the array for writing.
+    pub fn begin_changes(&self, op: u8, addr: u32, flash_len: usize) -> Option<Range<usize>> {
+        if !self.wel() {
+            return None;
+        }
+        erase_range(op, addr, flash_len)
+    }
+
+    /// The bytes of a `flash_len`-byte array the next [`write_byte`](Self::write_byte) would
+    /// change: one byte while a page program phase is open and the write-enable latch is set.
+    /// `None` otherwise; `write_byte` then leaves `flash` alone (an empty slice does).
+    pub fn write_changes(&self, flash_len: usize) -> Option<Range<usize>> {
+        let p = self.phase?;
+        if !self.wel() || p.kind != DataPhase::Write || !matches!(p.op, 0x02 | 0x32) {
+            return None;
+        }
+        let a = wrap(p.addr, flash_len)?;
+        Some(a..a + 1)
     }
 
     /// Starts command `op` at `addr` with a data length of `len` bytes, aborting any open phase.
@@ -277,23 +301,25 @@ impl NorFlash {
     }
 }
 
-/// Erases the 4K/32K/64K block (or the whole chip) that `addr` falls in.
-fn erase(op: u8, addr: u32, flash: &mut [u8]) {
+/// The bytes erase command `op` at `addr` clears in an array of `len` bytes: the 4K/32K/64K
+/// block `addr` falls in, or the whole chip. `None` for other commands and an empty array.
+fn erase_range(op: u8, addr: u32, len: usize) -> Option<Range<usize>> {
     let size = match op {
         0x20 => 4 << 10,
         0x52 => 32 << 10,
         0xD8 => 64 << 10,
-        _ => {
-            flash.fill(ERASED);
-            return;
-        }
+        0xC7 | 0x60 => return (len > 0).then_some(0..len),
+        _ => return None,
     };
-    let Some(a) = wrap(addr, flash.len()) else {
-        return;
-    };
-    let start = a & !(size - 1);
-    let end = (start + size).min(flash.len());
-    flash[start..end].fill(ERASED);
+    let start = wrap(addr, len)? & !(size - 1);
+    Some(start..(start + size).min(len))
+}
+
+/// Erases the 4K/32K/64K block (or the whole chip) that `addr` falls in.
+fn erase(op: u8, addr: u32, flash: &mut [u8]) {
+    if let Some(r) = erase_range(op, addr, flash.len()) {
+        flash[r].fill(ERASED);
+    }
 }
 
 const MAGIC: &[u8; 8] = b"EVOFLASH";
@@ -312,6 +338,10 @@ pub enum NvError {
     Version(u32),
     #[error("flash file size: expected {expected} bytes, found {found}")]
     Size { expected: usize, found: usize },
+    /// The file had `expected` bytes when its size was checked but more when it was read: it
+    /// grew while being read.
+    #[error("flash file grew while it was read: more than the {expected} bytes it had")]
+    Grew { expected: usize },
 }
 
 /// The non-volatile state: the flash array and the security registers.
@@ -366,10 +396,13 @@ impl NvState {
     pub fn read_file(path: &Path) -> Result<Self, NvError> {
         let mut file = File::open(path)?;
         let found = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+        Self::read_from(&mut file, found)
+    }
+
+    /// [`read_file`](Self::read_file) on an open file whose metadata gave its size as `found`.
+    fn read_from(file: &mut impl Read, found: usize) -> Result<Self, NvError> {
         let mut header = Vec::with_capacity(HEADER_LEN);
-        (&mut file)
-            .take(HEADER_LEN as u64)
-            .read_to_end(&mut header)?;
+        file.take(HEADER_LEN as u64).read_to_end(&mut header)?;
         let n = MAGIC.len().min(header.len());
         if header[..n] != MAGIC[..n] {
             return Err(NvError::BadMagic);
@@ -403,26 +436,29 @@ impl NvState {
         file.read_exact(&mut flash)?;
         let mut secregs = vec![0; SECREGS_LEN];
         file.read_exact(&mut secregs)?;
-        // The file grew after its size was checked: not a file this build wrote.
+        // The file grew after its size was checked: not a file this build wrote. Its new size
+        // is not known (it may still be growing), so it gets its own error.
         let mut extra = [0u8; 1];
         if file.read(&mut extra)? != 0 {
-            return Err(NvError::Size {
-                expected: FILE_LEN,
-                found: FILE_LEN + 1,
-            });
+            return Err(NvError::Grew { expected: FILE_LEN });
         }
         Self::new(flash, secregs)
     }
 
     /// Writes the flash file atomically ([`write_atomic`]).
     pub fn write_file(&self, path: &Path) -> Result<(), NvError> {
+        Ok(write_atomic(path, &self.to_bytes())?)
+    }
+
+    /// The flash-file bytes ([`FILE_LEN`] of them).
+    fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(FILE_LEN);
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
         out.extend_from_slice(&(NOR_SIZE as u32).to_le_bytes());
         out.extend_from_slice(&self.flash);
         out.extend_from_slice(&self.secregs);
-        Ok(write_atomic(path, &out)?)
+        out
     }
 }
 
@@ -443,4 +479,20 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_that_grew_after_its_size_check_is_reported_as_grown() {
+        // The metadata said FILE_LEN, but the reader yields more: the file grew in between.
+        let mut bytes = NvState::erased().to_bytes();
+        assert_eq!(bytes.len(), FILE_LEN);
+        assert!(NvState::read_from(&mut bytes.as_slice(), FILE_LEN).is_ok());
+        bytes.push(0);
+        let e = NvState::read_from(&mut bytes.as_slice(), FILE_LEN).expect_err("accepted");
+        assert!(matches!(e, NvError::Grew { expected: FILE_LEN }), "{e:?}");
+    }
 }

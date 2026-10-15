@@ -25,6 +25,8 @@
 //! **Save state** holds the registers, SR1-SR3 and the open data phase; the security registers
 //! are not part of it ([`NorFlash`] skips them) and [`Device::load`] keeps the current ones.
 
+use std::ops::Range;
+
 use serde::{Deserialize, Serialize};
 
 use crate::nor::{DataPhase, NorFlash};
@@ -89,10 +91,20 @@ impl Default for Spif {
     }
 }
 
-/// The flash bytes, or an empty slice when the map has no flash buffer (unmapped: reads 0xFF,
-/// writes dropped; `Spif::start` warns).
-fn flash<'c>(ctx: &'c mut DevCtx<'_>) -> &'c mut [u8] {
-    ctx.buffer_mut(FLASH_BUFFER).unwrap_or(&mut [])
+/// The flash bytes for a NOR operation that `changes` the given range of them, or an empty
+/// slice when the map has no flash buffer (unmapped: reads 0xFF, writes dropped; `Spif::start`
+/// warns). An operation that changes nothing gets an empty slice too. The buffer is borrowed
+/// with exactly the changed range, so the map drops only code cached from those bytes.
+fn flash<'c>(ctx: &'c mut DevCtx<'_>, changes: Option<Range<usize>>) -> &'c mut [u8] {
+    let Some(range) = changes else {
+        return &mut [];
+    };
+    ctx.buffer_mut_range(FLASH_BUFFER, range).unwrap_or(&mut [])
+}
+
+/// Length of the map's flash buffer (0 without one).
+fn flash_len(ctx: &DevCtx<'_>) -> usize {
+    ctx.buffer(FLASH_BUFFER).map_or(0, <[u8]>::len)
 }
 
 /// Whether command `op` reads, programs or erases the flash array.
@@ -146,7 +158,8 @@ impl Spif {
         if touches_array(op) && ctx.buffer(FLASH_BUFFER).is_none() {
             log::warn!("spif: op {op:#04x} without a flash buffer: reads 0xFF, writes dropped");
         }
-        let kind = self.nor.begin(op, addr, self.regs.len, flash(ctx));
+        let changes = self.nor.begin_changes(op, addr, flash_len(ctx));
+        let kind = self.nor.begin(op, addr, self.regs.len, flash(ctx, changes));
         self.kind = kind;
         // DONE means "transfer finished": at once unless data is still to be written.
         self.regs.done = kind != DataPhase::Write;
@@ -170,7 +183,11 @@ impl Spif {
             if self.left(DataPhase::Write) == 0 {
                 return;
             }
-            if self.nor.write_byte((v >> (8 * i)) as u8, flash(ctx)) {
+            let changes = self.nor.write_changes(flash_len(ctx));
+            if self
+                .nor
+                .write_byte((v >> (8 * i)) as u8, flash(ctx, changes))
+            {
                 self.regs.done = true;
             }
         }

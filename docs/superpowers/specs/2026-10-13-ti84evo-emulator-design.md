@@ -25,8 +25,8 @@ Assumptions (confirmed with the user):
 
 ## 2. Background and evidence
 
-All reverse-engineering material lives outside the repo
-(`Documents\ti84evo-re\`) and is never committed.
+All reverse-engineering material lives in a local folder outside the repo and is never
+committed.
 
 ### 2.1 TI's web emulator
 

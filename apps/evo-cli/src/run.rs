@@ -221,7 +221,18 @@ fn run(args: RunArgs, interrupt: &AtomicBool) -> ExitCode {
     }
     let code = match &args.save_state {
         Some(path) => match write_state(path, &machine.save_state()) {
-            Ok(()) => code,
+            Ok(()) => {
+                if args.flash_file.is_none() {
+                    // The state is tied to this run's flash, which is not kept anywhere.
+                    eprintln!(
+                        "evo-cli: note: {} holds no flash and this run used no --flash-file; \
+                         --load-state accepts it only on the same flash, so it fails if the \
+                         guest wrote flash (pass --flash-file to keep the flash)",
+                        path.display()
+                    );
+                }
+                code
+            }
             Err(e) => {
                 eprintln!("evo-cli: {}: {e}", path.display());
                 ExitCode::FAILURE

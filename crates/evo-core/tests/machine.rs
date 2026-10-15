@@ -1341,3 +1341,55 @@ fn on_key_does_not_force_a_wake_from_ordinary_sleep() {
     assert!(m.asleep(), "IRQ 0 is masked: the WFI stays asleep");
     assert_eq!(wake_status(&m), 0);
 }
+
+/// Batched stepping (`Machine::set_batching`, on by default) and stepping one at a time
+/// reach the same machine at every point: a program that takes SysTick and device
+/// interrupts, schedules device events, pulses IRQs and sleeps, run in uneven slices.
+#[test]
+fn batching_matches_single_steps() {
+    const L_RVR: u32 = LIT + 0x20;
+    const L_CSR: u32 = LIT + 0x24;
+    let mut p = Payload::device_test(&[
+        I::Ld(0, L_PROBE),
+        I::Ld(1, L_ISER0),
+        I::H(0x2260), // movs r2, #0x60 (IRQ 5 and 6)
+        I::H(0x600A), // str r2, [r1]
+        I::Ld(1, L_RVR),
+        I::H(0x2225), // movs r2, #37
+        I::H(0x600A),
+        I::Ld(1, L_CSR),
+        I::H(0x2207), // movs r2, #7 (enable, interrupt, processor clock)
+        I::H(0x600A),
+        // loop: ask for an event in 50 cycles, pulse IRQ 6, count, sleep, count, again.
+        I::H(0x2132), // movs r1, #50
+        str_r1_r0(4),
+        str_r1_r0(8),
+        I::H(0x3601), // adds r6, #1
+        I::H(WFI),
+        I::H(0x3701), // adds r7, #1
+        I::H(0xE7F8), // b loop
+    ]);
+    p.word(L_RVR, SYST_RVR)
+        .word(L_CSR, SYST_CSR)
+        .vector(SYSTICK, H6);
+    let mut batched = boot_with_probe(&p, Probe::default());
+    let mut single = boot_with_probe(&p, Probe::default());
+    single.set_batching(false);
+    let slices = [1, 7, 100, 333, 1_000, 4_096, 10_000, 3, 50_000, 77_777];
+    for (i, &n) in slices.iter().cycle().take(20).enumerate() {
+        let a = batched.run(n);
+        let b = single.run(n);
+        assert_eq!(a, b, "slice {i}");
+        assert_eq!(batched.sched.now, single.sched.now, "slice {i}");
+        assert_eq!(batched.awake_cycles(), single.awake_cycles(), "slice {i}");
+        assert_eq!(batched.cpu, single.cpu, "slice {i}");
+        assert_eq!(probe(&batched).events, probe(&single).events, "slice {i}");
+        assert_eq!(batched.recent_trace(), single.recent_trace(), "slice {i}");
+        assert_eq!(batched.save_state(), single.save_state(), "slice {i}");
+    }
+    let r = &batched.cpu.regs.r;
+    assert!(
+        r[4] > 100 && r[5] > 100 && r[7] > 100,
+        "IRQs and wake-ups ran: {r:?}"
+    );
+}

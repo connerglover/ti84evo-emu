@@ -340,3 +340,121 @@ fn soc_attaches_spif() {
     evo_hw::soc::attach(&mut map);
     assert!(map.device::<Spif>("spif").is_some());
 }
+
+/// Code the CPU cached from flash (`Bus::cache_code`) stays valid across SPIF commands that
+/// only read the part: just erases, programs and status-register writes may change bytes, and
+/// only those change the code epoch.
+#[test]
+fn only_commands_that_change_flash_end_cached_code() {
+    use armv8m::{Access, AccessKind, Bus};
+
+    const SPIF: u32 = 0x5000_1000;
+    let acc = |kind| Access {
+        kind,
+        secure: true,
+        privileged: true,
+    };
+    let mut map = MemoryMap::new();
+    map.add_rom(FLASH_BUFFER, vec![0xFF; NOR_SIZE], &[0x1000_0000]);
+    evo_hw::soc::attach(&mut map);
+    assert!(map.cache_code(0x1000_0000, 2));
+    let run = |map: &mut MemoryMap, op: u32, cfg: u32, addr: u32, len: u32| {
+        for (off, v) in [(INT, 1), (ADDR, addr), (CFG, cfg), (LEN, len), (OP, op)] {
+            map.write32(SPIF + off, v, acc(AccessKind::Write)).unwrap();
+        }
+        map.write32(SPIF + CTRL, 0x1102, acc(AccessKind::Write))
+            .unwrap();
+        map.code_epoch()
+    };
+    let e0 = map.code_epoch();
+    assert_eq!(run(&mut map, 0x0300_0000, CFG_ADDR3, 0, 4), e0, "READ");
+    for _ in 0..4 {
+        map.read8(SPIF + FIFO, acc(AccessKind::Read)).unwrap();
+    }
+    assert_eq!(map.code_epoch(), e0, "popping read data");
+    assert_eq!(run(&mut map, 0x9F00_0000, CFG_NOADDR, 0, 3), e0, "JEDEC ID");
+    assert_eq!(run(&mut map, RDSR, CFG_NOADDR, 0, 1), e0, "RDSR");
+    assert_eq!(run(&mut map, WREN, CFG_NOADDR, 0, 0), e0, "WREN");
+    let e1 = run(&mut map, 0x2000_0006, CFG_ADDR3, 0, 0);
+    assert_ne!(e1, e0, "sector erase with WEL");
+    assert_eq!(
+        run(&mut map, 0x2000_0006, CFG_ADDR3, 0, 0),
+        e1,
+        "erase without WEL"
+    );
+    run(&mut map, WREN, CFG_NOADDR, 0, 0);
+    let e2 = run(&mut map, 0x0200_0002, CFG_ADDR3, 0, 4);
+    assert_eq!(e2, e1, "a program command before its data");
+    map.write32(SPIF + FIFO, 0x1234_5678, acc(AccessKind::Write))
+        .unwrap();
+    assert_ne!(map.code_epoch(), e2, "program data");
+    assert_eq!(
+        map.read32(0x1000_0000, acc(AccessKind::Read)),
+        Ok(0x1234_5678)
+    );
+}
+
+/// Erases and programs away from cached code keep it: the SPIF declares only the bytes an
+/// erase block or a programmed byte covers. A chip erase covers everything.
+#[test]
+fn flash_changes_away_from_cached_code_keep_it() {
+    use armv8m::{Access, AccessKind, Bus};
+
+    const SPIF: u32 = 0x5000_1000;
+    let acc = |kind| Access {
+        kind,
+        secure: true,
+        privileged: true,
+    };
+    let mut map = MemoryMap::new();
+    map.add_rom(FLASH_BUFFER, vec![0xFF; NOR_SIZE], &[0x1000_0000]);
+    evo_hw::soc::attach(&mut map);
+    assert!(map.cache_code(0x1001_0000, 2));
+    let run = |map: &mut MemoryMap, op: u32, cfg: u32, addr: u32, len: u32| {
+        for (off, v) in [(INT, 1), (ADDR, addr), (CFG, cfg), (LEN, len), (OP, op)] {
+            map.write32(SPIF + off, v, acc(AccessKind::Write)).unwrap();
+        }
+        map.write32(SPIF + CTRL, 0x1102, acc(AccessKind::Write))
+            .unwrap();
+        map.code_epoch()
+    };
+    let e0 = map.code_epoch();
+    run(&mut map, WREN, CFG_NOADDR, 0, 0);
+    assert_eq!(
+        run(&mut map, 0x2000_0006, CFG_ADDR3, 0x1_1000, 0),
+        e0,
+        "4K erase next door"
+    );
+    run(&mut map, WREN, CFG_NOADDR, 0, 0);
+    run(&mut map, 0x0200_0002, CFG_ADDR3, 0x0_FFFC, 4);
+    map.write32(SPIF + FIFO, 0x1234_5678, acc(AccessKind::Write))
+        .unwrap();
+    assert_eq!(map.code_epoch(), e0, "program right below the code page");
+    assert_eq!(
+        map.read32(0x1000_FFFC, acc(AccessKind::Read)),
+        Ok(0x1234_5678)
+    );
+    run(&mut map, WREN, CFG_NOADDR, 0, 0);
+    let e1 = run(&mut map, 0x5200_0006, CFG_ADDR3, 0x0_8000, 0);
+    assert_eq!(e1, e0, "32K erase of the block below");
+    assert_eq!(map.read32(0x1000_FFFC, acc(AccessKind::Read)), Ok(u32::MAX));
+    run(&mut map, WREN, CFG_NOADDR, 0, 0);
+    assert_eq!(
+        run(&mut map, 0xD800_0006, CFG_ADDR3, 0x0_8000, 0),
+        e0,
+        "64K erase below"
+    );
+    run(&mut map, WREN, CFG_NOADDR, 0, 0);
+    assert_ne!(
+        run(&mut map, 0xD800_0006, CFG_ADDR3, 0x1_8000, 0),
+        e0,
+        "64K erase of it"
+    );
+    let e2 = map.code_epoch();
+    run(&mut map, WREN, CFG_NOADDR, 0, 0);
+    assert_ne!(
+        run(&mut map, 0xC700_0002, CFG_NOADDR, 0, 0),
+        e2,
+        "chip erase"
+    );
+}

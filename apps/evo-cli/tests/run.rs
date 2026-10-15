@@ -1001,3 +1001,42 @@ fn cli_keys_wake_idle_guest() {
     // The press comes at 100 ms; the release at 150 ms is applied before the run ends.
     assert!(cycles >= 150 * evo_core::CPU_HZ / 1000, "{out}");
 }
+
+/// `--save-state` without `--flash-file` notes on stderr that loading the state later needs
+/// the same flash (the flash is not in a save state); with `--flash-file` there is no note.
+#[test]
+fn cli_save_state_without_flash_file_notes_it() {
+    let bundle = bundle_file("cli_save_state_note", looping());
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let state = dir.join("cli_save_state_note.state");
+    let stderr = |cmd: &mut Command| {
+        let out = cmd.assert().code(0).get_output().clone();
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let without = stderr(
+        evo_cli()
+            .env_remove("RUST_LOG")
+            .arg("run")
+            .arg(&bundle)
+            .args(["--max-cycles", "1000", "--save-state"])
+            .arg(&state),
+    );
+    assert!(
+        without.contains("note:") && without.contains("--flash-file"),
+        "{without}"
+    );
+    let flash = flash_file("cli_save_state_note");
+    let with = stderr(
+        evo_cli()
+            .env_remove("RUST_LOG")
+            .arg("run")
+            .arg(&bundle)
+            .args(["--max-cycles", "1000", "--save-state"])
+            .arg(&state)
+            .arg("--flash-file")
+            .arg(&flash),
+    );
+    assert!(!with.contains("note:"), "{with}");
+    let _ = std::fs::remove_file(&state);
+    let _ = std::fs::remove_file(&flash);
+}
