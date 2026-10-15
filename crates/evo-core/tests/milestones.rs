@@ -396,9 +396,9 @@ fn m2_no_boot_combo() {
 }
 
 /// A cycle inside the window where the BSP's TI logo is on the screen alone (about 80 M to
-/// 100 M: drawn with the `Starting BSP` banner, joined by a busy spinner by 105 M; `boot-flow.md`
+/// 100 M: drawn with the `Starting BSP` banner, joined by a busy spinner by 110 M; `boot-flow.md`
 /// "M3 notes"). `m3_find_settled_logo` cannot find this frame: its 50 M slices start after it,
-/// and what it reports is a step of the charging animation that follows.
+/// and what it reports is the Self-Test unit-info screen that follows.
 const M3_CYCLES: u64 = 90_000_000;
 /// Lowercase hex SHA-256 of the approved logo frame's `Frame::rgb` (a hash holds no TI data).
 const M3_SCREEN_SHA256: &str = "f90877dd5646659cb227dab64bbe301c88207c995eeb708a6843e50d3dc86c30";
@@ -416,9 +416,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// The workspace `target/` directory.
-fn target_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")
+/// Cargo's scratch directory for this test target (under `CARGO_TARGET_DIR` when it is set).
+fn scratch_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
 }
 
 /// Write `frame` as an RGB8 PNG.
@@ -434,8 +434,8 @@ fn write_png(path: &std::path::Path, frame: &evo_hw::dev::lcdc::Frame) {
 /// Search helper, run by hand: from the M2 BSP-banner cycle, run in [`M3_SLICE`] slices up to
 /// [`M3_SEARCH_END`]; after each slice hash `screen()`; stop after three identical non-blank
 /// frames in a row; print the first cycle of the run of three and write that frame to
-/// `target/m3.png`. With OS 7.1.0.4421 it stops on the charging animation (`boot-flow.md`
-/// "M3 notes"), whose steps last longer than three slices; see [`M3_CYCLES`].
+/// `m3.png` in [`scratch_dir`]. With OS 7.1.0.4421 on a fresh unit it settles on the Self-Test
+/// app's unit-info screen (`boot-flow.md` "M3 notes"), not the logo; see [`M3_CYCLES`].
 #[test]
 #[ignore]
 fn m3_find_settled_logo() {
@@ -467,7 +467,7 @@ fn m3_find_settled_logo() {
         };
         if let Some((first, h, 3)) = &run {
             println!("m3: settled at cycle {first}: {h}");
-            let path = target_dir().join("m3.png");
+            let path = scratch_dir().join("m3.png");
             write_png(&path, &frame);
             println!("m3: wrote {}", path.display());
             return;
@@ -526,6 +526,12 @@ const IMAGE1_ENTRY: u32 = 0x0044_BC90;
 const OS_SERVICE_TABLE_PTR: u32 = 0x2009_B100;
 /// `m4_image1_launches` cycle budget: the measured launch cycle rounded up to the next 500 M.
 const M4_BUDGET: u64 = 1_000_000_000;
+/// `m4_image1_launches` checks the OS home screen at this cycle (about 9 s of guest time; the
+/// home screen is up by about 7.9 s, `boot-flow.md` "M4 notes").
+const M4_HOME_CYCLES: u64 = 1_400_000_000;
+/// Lowercase hex SHA-256 of the OS home screen's `Frame::rgb` at [`M4_HOME_CYCLES`], checked by
+/// eye (`boot-flow.md` "M4 notes"; a hash holds no TI data).
+const M4_HOME_SHA256: &str = "1be6b6abb527b928ba5048d8f1c2b4a4a4887b4faf65343cf73e9e22b3a34984";
 /// Guest milliseconds to cycles.
 const fn ms(n: u64) -> u64 {
     n * 156_000
@@ -601,6 +607,26 @@ fn m4_image1_launches() {
         String::from_utf8_lossy(&os.uart0[uart_before..])
     );
     assert_eq!(os.m.bus.irq_lines() & FATAL_STUB_IRQS, 0);
+
+    // The OS runs: by M4_HOME_CYCLES it shows its home screen (the app launcher).
+    let stop = os.run_until(M4_HOME_CYCLES.saturating_sub(os.m.sched.now), |_| false);
+    assert_eq!(
+        stop,
+        StopReason::CycleLimit,
+        "UART0:
+{}",
+        os.uart_text()
+    );
+    let frame = os.m.screen().expect("the LCD is on");
+    let hash = sha256_hex(&frame.rgb);
+    let path = scratch_dir().join("m4-home.png");
+    write_png(&path, &frame);
+    println!(
+        "m4: screen at cycle {} is {hash} ({})",
+        os.m.sched.now,
+        path.display()
+    );
+    assert_eq!(hash, M4_HOME_SHA256, "not the OS home screen");
 }
 
 // ---- Every key on the OS (`keypad.md` "Verification on the OS") ----
@@ -1028,7 +1054,7 @@ fn provisioned_flash_boots_to_os_without_keys() {
     assert!(report.toggled, "Boot Select was Self-Test on a fresh unit");
 
     // Through a flash file, as `evo-cli provision --flash-file` writes it.
-    let path = target_dir().join("provisioned.evoflash");
+    let path = scratch_dir().join("provisioned.evoflash");
     m.nv_state()
         .write_file(&path)
         .expect("write the flash file");
