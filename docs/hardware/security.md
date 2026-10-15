@@ -368,7 +368,7 @@ The mapping from PPC position to peripheral is unknown (open question 2).
 | +0x04 | CLKSEL / DIV | bit 0 = sysclk from PLL; [10:8] = HCLK shift; [18:16] = PCLK shift | R (clock getters); RMW `&= ~1` / `\|= 1` (`pll_enable`) | **`0x0002_0001`** (post-BL2 state: 156 MHz sysclk, 39 MHz PCLK) |
 | +0x08 | WAKE_STATUS (likely) | [7:0]; decoded bit0→0, bit1→1, bit6→2, bit3→3, bit4→4, else 5. Non-zero means WFI is skipped in deep sleep | R; W 0 to clear | 0 |
 | +0x0C | UID_LO | 32 bits | R | any fixed value |
-| +0x10 | CHIPINFO | bit 30 = **chip-variant/revision bit** (not a ready flag); [29:25] = strap/board variant; [19:0] = UID_HI | R only | 0 (see below) |
+| +0x10 | CHIPINFO | bit 30 = **chip-variant/revision bit** (not a ready flag); [29:25] = strap/board variant (the hardware product ID, 1); [19:0] = UID_HI | R only | 0x0200_0000 (see below) |
 | +0x14 | CLKEN0 | clock-enable bits 0..16 | RMW | 0. After boot: `0x0001_97D0` |
 | +0x18 | CLKEN1 | clock-enable bits 17..31, stored shifted (bit k → bit k-17) | RMW | 0. After boot: `0x0000_0160` |
 | +0x1C | PLLCTRL | bit 0 = enable, bit 1 = **LOCK (polled)**, [5:4] = post-div M (÷ `32>>M`), [14:8] = N | W 0x3430 then 0x3431; R (getters, poll) | **`0x0000_3433`** post-BL2, i.e. N = 0x34 (52), M = 3 (÷4), enabled and locked |
@@ -509,8 +509,8 @@ model "pending wake skips the sleep".
 - Storage-backed 32-bit registers over 0x000..0xFFF, with these exceptions:
   - `+0xFC`: read-only `0x0011_0000`.
   - `+0x1C`: stored; on read, `bit1 = bit0`.
-  - `+0x10`, `+0x0C`: read-only constants. Use `+0x10 = 0x0000_0000` (bit 30 clear, which
-    gives the HW-rev-10 path, strap 0) unless better data appears. `+0x0C` is any UID.
+  - `+0x10`, `+0x0C`: read-only constants. `+0x10 = 0x0200_0000`: bit 30 clear (the
+    HW-rev-10 path) and strap [29:25] = 1 (Task 24, below). `+0x0C` is any UID.
   - `+0x08`, `+0x60`: storage, reset 0, cleared by the firmware writing 0 (plain store
     semantics suffice).
 - Reset values: `+0x04 = 0x0002_0001` and `+0x1C = 0x0000_3433`; everything else 0. Keep
@@ -630,8 +630,14 @@ clocking or QSPI drive.
 3. **CRU +0x08 vs +0x60:** which is the wake cause and which the reset cause, and which bit
    means power-on reset? The Power-partition enum decode is known (above); the bit
    semantics are not.
-4. **CRU +0x10 bit 30 and [29:25] on real units:** is the variant bit set on shipping
-   hardware (revision 9 vs 10)? Bit 30 = 1 clears DOMCFG bits 6:5 in SystemInit.
+4. **CRU +0x10 bit 30 on real units:** is the variant bit set on shipping hardware
+   (revision 9 vs 10)? Bit 30 = 1 clears DOMCFG bits 6:5 in SystemInit. **Strap [29:25]
+   (decided, Task 24): 1.** With OTP item 50 reading 0 (the OTP is not modelled), the Info
+   partition init (0x100d7d74..0x100d7da0) stores `cru_get_strap()` at S 0x3000_09F0 as the
+   hardware product ID; secure service 0x4000_0106 type 16 returns it, and the OS service
+   (0x4000_0107) rejects image 1 unless it equals the image's protected TLV 0xA0
+   (0x100bdccc..0x100bdcf6, check 0x100b0ee0), which is 1 in OS 7.1. The real value for the
+   Evo-T or other models is unknown.
 5. **CRU +0x00 bits 6/7, the other +0x20 bit assignments, and the +0x14/+0x18 clock-gate bit
    → peripheral map.** Only +0x20 bit 4 (backlight PWM) is known.
 6. **SPCTRL +0x80 bit 0, +0xC0 (bits 4, 6) and +0xD4 (0x10 / 0x100)** are custom. Only

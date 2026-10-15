@@ -98,14 +98,17 @@ fn cru_reset_values() {
     assert_eq!(CRU_CLKSEL_RESET, 0x0002_0001);
     assert_eq!(CRU_PLL_RESET, 0x0000_3433);
     assert_eq!(CRU_UID_LO, 0x4556_4F31);
-    assert_eq!(CRU_CHIPINFO, 0);
+    // Strap [29:25] = 1: the product ID the OS image's TLV 0xA0 requires (TI-84 Evo).
+    assert_eq!(CRU_CHIPINFO, 0x0200_0000);
+    assert_eq!((CRU_CHIPINFO >> 25) & 0x1F, 1);
+    assert_eq!(CRU_CHIPINFO & (1 << 30), 0, "variant bit 30 stays clear");
     let mut h = DevHarness::new();
     let mut c = Cru::new();
     assert_eq!(h.read(&mut c, 0x04, 4), 0x0002_0001);
     assert_eq!(h.read(&mut c, 0x1C, 4), 0x3433);
     assert_eq!(h.read(&mut c, 0xFC, 4), 0x0011_0000);
     assert_eq!(h.read(&mut c, 0x0C, 4), 0x4556_4F31);
-    assert_eq!(h.read(&mut c, 0x10, 4), 0);
+    assert_eq!(h.read(&mut c, 0x10, 4), 0x0200_0000);
     assert_eq!(c.reg(0x04), 0x0002_0001);
     assert_eq!(c.reg(0xFC), 0x0011_0000);
     for off in [0x00, 0x08, 0x14, 0x18, 0x20, 0x4C, 0x50, 0x60, 0x70, 0x94] {
@@ -123,7 +126,7 @@ fn cru_id_read_only() {
     }
     assert_eq!(h.read(&mut c, 0xFC, 4), 0x0011_0000);
     assert_eq!(h.read(&mut c, 0x0C, 4), 0x4556_4F31);
-    assert_eq!(h.read(&mut c, 0x10, 4), 0);
+    assert_eq!(h.read(&mut c, 0x10, 4), 0x0200_0000);
     assert!(h.log.is_empty());
 }
 

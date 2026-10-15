@@ -116,8 +116,11 @@ pub const CRU_CLKSEL_RESET: u32 = 0x0002_0001;
 pub const CRU_PLL_RESET: u32 = 0x0000_3433;
 /// +0x0C UID_LO, read-only ("EVO1").
 pub const CRU_UID_LO: u32 = 0x4556_4F31;
-/// +0x10 CHIPINFO, read-only: variant bit 30 clear, strap 0, UID_HI 0.
-pub const CRU_CHIPINFO: u32 = 0;
+/// +0x10 CHIPINFO, read-only: variant bit 30 clear, strap [29:25] = 1, UID_HI 0. The secure
+/// image reads the strap as the hardware product ID (`cru_get_strap` 0x100b5cec, when OTP item
+/// 50 is 0) and the OS service accepts image 1 only if it equals the image's product-ID TLV
+/// 0xA0, which is 1 in OS 7.1 (`docs/hardware/security.md`).
+pub const CRU_CHIPINFO: u32 = 1 << 25;
 
 const CRU_CLKSEL: u32 = 0x04;
 const CRU_UID: u32 = 0x0C;
