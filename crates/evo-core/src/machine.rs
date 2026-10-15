@@ -319,6 +319,28 @@ impl Machine {
     /// to the NVIC, (2) pulses, (3) event requests to the scheduler, (4) the CPU's
     /// unimplemented PPB accesses to the unmapped log.
     fn sync_bus(&mut self) {
+        if self.bus.take_device_activity() {
+            self.sync_devices();
+        }
+        for miss in self.cpu.take_ppb_misses() {
+            let kind = if miss.write.is_some() {
+                UnmappedKind::Write
+            } else {
+                UnmappedKind::Read
+            };
+            self.bus.log.record(UnmappedAccess {
+                addr: miss.addr,
+                width: miss.width,
+                write: miss.write,
+                kind,
+                pc: self.bus.pc_hint,
+                secure: miss.secure,
+            });
+        }
+    }
+
+    /// Steps (1) to (3) of [`sync_bus`](Self::sync_bus), needed only after a device ran.
+    fn sync_devices(&mut self) {
         let lines = self.bus.irq_lines();
         let mut changed = lines ^ self.applied_irqs;
         while changed != 0 {
@@ -337,21 +359,6 @@ impl Machine {
                 Some(at) => self.sched.schedule(at, kind),
                 None => self.sched.cancel(kind),
             }
-        }
-        for miss in self.cpu.take_ppb_misses() {
-            let kind = if miss.write.is_some() {
-                UnmappedKind::Write
-            } else {
-                UnmappedKind::Read
-            };
-            self.bus.log.record(UnmappedAccess {
-                addr: miss.addr,
-                width: miss.width,
-                write: miss.write,
-                kind,
-                pc: self.bus.pc_hint,
-                secure: miss.secure,
-            });
         }
     }
 

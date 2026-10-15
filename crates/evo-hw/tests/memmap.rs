@@ -730,3 +730,29 @@ fn page_table_follows_windows_added_later() {
     assert_eq!(m.read32(0x2000_0000, acc(S)), Ok(7));
     assert_eq!(m.log.len(), 1, "only the read before the RAM existed");
 }
+
+#[test]
+fn device_activity_reports_device_calls_only() {
+    let mut m = MemoryMap::new();
+    m.add_ram("ram", 0x1_0000, &[0x2000_0000]);
+    m.add_device(
+        "probe",
+        0x4000_0000,
+        0x10,
+        Box::new(Probe {
+            seen: Seen::default(),
+        }),
+    );
+    assert!(!m.take_device_activity(), "adding windows runs no device");
+    m.write32(0x2000_0000, 1, write_acc()).unwrap();
+    m.read32(0x5000_0000, acc(S)).unwrap();
+    assert!(!m.take_device_activity(), "RAM and unmapped accesses");
+    m.read32(0x4000_0000, acc(S)).unwrap();
+    assert!(m.take_device_activity());
+    assert!(!m.take_device_activity(), "taking it clears it");
+    m.device_event(0);
+    assert!(m.take_device_activity());
+    let states = m.device_states();
+    m.load_device_states(&states).unwrap();
+    assert!(m.take_device_activity());
+}

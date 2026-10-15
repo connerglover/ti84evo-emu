@@ -82,3 +82,15 @@ take longer to link.
 |---|---|---|
 | `Cpu::step` / `Machine::step` | 44.8 / 57.9 ns | 36.6 / 54.1 ns |
 | `busy_loop` | 16.5 M cycles/s | 23.0 M cycles/s (15 %) |
+
+### 3. `sync_bus` only after device activity
+
+`MemoryMap` sets a flag whenever it calls into a device (access, event, reset, host call) or
+loads device states; IRQ lines, pulses and event requests can only change then.
+`Machine::sync_bus` skips the IRQ-line fold over every device, the pulse and the event queues
+unless the flag is set (the PPB-miss drain stays unconditional).
+
+| | Before | After |
+|---|---|---|
+| `Machine::step` | 54.1 ns | 44.8 ns |
+| `busy_loop` | 23.0 M cycles/s | 22.9 M cycles/s (within noise) |

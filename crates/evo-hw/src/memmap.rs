@@ -81,6 +81,10 @@ pub struct MemoryMap {
     /// and takes the general path for every access, with the same results.
     #[serde(skip)]
     pages: Vec<Page>,
+    /// Set whenever a device ran (or had its state replaced), which is the only way IRQ
+    /// lines, pulses and event requests change; cleared by [`MemoryMap::take_device_activity`].
+    #[serde(skip)]
+    device_activity: bool,
 }
 
 /// log2 of the page size of [`MemoryMap::pages`].
@@ -246,6 +250,7 @@ impl MemoryMap {
         f: impl FnOnce(&mut dyn Device, &mut DevCtx<'_>) -> R,
     ) -> Option<R> {
         let slot = self.slots.get_mut(id)?;
+        self.device_activity = true;
         // `id` fits: add_device checked every slot index.
         let mut ctx = DevCtx::new(
             self.now,
@@ -309,6 +314,12 @@ impl MemoryMap {
         self.slots.iter().fold(0, |acc, s| acc | s.irq_out)
     }
 
+    /// Whether any device ran or had its state loaded since the last call: until one does,
+    /// [`irq_lines`](Self::irq_lines), pulses and event requests cannot have changed.
+    pub fn take_device_activity(&mut self) -> bool {
+        std::mem::take(&mut self.device_activity)
+    }
+
     /// Edge IRQs requested since the last call, in order.
     pub fn take_pulses(&mut self) -> Vec<u16> {
         std::mem::take(&mut self.pulses)
@@ -368,6 +379,7 @@ impl MemoryMap {
                 return Err(e);
             }
         }
+        self.device_activity = true;
         for (slot, st) in self.slots.iter_mut().zip(states) {
             slot.irq_out = st.irq_out;
         }
