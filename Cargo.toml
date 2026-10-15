@@ -4,7 +4,7 @@ members = ["crates/armv8m", "crates/evo-core", "crates/evo-hw", "crates/evo-imag
 
 [workspace.package]
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
