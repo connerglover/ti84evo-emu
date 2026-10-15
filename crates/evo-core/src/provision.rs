@@ -8,7 +8,9 @@
 //! 1. power on with ALPHA + SIN + ENTER held (boot combo 9, `keypad.md` "Boot key combos");
 //! 2. press ENTER on the unit info screen: the diagnostic app opens the Engineering menu;
 //! 3. press 2 ("Boot Select: Self-Test") once: the BSP writes the flag and the line reads
-//!    "Boot Select: Calc OS";
+//!    "Boot Select: Calc OS". 2 toggles the flag, so it is never pressed a second time: the
+//!    label is polled until it changes, for up to `TOGGLE_POLLS` × `SETTLE_MS` (3 s) of guest
+//!    time;
 //! 4. press 0 ("Exit this menu"): the BSP launches the OS;
 //! 5. power-cycle and check that the next boot, with no key held, enters OS image 1.
 //!
@@ -57,8 +59,9 @@ const SETTLE_MS: u64 = 500;
 /// ENTER on the info screen is retried this often, this many times.
 const ENTER_EVERY_MS: u64 = 500;
 const ENTER_TRIES: u32 = 20;
-/// Presses of 2 before Boot Select must read Calc OS.
-const TOGGLE_TRIES: u32 = 3;
+/// After the one press of 2, Boot Select is read this many times, [`SETTLE_MS`] apart; it must
+/// read Calc OS by the last read. 2 is not pressed again: a second press toggles the flag back.
+const TOGGLE_POLLS: u32 = 6;
 /// Budget from power-on to `get_combo` (measured about 92 M cycles).
 const COMBO_BUDGET: u64 = 1_000_000_000;
 /// Budget from `get_combo` to the diagnostic app (measured about 18 M cycles).
@@ -107,7 +110,10 @@ pub enum ProvisionError {
     #[error("unexpected Engineering menu text: {text:?}")]
     UnexpectedMenu { text: Option<String> },
     /// Pressing 2 did not switch Boot Select to Calc OS.
-    #[error("Boot Select still reads {label:?} after {TOGGLE_TRIES} presses of 2")]
+    #[error(
+        "Boot Select still reads {label:?} {} ms after pressing 2",
+        u64::from(TOGGLE_POLLS) * SETTLE_MS
+    )]
     BootSelectUnchanged { label: Option<String> },
     /// After the power cycle the BSP started the diagnostic app again: the flag did not
     /// persist.
@@ -175,8 +181,8 @@ pub fn provision(m: &mut Machine) -> Result<ProvisionReport, ProvisionError> {
     let toggled = match label.as_deref() {
         Some(BOOT_CALC_OS) => false,
         Some(BOOT_SELF_TEST) => {
-            for _ in 0..TOGGLE_TRIES {
-                tap(m, "2", "pressing 2 (Boot Select)")?;
+            tap(m, "2", "pressing 2 (Boot Select)")?;
+            for _ in 0..TOGGLE_POLLS {
                 run_for(m, SETTLE_MS * MS, "redrawing Boot Select")?;
                 label = menu_text(m, BOOT_SELECT_LABEL);
                 if label.as_deref() == Some(BOOT_CALC_OS) {
@@ -269,7 +275,8 @@ fn tap(m: &mut Machine, name: &str, stage: &'static str) -> Result<Option<u32>, 
 }
 
 /// The NUL-terminated ASCII string the Engineering menu's pointer at `offset` points to;
-/// `None` if a byte is unreadable, not printable ASCII, or the string is over 64 bytes.
+/// `None` if a byte is unreadable, not printable ASCII, or no NUL ends the string within 64
+/// characters (at most 65 bytes are read: 64 characters and the NUL).
 fn menu_text(m: &Machine, offset: u32) -> Option<String> {
     let ptr = m.bus.peek(ENGINEERING_MENU + offset, 4)?;
     let mut s = String::new();
