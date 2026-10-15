@@ -24,7 +24,7 @@ use crate::keypad::geometry::{
 use crate::keypad::paint::{body_rect_to_screen, keypad_rect_to_screen, paint_body, paint_key};
 use crate::keypad::{KEYS, KeyId, KeyShape, key_def};
 use crate::lcd::{LcdView, ScaleFilter};
-use crate::pacer::{FrameRunner, Pacer, SpeedMeter, WALL_BUDGET};
+use crate::pacer::{FrameRunner, Pacer, Speed, SpeedMeter, WALL_BUDGET};
 use crate::prefs::{PREFS_KEY, Prefs};
 use crate::store::{Store, StoreError};
 use crate::theme::{APP_BG, HEADER_BG, LABEL_DARK, install_fonts};
@@ -207,6 +207,12 @@ pub struct EvoApp {
     grow_target: Option<(f32, u32)>,
     lcd: LcdView,
     filter: ScaleFilter,
+    /// The linked OS bundle, kept so saving preferences does not drop it.
+    bundle: Option<PathBuf>,
+    /// Compact sidebar mode, kept so saving preferences does not drop it.
+    compact: bool,
+    /// The selected speed; `pacer.speed` is its factor.
+    speed_setting: Speed,
     transform: CalcTransform,
     store: Store,
     toasts: Toasts,
@@ -250,7 +256,7 @@ impl EvoApp {
             speed: SpeedMeter::default(),
             pacer: Pacer {
                 clock_hz: CLOCK_HZ,
-                speed: 1.0,
+                speed: opts.prefs.speed.factor(),
             },
             runner: FrameRunner::new(),
             latch: KeyLatch::new(),
@@ -268,6 +274,9 @@ impl EvoApp {
             grow_target: None,
             lcd: LcdView::new(),
             filter: opts.prefs.filter,
+            bundle: opts.prefs.bundle,
+            compact: opts.prefs.compact,
+            speed_setting: opts.prefs.speed,
             transform: CalcTransform::fit(egui::Rect::ZERO),
         };
         if needs_provision {
@@ -396,12 +405,16 @@ impl EvoApp {
         self.filter
     }
 
-    /// The preferences to save: current keymap, filter and debug-open state.
+    /// The preferences to save: current keymap, filter, debug-open state,
+    /// linked bundle, compact mode and speed.
     pub fn prefs(&self) -> Prefs {
         Prefs {
             keymap: self.keymap.clone(),
             filter: self.filter,
             debug_open: self.debug_open,
+            bundle: self.bundle.clone(),
+            compact: self.compact,
+            speed: self.speed_setting,
         }
     }
 

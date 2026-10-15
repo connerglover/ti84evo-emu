@@ -6,6 +6,8 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::backend::{CLOCK_HZ, EmuBackend, RunStatus};
 
 /// The longest frame interval emulated in one frame; longer gaps are dropped.
@@ -16,6 +18,44 @@ pub const CHUNK_CYCLES: u64 = 200_000;
 pub const MIN_CHUNK_CYCLES: u64 = 10_000;
 /// Wall time one frame may spend emulating.
 pub const WALL_BUDGET: Duration = Duration::from_millis(12);
+
+/// The user-selected emulation speed.
+///
+/// [`Speed::Unlimited`] is 1000 times real time; [`WALL_BUDGET`] still caps
+/// each frame, so it means "as fast as the host allows".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Speed {
+    #[default]
+    X1,
+    X2,
+    X4,
+    Unlimited,
+}
+
+impl Speed {
+    /// Every speed, slowest first.
+    pub const ALL: [Speed; 4] = [Speed::X1, Speed::X2, Speed::X4, Speed::Unlimited];
+
+    /// The multiplier for [`Pacer::speed`].
+    pub fn factor(self) -> f64 {
+        match self {
+            Speed::X1 => 1.0,
+            Speed::X2 => 2.0,
+            Speed::X4 => 4.0,
+            Speed::Unlimited => 1000.0,
+        }
+    }
+
+    /// The menu label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Speed::X1 => "Speed 1\u{d7}",
+            Speed::X2 => "Speed 2\u{d7}",
+            Speed::X4 => "Speed 4\u{d7}",
+            Speed::Unlimited => "Speed unlimited",
+        }
+    }
+}
 
 /// Converts frame intervals to cycle budgets.
 #[derive(Clone, Copy, Debug, PartialEq)]

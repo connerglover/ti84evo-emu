@@ -8,6 +8,7 @@ use evo_gui::backend::fake::FakeBackend;
 use evo_gui::input::{Keymap, PcKey};
 use evo_gui::keypad::KeyId;
 use evo_gui::lcd::ScaleFilter;
+use evo_gui::pacer::Speed;
 use evo_gui::prefs::{PREFS_KEY, Prefs};
 
 fn harness_with(fake: FakeBackend, prefs: Prefs) -> Harness<'static, EvoApp> {
@@ -76,6 +77,7 @@ fn prefs_json_roundtrip() {
         keymap,
         filter: ScaleFilter::Smooth,
         debug_open: true,
+        ..Prefs::default()
     };
     let json = serde_json::to_string(&p).expect("serialize");
     let back: Prefs = serde_json::from_str(&json).expect("deserialize");
@@ -101,6 +103,9 @@ fn app_starts_from_prefs_and_reports_them() {
         keymap,
         filter: ScaleFilter::Smooth,
         debug_open: true,
+        bundle: Some(std::path::PathBuf::from("os.84b2")),
+        compact: true,
+        speed: Speed::X2,
     };
     let h = harness_with(FakeBackend::new(), prefs.clone());
     assert_eq!(h.state().prefs(), prefs);
