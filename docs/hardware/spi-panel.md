@@ -268,7 +268,8 @@ State: `ctrl0, ctrl1, ctrl2, inten: u32`, `tx: VecDeque<u16>` (capacity `DEPTH` 
   - For read commands, load the bit queue as `[dummy 0] ++ bytes` (MSB first):
     - `0x04` RDDID → `ID1, ID2, ID3` (3 bytes, with the dummy bit);
     - `0x09` RDDST → 4 bytes, with the dummy bit;
-    - `0x0A..0x0F` → 1 byte, no dummy;
+    - `0x0A` RDDPM → the power mode, `0x0B` RDDMADCTL → MADCTL, `0x0C` RDDCOLMOD → COLMOD,
+      `0x0D..0x0F` → 0; 1 byte each, no dummy;
     - `0xDA/0xDB/0xDC` → ID1/ID2/ID3, 1 byte each, no dummy.
   - For the C2/C5/BB diagnostic reads, use the dummy bit plus the last written parameters,
     padded to 5 bytes.
