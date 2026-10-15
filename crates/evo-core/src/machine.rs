@@ -142,6 +142,13 @@ pub enum StopReason {
     Bkpt { pc: u32, imm: u8 },
 }
 
+/// GPIO inputs the board drives high at power-on (`docs/hardware/gpio.md`, "Pin roles"):
+/// pin 9, the charger status line (high = no charger or USB power; low makes the BSP show its
+/// charging animation instead of launching the OS), and pin 11, the battery comparator (high
+/// = the battery is above the threshold the BSP sets on pins 5/7/12; low reads as a critical
+/// battery). `Machine::set_gpio_input` changes them.
+pub const BOARD_INPUTS_HIGH: [u8; 2] = [9, 11];
+
 /// The whole emulated calculator.
 #[derive(Serialize, Deserialize)]
 pub struct Machine {
@@ -233,6 +240,9 @@ impl Machine {
             m.with_dev("spif", |s: &mut Spif, _| {
                 s.nor_mut().set_secregs(nv.secregs())
             });
+        }
+        for pin in BOARD_INPUTS_HIGH {
+            m.set_gpio_input(pin, Some(true));
         }
         Ok(m)
     }

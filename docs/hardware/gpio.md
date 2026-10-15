@@ -72,10 +72,10 @@ then enabled.
 |---|---|---|---|
 | 1 | out | S 0x100b27a4 (set at platform init), BSP Shipmode | **power hold**: driving it low (CLR) powers the unit off |
 | 2 | out | S `panel_on` 0x100b3244..0x100b3260; BSP 0x0015f444 | **LCD panel reset** (low, 10 ms, high; `spi-panel.md`) |
-| 5, 7, 12 | out | BSP 0x001051a0.. | driven in patterns while pin 11 is sampled after `delay_ms(10)`: a strap/ID probe or a bit-banged link |
+| 5, 7, 12 | out | BSP `set_threshold` 0x00105444 (bit 2 → pin 5, bit 1 → pin 7, bit 0 → pin 12) | **battery comparator threshold** (3 bits, 0..7); pin 11 is sampled after `delay_ms(10)` |
 | 8 | in/out | BSP 0x001051d2 | read |
-| 9 | in | BSP 0x001051da, IRQ mode 4 | cable/accessory detect (guess) |
-| 11 | in | BSP 0x00104c94 and the probe loop; IRQ modes 2/3 | an input level tracked by IRQ |
+| 9 | in | BSP 0x001147d4, IRQ mode 4 | **charger status**: low = charging/USB power (with HW-config +0x12 = 0, as on the emulated unit). The POWER state machine's "Check State" (0x00152eb4) then reports "Battery Charging" and the BSP shows its charging animation instead of launching the OS. The board drives it **high** |
+| 11 | in | BSP 0x0010542c (read via `gpio_read(11)`) and the threshold ladder 0x00152f06..; IRQ modes 2/3 | **battery comparator output**: high = the battery is above the threshold set on pins 5/7/12. All-low reads as level 7 → "Battery Critical" (the "Low Battery" screen). The board drives it **high** (level 0, full) |
 
 Excerpt (secure handler, 0x100b0f80..):
 ```
@@ -135,11 +135,16 @@ The model above, with these decisions:
   the host input levels (what is wired to the pins does not change) and a pending power-off
   report. PowerOn also clears both.
 
-Unconnected inputs read 0. The probe at 0x001051d0 branches on pin 11, and both branches stay
-bounded.
+Unconnected inputs read 0, except pins 9 and 11: `Machine` drives both high at power-on
+(`BOARD_INPUTS_HIGH`, Task 24: no charger, battery above every threshold), and the host can
+change them with `set_gpio_input`. With both low (the old default) the BSP never launches
+the OS: pin 9 low gives the charging animation, pin 11 low a critical battery. The probe at
+0x001051d0 branches on pin 11, and both branches stay bounded.
 
 ## Open questions
 
-1. Real input values for pins 8, 9 and 11.
+1. Real input value for pin 8. Pins 9 and 11: decided (Task 24), high when the unit runs
+   on a good battery without a cable; their real electrical polarity is inferred from the
+   BSP code, not measured.
 2. The polarity of PULL_SEL (+0x1C): is 1 a pull-up?
 3. Whether the interrupt-mode decode above matches the hardware.

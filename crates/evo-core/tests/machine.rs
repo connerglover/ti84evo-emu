@@ -7,6 +7,7 @@ use std::ops::ControlFlow;
 
 use armv8m::Sec;
 use evo_core::{EventKind, Key, Machine, StopReason, UartPort};
+use evo_hw::dev::gpio::Gpio;
 use evo_hw::dev::keypad::{Keypad, SCAN_CYCLES};
 use evo_hw::{DevCtx, Device, ResetKind, StateError, UnmappedKind};
 use evo_image::testutil::secure_image_bundle;
@@ -986,12 +987,14 @@ fn gpio_input_irq_wakes_sleeping_cpu() {
     /// adds r4, #1 ; bx lr`.
     const H24: u32 = 0x2B0;
     // ldr r0, =GPIO ; ldr r1, =1 << 9 ; str r1, [r0, #0x38] (INT_BOTH) ;
+    // str r1, [r0, #0x30] (INT_CLR, as the BSP driver does before enabling) ;
     // str r1, [r0, #0x20] (INT_EN) ; ldr r0, =ISER0 ; ldr r1, =1 << 24 ; str r1, [r0] ;
     // wfi ; b .
     let mut p = Payload::device_test(&[
         I::Ld(0, L_GPIO),
         I::Ld(1, L_PIN9),
         str_r1_r0(0x38),
+        str_r1_r0(0x30),
         str_r1_r0(0x20),
         I::Ld(0, L_ISER0),
         I::Ld(1, L_IRQ24),
@@ -1014,6 +1017,8 @@ fn gpio_input_irq_wakes_sleeping_cpu() {
         ],
     );
     let mut m = p.boot();
+    // Pin 9 idles high on the board (no charger); start this test with it low.
+    m.set_gpio_input(9, Some(false));
     assert_eq!(m.run(1_000), StopReason::Idle);
     assert_eq!(m.cpu.regs.r[4], 0);
     m.set_gpio_input(9, Some(true));
@@ -1025,6 +1030,26 @@ fn gpio_input_irq_wakes_sleeping_cpu() {
     m.run(1_000);
     assert_eq!(m.cpu.regs.r[4], 2);
     assert!(!m.take_power_off());
+}
+
+#[test]
+fn board_drives_charger_and_battery_inputs_high() {
+    // `gpio.md` "Pin roles": pin 9 high = no charger/USB power, pin 11 high = the battery is
+    // above the comparator threshold. They survive a System reset; the host can change them.
+    let mut m = looping().boot();
+    let level = |m: &Machine, pin| {
+        m.bus
+            .device::<Gpio>("gpio")
+            .expect("gpio device")
+            .pin_level(pin)
+    };
+    assert!(level(&m, 9));
+    assert!(level(&m, 11));
+    assert!(!level(&m, 8), "other inputs stay undriven");
+    m.bus.reset_devices(ResetKind::System);
+    assert!(level(&m, 9) && level(&m, 11));
+    m.set_gpio_input(9, Some(false));
+    assert!(!level(&m, 9));
 }
 
 #[test]
