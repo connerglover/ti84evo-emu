@@ -1541,6 +1541,8 @@ fn memory(case: &Case, prog: &[Line]) -> Memory {
 
 fn run_core(case: &Case, mem: &Memory) -> State {
     let mut bus = FlatBus::new();
+    // The decoded-instruction cache is on, so stores into the code window exercise it too.
+    bus.cache = true;
     bus.code[..mem.code.len()].copy_from_slice(&mem.code);
     bus.ram[..mem.ram.len()].copy_from_slice(&mem.ram);
     let mut cpu = Cpu::new();

@@ -54,6 +54,13 @@ pub struct Cpu {
     /// it into a STKOF UsageFault. Only meaningful within one instruction.
     #[serde(skip)]
     pub(crate) sp_violation: bool,
+    /// Set during an instruction by whatever can make an exception pending (guest PPB writes,
+    /// faults, SVC, exception returns, which can fault, and SysTick): only then, or when
+    /// something was pending already before the instruction, can `step` find an exception to
+    /// take after it. (Masks such as PRIMASK only matter for exceptions already pending.) Only
+    /// meaningful within one step.
+    #[serde(skip)]
+    pub(crate) pend_check: bool,
     /// Guest data accesses to unimplemented internal PPB registers, drained by
     /// `take_ppb_misses` (diagnostics only: not serialized).
     #[serde(skip)]
@@ -236,6 +243,7 @@ impl Cpu {
             scs: Scs::default(),
             lockup: None,
             sp_violation: false,
+            pend_check: false,
             ppb_misses: Vec::new(),
             idau: IdauHandle::default(),
             attr_cache: AttrCache::default(),
@@ -531,16 +539,20 @@ impl Cpu {
             return StepResult::Lockup;
         }
         // Asynchronous exceptions that became pending between steps.
-        if self.take_pending(bus) {
+        let quiet = self.nothing_pending();
+        if !quiet && self.take_pending(bus) {
             return self.entry_result(ENTRY_CYCLES);
         }
+        self.pend_check = false;
         let (mut cycles, sleep) = match self.execute_one(bus) {
             Exec::Done { cycles, sleep } => (cycles, sleep),
             Exec::Bkpt(imm) => return StepResult::Bkpt(imm),
             Exec::Lockup => return StepResult::Lockup,
         };
         self.tick_systick(cycles);
-        if self.take_pending(bus) {
+        // Exceptions the instruction pended or unmasked. With nothing pending before it, only
+        // the operations that set `pend_check` can have changed that.
+        if (!quiet || self.pend_check) && self.take_pending(bus) {
             cycles += ENTRY_CYCLES;
             return self.entry_result(cycles);
         }
@@ -562,6 +574,7 @@ impl Cpu {
     #[cold]
     #[inline(never)]
     fn fault(&mut self, fault: Fault) -> Exec {
+        self.pend_check = true;
         if self.raise_fault(fault) {
             Exec::Done {
                 cycles: 1,
@@ -645,6 +658,9 @@ impl Cpu {
             Flow::Sleep(kind) => Some(kind),
             _ => None,
         };
+        if matches!(flow, Flow::Svc(_) | Flow::ExcReturn(_)) {
+            self.pend_check = true;
+        }
         match flow {
             Flow::Svc(_) => {
                 if !self.raise_sync(SVCALL, self.regs.sec) {

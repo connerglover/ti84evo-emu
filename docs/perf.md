@@ -187,3 +187,26 @@ half of the pending check, is out of line.
 |---|---|---|
 | `busy_loop`, thread CPU time | 51.2 M cycles/s | 54.2 M cycles/s (35 %) |
 | raw `Cpu::step` loop | 59.8 M cycles/s | 64.6 M cycles/s |
+
+### 10. Look for exceptions after an instruction only when one can have appeared
+
+`Cpu::step` checks for a pending exception before the instruction (anything that pended
+between steps) and again after it (anything the instruction pended, taken in the same step).
+The second check now runs only if something was pending before the instruction, or if the
+instruction did one of the things that can make an exception pending: a guest PPB write
+(STIR, ISPR, ISER enabling an IRQ already pending, ICSR, ...), a fault, SVC, an exception
+return (it can fault) or a SysTick wrap; these set `Cpu::pend_check`. Masks (PRIMASK,
+BASEPRI, FAULTMASK, CPS) only matter for exceptions already pending, which the first
+condition covers. Each flag site is pinned by a test that expects the exception entry in the
+same step. `Machine::idle` and `wake_if_due` are now out of line too (sleep handling is rare
+per instruction; inlined, it cost the busy loop a fifth of its speed).
+
+The difftest bus now lets the core cache decoded code (every bus write, including stores into
+the code window, starts a new epoch), so `DIFFTEST_CASES=20000` exercises the instruction
+cache against Unicorn: 4 passed.
+
+| | Before | After |
+|---|---|---|
+| `busy_loop`, thread CPU time | 54.2 M cycles/s | 64.3 M cycles/s (41 %) |
+| raw `Cpu::step` loop | 64.6 M cycles/s | 77.1 M cycles/s |
+| `boot_to_self_test`, thread CPU time | 132.8 M cycles/s | 156.0 M cycles/s (100 %; awake cycles unchanged) |

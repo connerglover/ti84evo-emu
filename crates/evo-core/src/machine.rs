@@ -542,6 +542,7 @@ impl Machine {
 
     /// While asleep: wake if a wake-up is due, else advance time to the next wake-up time (at
     /// most to `end`). `Some(Idle)` if nothing will ever wake the CPU.
+    #[inline(never)]
     fn idle(&mut self, end: u64) -> Option<StopReason> {
         if self.wake_if_due() {
             return None;
@@ -572,6 +573,7 @@ impl Machine {
 
     /// Wake the sleeping CPU if an exception is pending or, for WFE, the event register is set
     /// (consuming it). Returns whether it woke.
+    #[inline(never)]
     fn wake_if_due(&mut self) -> bool {
         let Some(kind) = self.sleep else {
             return false;

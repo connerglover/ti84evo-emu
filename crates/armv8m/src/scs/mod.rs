@@ -196,6 +196,7 @@ impl Cpu {
         size: MemSize,
         acc: Access,
     ) -> Result<(), BusError> {
+        self.pend_check = true;
         let n = size_bytes(size);
         let view = ppb_view(addr & !3, self.regs.sec);
         let user_stir = view.is_some_and(|(word, sec)| {
@@ -647,6 +648,7 @@ impl Cpu {
     pub fn tick_systick(&mut self, cycles: u32) {
         for sec in [Sec::Secure, Sec::NonSecure] {
             if self.scs.systick.get_mut(sec).tick(cycles) {
+                self.pend_check = true;
                 self.set_exc_pending(SYSTICK_EXC, sec, true);
             }
         }

@@ -10,6 +10,11 @@ const SIZE: u32 = 0x1_0000;
 pub struct FlatBus {
     pub code: Vec<u8>,
     pub ram: Vec<u8>,
+    /// Let the core cache decoded code (`Bus::cache_code`): every bus write starts a new code
+    /// epoch. Direct changes to `code` are not seen, so only tests that never patch code
+    /// between steps turn this on.
+    pub cache: bool,
+    epoch: u64,
 }
 
 impl FlatBus {
@@ -17,6 +22,8 @@ impl FlatBus {
         Self {
             code: vec![0; SIZE as usize],
             ram: vec![0; SIZE as usize],
+            cache: false,
+            epoch: 1,
         }
     }
 
@@ -38,6 +45,7 @@ impl FlatBus {
     }
 
     fn write(&mut self, addr: u32, v: u32, n: u32) -> Result<(), BusError> {
+        self.epoch += 1;
         for i in 0..n {
             *self.slot(addr.wrapping_add(i))? = (v >> (8 * i)) as u8;
         }
@@ -69,6 +77,12 @@ impl Bus for FlatBus {
     }
     fn write32(&mut self, addr: u32, v: u32, _a: Access) -> Result<(), BusError> {
         self.write(addr, v, 4)
+    }
+    fn code_epoch(&self) -> u64 {
+        self.epoch
+    }
+    fn cache_code(&mut self, addr: u32, len: u32) -> bool {
+        self.cache && addr.checked_add(len).is_some_and(|end| end <= SIZE)
     }
 }
 

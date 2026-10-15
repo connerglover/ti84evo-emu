@@ -533,12 +533,19 @@ impl Cpu {
 
     // ---- Entry ----
 
+    /// No system exception is pending and no IRQ is both pending and enabled: there is nothing
+    /// `highest_pending` could find.
+    #[inline]
+    pub(crate) fn nothing_pending(&mut self) -> bool {
+        let scb = &self.scs.scb;
+        scb.pending.s | scb.pending.ns == 0 && self.scs.nvic.none_live()
+    }
+
     /// Take the highest-priority pending exception if it preempts the current execution
     /// priority. Returns true if an exception entry was performed (or it locked up trying).
     pub(crate) fn take_pending(&mut self, bus: &mut impl Bus) -> bool {
         // The common case, before and after every instruction: nothing is pending at all.
-        let scb = &self.scs.scb;
-        if scb.pending.s | scb.pending.ns == 0 && self.scs.nvic.none_live() {
+        if self.nothing_pending() {
             return false;
         }
         let Some((num, sec)) = self.preemptable_pending() else {
