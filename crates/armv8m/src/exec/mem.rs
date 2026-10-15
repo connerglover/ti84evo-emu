@@ -45,7 +45,6 @@ fn attribute(cpu: &Cpu, addr: u32, acc: Access) -> Result<Access, MemFault> {
         .ok_or(MemFault::Secure(addr))
 }
 
-/// True if an unaligned access of `size` at `addr` traps (`CCR.UNALIGN_TRP`).
 /// Unprivileged accesses to the external PPB BusFault before they reach the `Bus`: the whole PPB
 /// is privileged-only. (`ppb_read`/`ppb_write` check this for the internal PPB.)
 fn eppb_check(addr: u32, acc: Access) -> Result<(), MemFault> {
@@ -55,6 +54,7 @@ fn eppb_check(addr: u32, acc: Access) -> Result<(), MemFault> {
     Ok(())
 }
 
+/// True if an unaligned access of `size` at `addr` traps (`CCR.UNALIGN_TRP`).
 fn unaligned_trap(cpu: &Cpu, addr: u32, size: MemSize) -> bool {
     let mask = match size {
         MemSize::Byte => return false,
