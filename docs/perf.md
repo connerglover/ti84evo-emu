@@ -358,3 +358,16 @@ and `latch` now work in `u64` and fall back to the exact 128-bit form only past 
 |---|---|---|
 | `boot_to_self_test`, thread CPU time | 166.4 M cycles/s | 168.6 M cycles/s (awake cycles unchanged) |
 | `busy_loop` | — | unchanged (no timer reads) |
+
+### 17. A larger attribution cache
+
+In the boot profile `Sau::check` and the attribution lookup behind it took about 3 %: the
+256-entry attribution cache of step 5 covers 8 KiB, less than the OS's working set of code,
+stack and data, so lookups kept missing into the SAU region walk. It has 4096 entries now
+(128 KiB covered, 16 KiB of state that is not saved). A flush, on an SAU or IDAU change,
+clears 16 KiB instead of 1 KiB. The boot to the Self-Test screen flushes 13 times.
+
+| | Before | After |
+|---|---|---|
+| `boot_to_self_test`, thread CPU time | 167.5 M cycles/s | 172.1 M cycles/s (awake cycles unchanged) |
+| `busy_loop` | — | unchanged (two blocks) |

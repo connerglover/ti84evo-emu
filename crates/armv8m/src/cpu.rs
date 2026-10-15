@@ -151,8 +151,9 @@ impl ICache {
     }
 }
 
-/// Entries of `AttrCache`, a power of two.
-const ATTR_CACHE: usize = 256;
+/// Entries of `AttrCache`, a power of two: 4096 blocks of 32 bytes cover 128 KiB, the OS's
+/// working set of code, stack and data; 256 (8 KiB) missed into the SAU walk about 3 % of the boot.
+const ATTR_CACHE: usize = 4096;
 /// `AttrCache` entry flag: the entry is valid.
 const ATTR_VALID: u32 = 1 << 3;
 
