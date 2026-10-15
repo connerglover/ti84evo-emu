@@ -4,10 +4,10 @@
 //! placed by `Layout::EVO_7_1` like the real OS.
 
 use evo_core::state::{STATE_MAGIC, STATE_VERSION};
-use evo_core::{Machine, StateError, UartPort};
+use evo_core::{Machine, NvState, StateError, UartPort};
 use evo_hw::dev::spif::Spif;
 use evo_hw::nor::SECREGS_LEN;
-use evo_hw::soc::SRAM_BUFFER;
+use evo_hw::soc::{FLASH_BUFFER, SRAM_BUFFER};
 use evo_hw::{DevCtx, Device, ResetKind};
 use evo_image::testutil::secure_image_bundle;
 use evo_image::{Bundle, Layout};
@@ -281,16 +281,16 @@ fn load_state_rejects_bad_magic() {
 }
 
 #[test]
-fn load_state_rejects_version_2() {
-    let (mut state, mut m) = two_machines();
-    state[8..12].copy_from_slice(&2u32.to_le_bytes());
-    assert!(matches!(
-        rejected(&mut m, &state),
-        StateError::Version {
-            found: 2,
-            expected: 1
-        }
-    ));
+fn load_state_rejects_other_versions() {
+    assert_eq!(STATE_VERSION, 2);
+    for v in [1, 3] {
+        let (mut state, mut m) = two_machines();
+        state[8..12].copy_from_slice(&u32::to_le_bytes(v));
+        assert!(matches!(
+            rejected(&mut m, &state),
+            StateError::Version { found, expected: 2 } if found == v
+        ));
+    }
 }
 
 #[test]
@@ -305,6 +305,11 @@ fn load_state_rejects_truncated() {
         43,
         44,
         45,
+        75,
+        76,
+        107,
+        108,
+        109,
         state.len() / 2,
         state.len() - 1,
     ] {
@@ -373,17 +378,80 @@ fn load_state_rejects_other_bundle() {
 #[test]
 fn load_state_keeps_secregs() {
     let mut m = counter_uart().boot();
-    m.run(10_000);
-    let state = m.save_state();
     m.bus
         .with_device::<Spif, _>("spif", |s, _| s.nor_mut().set_secregs(&[0x12; SECREGS_LEN]))
         .expect("spif");
+    m.run(10_000);
+    let state = m.save_state();
+    m.run(10_000);
     m.load_state(&state).expect("load");
     assert_eq!(m.nv_state().secregs()[0], 0x12);
 }
 
-/// Bytes before the postcard body: magic, version, bundle id.
-const HEADER_LEN: usize = 8 + 4 + 32;
+/// Offset of the body checksum in the header.
+const CHECKSUM_AT: usize = 8 + 4 + 32 + 32;
+/// Bytes before the postcard body: magic, version, bundle id, flash fingerprint, body checksum.
+const HEADER_LEN: usize = CHECKSUM_AT + 32;
+
+/// `state` with its body checksum recomputed, as a writer of that body would make it.
+fn resealed(mut state: Vec<u8>) -> Vec<u8> {
+    use sha2::Digest;
+    let sum = sha2::Sha256::digest(&state[HEADER_LEN..]);
+    state[CHECKSUM_AT..HEADER_LEN].copy_from_slice(&sum);
+    state
+}
+
+#[test]
+fn load_state_rejects_corrupt_body() {
+    let (state, mut m) = two_machines();
+    assert!(state == resealed(state.clone()), "checksum layout");
+    // One flipped bit anywhere in the body, here in the middle of SRAM.
+    let mut bad = state.clone();
+    let at = HEADER_LEN + (state.len() - HEADER_LEN) / 2;
+    bad[at] ^= 0x01;
+    assert!(matches!(rejected(&mut m, &bad), StateError::Corrupt));
+    // A corrupt checksum is the same error.
+    let mut bad = state.clone();
+    bad[CHECKSUM_AT] ^= 0x80;
+    assert!(matches!(rejected(&mut m, &bad), StateError::Corrupt));
+    m.load_state(&state).expect("load");
+}
+
+#[test]
+fn load_state_rejects_other_flash() {
+    let (state, _) = two_machines();
+    // The same bundle, booted from a flash that differs outside the image slots (the ITS area).
+    let mut flash = vec![0xFF; evo_hw::nor::NOR_SIZE];
+    flash[0x0009_0000] = 0x00;
+    let nv = NvState::new(flash, vec![0xFF; SECREGS_LEN]).unwrap();
+    let p = counter_uart();
+    let mut m = Machine::from_bundle_nv(&p.bundle(), &Layout::EVO_7_1, Some(nv)).unwrap();
+    m.run(10_000);
+    let err = rejected(&mut m, &state);
+    assert!(
+        matches!(&err, StateError::Mismatch(msg) if msg.contains("flash")),
+        "{err}"
+    );
+
+    // Other security registers are other non-volatile state too.
+    let mut m = p.boot();
+    m.bus
+        .with_device::<Spif, _>("spif", |s, _| s.nor_mut().set_secregs(&[0x12; SECREGS_LEN]))
+        .expect("spif");
+    let err = rejected(&mut m, &state);
+    assert!(
+        matches!(&err, StateError::Mismatch(msg) if msg.contains("flash")),
+        "{err}"
+    );
+
+    // Flash the guest writes after the save is a change too: the state no longer fits.
+    let mut a = p.boot();
+    a.run(10_000);
+    let state = a.save_state();
+    a.bus.buffer_mut(FLASH_BUFFER).expect("flash")[0x0009_0000] = 0x00;
+    let err = rejected(&mut a, &state);
+    assert!(matches!(err, StateError::Mismatch(_)), "{err}");
+}
 
 /// A state of a machine that ran a while, with its CPU replaced by `edit(cpu)`: the CPU is the
 /// first field of the body, so its postcard bytes are swapped in place and the header (bundle id
@@ -402,7 +470,7 @@ fn with_cpu(edit: impl FnOnce(&mut armv8m::Cpu)) -> (Vec<u8>, Machine) {
     out.extend_from_slice(&state[HEADER_LEN + old.len()..]);
     let mut b = p.boot();
     b.run(10_000);
-    (out, b)
+    (resealed(out), b)
 }
 
 #[test]

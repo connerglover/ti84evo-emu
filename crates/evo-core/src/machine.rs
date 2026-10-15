@@ -41,8 +41,9 @@
 //! # Save states
 //!
 //! [`Machine::save_state`] / [`Machine::load_state`] (in [`crate::state`]): CPU, scheduler,
-//! SRAM, devices and the unmapped log, tied to the bundle the machine booted. Flash and the
-//! NOR security registers are not in a save state; they persist in the flash file.
+//! SRAM, devices and the unmapped log, tied to the bundle the machine booted and to the flash
+//! it had (its fingerprint, [`Machine::nv_fingerprint`]). Flash and the NOR security registers
+//! are not in a save state; they persist in the flash file.
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -78,7 +79,7 @@ pub const BL2_SHARED_DATA: u32 = 0x3000_0000;
 /// total length 4 (no entries).
 pub const BL2_SHARED_HEADER: u32 = 0x0004_2016;
 /// Erased NOR flash reads as all ones.
-const ERASED: u8 = 0xFF;
+pub(crate) const ERASED: u8 = 0xFF;
 /// CPU steps [`Machine::recent_trace`] remembers.
 pub const RECENT_STEPS: usize = 64;
 
@@ -273,8 +274,10 @@ impl Machine {
     }
 
     /// The non-volatile state now, as a flash file stores it: the flash bytes and the SPIF NOR
-    /// part's security registers. Security registers the part does not hold (it has none
-    /// after a save-state restore until they are set again) read as erased.
+    /// part's security registers. A save-state restore keeps the registers the part holds
+    /// (they are not in a save state; `Spif::load` keeps the current ones), so after
+    /// [`load_state`](Self::load_state) this is the same as before it. (Were the part to hold no
+    /// registers, they would read as erased; the SoC's part always holds them.)
     pub fn nv_state(&self) -> NvState {
         let mut flash = self
             .bus

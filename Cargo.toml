@@ -15,3 +15,8 @@ thiserror = "2"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 clap = { version = "4.6", features = ["derive"] }
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+
+# Save states hash the 16 MiB flash (`Machine::nv_fingerprint`); unoptimized SHA-256 would make
+# every save and load in a debug test take about a second.
+[profile.dev.package.sha2]
+opt-level = 3
