@@ -25,7 +25,7 @@ struct Args {
 }
 
 fn main() -> ExitCode {
-    env_logger::init();
+    evo_gui::logbuf::init();
     let args = Args::parse();
     // Preferences, slots, screenshots and flash files live together (eframe's storage dir).
     let data_dir =

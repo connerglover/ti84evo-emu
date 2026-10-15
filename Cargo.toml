@@ -19,6 +19,14 @@ egui = { version = "0.36.2", features = ["serde"] }
 egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu", "snapshot"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+rfd = "0.17.2"
+arboard = "3.6.1"
+png = "0.18.1"
+openh264 = "0.9.9"
+mp4 = "0.14.0"
+ureq = "3.4.2"
+webbrowser = "1.2.4"
+sha2 = "0.10.9"
 
 [profile.release]
 codegen-units = 1

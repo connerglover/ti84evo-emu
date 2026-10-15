@@ -28,6 +28,8 @@ jobs:
         with:
           toolchain: "1.98"
           components: clippy
+      # rfd (xdg-portal), arboard (x11rb) and openh264-sys2 (C/C++ source build) need no packages
+      # beyond these and the runner's compiler.
       # eframe (evo-gui) needs the xkbcommon and wayland headers on Linux.
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
@@ -43,6 +45,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.98"
+      # Same packages as clippy: rfd, arboard and openh264-sys2 need nothing more.
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
       - run: cargo test --workspace

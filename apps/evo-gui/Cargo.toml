@@ -23,6 +23,14 @@ thiserror.workspace = true
 clap.workspace = true
 log.workspace = true
 env_logger.workspace = true
+rfd.workspace = true
+arboard.workspace = true
+png.workspace = true
+openh264.workspace = true
+mp4.workspace = true
+ureq.workspace = true
+webbrowser.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 evo-image = { path = "../../crates/evo-image", features = ["testutil"] }

@@ -52,3 +52,6 @@ unset.
 MIT — see [LICENSE](LICENSE). The bundled DejaVu fonts (`apps/evo-gui/assets`) keep their own
 license. TI-84 Evo is a trademark of Texas Instruments; this project is not affiliated with or
 endorsed by Texas Instruments.
+
+MP4 recording uses OpenH264 compiled from source; Cisco's patent licence for OpenH264 applies
+only to Cisco's binaries. Use animated PNG if this matters to you.
