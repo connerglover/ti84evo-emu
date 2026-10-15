@@ -610,13 +610,7 @@ fn m4_image1_launches() {
 
     // The OS runs: by M4_HOME_CYCLES it shows its home screen (the app launcher).
     let stop = os.run_until(M4_HOME_CYCLES.saturating_sub(os.m.sched.now), |_| false);
-    assert_eq!(
-        stop,
-        StopReason::CycleLimit,
-        "UART0:
-{}",
-        os.uart_text()
-    );
+    assert_eq!(stop, StopReason::CycleLimit, "UART0:\n{}", os.uart_text());
     let frame = os.m.screen().expect("the LCD is on");
     let hash = sha256_hex(&frame.rgb);
     let path = scratch_dir().join("m4-home.png");
