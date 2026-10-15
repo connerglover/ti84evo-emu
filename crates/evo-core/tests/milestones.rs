@@ -985,3 +985,69 @@ fn launcher_selection_is_blue() {
     );
     assert_eq!(swapped, 0, "red and blue are swapped");
 }
+
+// ---- Factory provisioning (`boot-flow.md` §3.5) ----
+
+/// Budget for a boot with no key input to reach [`IMAGE1_ENTRY`] once the unit is provisioned
+/// (measured about 300 M; `boot-flow.md` §3.5).
+const PROVISIONED_BOOT_BUDGET: u64 = 1_000_000_000;
+/// The diagnostic app's entry (`boot-flow.md` §3.5): reached on a boot that shows Self-Test or
+/// Engineering instead of launching the OS.
+const DIAG_APP_ENTRY: u32 = 0x0011_7AFC;
+
+/// Power on from `nv` with no key held and report where the BSP went: `Ok(cycle)` when image 1
+/// is entered, `Err(stop)` otherwise (the diagnostic app's entry, or the budget).
+fn boot_without_keys(nv: NvState) -> Option<Result<u64, StopReason>> {
+    let mut os = Os::boot_nv(nv)?;
+    os.m.breakpoints.insert(IMAGE1_ENTRY);
+    os.m.breakpoints.insert(DIAG_APP_ENTRY);
+    let stop = os.run_until(PROVISIONED_BOOT_BUDGET, |_| false);
+    assert_eq!(os.m.resets, 0);
+    Some(match stop {
+        StopReason::Breakpoint(IMAGE1_ENTRY) => Ok(os.m.sched.now),
+        other => Err(other),
+    })
+}
+
+/// A fresh unit boots into the diagnostic app; `evo_core::provision` drives the Engineering
+/// menu (Boot Select: Calc OS) and leaves a flash that boots straight to the OS, with no key
+/// input, on every later power-on: through a flash file, and again from the flash that boot
+/// re-saved (`boot-flow.md` §3.5).
+#[test]
+fn provisioned_flash_boots_to_os_without_keys() {
+    let Some(os) = Os::boot() else {
+        return;
+    };
+    // A fresh flash shows the diagnostic app (Self-Test), not the OS.
+    let fresh = boot_without_keys(os.m.nv_state()).expect("not skipped");
+    assert_eq!(fresh, Err(StopReason::Breakpoint(DIAG_APP_ENTRY)));
+
+    let mut m = os.m;
+    let report = evo_core::provision(&mut m).expect("provisioning succeeds");
+    println!("provision: {report:?}");
+    assert!(report.toggled, "Boot Select was Self-Test on a fresh unit");
+
+    // Through a flash file, as `evo-cli provision --flash-file` writes it.
+    let path = target_dir().join("provisioned.evoflash");
+    m.nv_state()
+        .write_file(&path)
+        .expect("write the flash file");
+    let nv = NvState::read_file(&path).expect("read the flash file");
+    let _ = std::fs::remove_file(&path);
+
+    let mut second = Os::boot_nv(nv).expect("not skipped");
+    second.m.breakpoints.insert(IMAGE1_ENTRY);
+    second.m.breakpoints.insert(DIAG_APP_ENTRY);
+    let stop = second.run_until(PROVISIONED_BOOT_BUDGET, |_| false);
+    println!(
+        "provision: power-on 2 from the flash file: {stop:?} at cycle {}",
+        second.m.sched.now
+    );
+    assert_eq!(stop, StopReason::Breakpoint(IMAGE1_ENTRY));
+    // Let the OS run a while, then power-cycle once more from the flash it re-saved.
+    second.m.breakpoints.clear();
+    second.run_until(500_000_000, |_| false);
+    let third = boot_without_keys(second.m.nv_state()).expect("not skipped");
+    println!("provision: power-on 3 from the re-saved flash: {third:?}");
+    assert!(third.is_ok(), "{third:?}");
+}

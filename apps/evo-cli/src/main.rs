@@ -6,10 +6,11 @@ mod score;
 
 use std::io::{self, BufWriter, Write};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use evo_core::Machine;
 use evo_image::{Bundle, Layout};
 
 #[derive(Parser)]
@@ -119,6 +120,20 @@ enum Command {
         )]
         keys: Option<run::KeyScript>,
     },
+    /// Provision a unit to boot straight to the OS, as the factory does: power on with
+    /// ALPHA + SIN + ENTER held, set Engineering > Boot Select to Calc OS, exit, then check
+    /// that a power-on with no key held enters OS image 1 (docs/hardware/boot-flow.md §3.5).
+    ///
+    /// Reads FILE (an erased part if it does not exist) and writes the provisioned flash back
+    /// only when every step succeeds; on failure FILE is left untouched and the exit status is
+    /// 1. Takes about 0.8 G emulated cycles (about a minute in a release build).
+    Provision {
+        /// Path to the .84b2 bundle.
+        bundle: PathBuf,
+        /// The flash file to provision (as `run --flash-file` uses it).
+        #[arg(long, value_name = "FILE")]
+        flash_file: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -176,6 +191,7 @@ fn main() -> ExitCode {
             after,
             keys: keys.map(|k| k.0).unwrap_or_default(),
         }),
+        Command::Provision { bundle, flash_file } => provision(&bundle, &flash_file),
         Command::Inspect {
             bundle,
             score_bases,
@@ -199,6 +215,62 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+    }
+}
+
+/// `evo-cli provision`: provision the flash in `flash_file` and write it back on success.
+fn provision(bundle: &Path, flash_file: &Path) -> ExitCode {
+    let parsed = match Bundle::open(bundle) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("evo-cli: {}: {e}", bundle.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let Ok(nv) = run::read_flash_file(flash_file) else {
+        return ExitCode::FAILURE;
+    };
+    let mut machine = match Machine::from_bundle_nv(&parsed, &Layout::EVO_7_1, nv) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("evo-cli: {}: {e}", bundle.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = match evo_core::provision(&mut machine) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "evo-cli: provisioning failed: {e}; {} not written",
+                flash_file.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "provision: Engineering combo at cycle {}, menu at {}, Boot Select {}, OS launched at {}",
+        report.combo_cycle,
+        report.menu_cycle,
+        if report.toggled {
+            "set to Calc OS"
+        } else {
+            "already Calc OS"
+        },
+        report.launch_cycle
+    );
+    println!(
+        "provision: power-on with no key held entered the OS at cycle {}",
+        report.boot_cycle
+    );
+    match machine.nv_state().write_file(flash_file) {
+        Ok(()) => {
+            println!("provision: wrote {}", flash_file.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("evo-cli: {}: {e}", flash_file.display());
+            ExitCode::FAILURE
         }
     }
 }
@@ -366,6 +438,25 @@ mod tests {
         assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--break", "zz"]).is_err());
         assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--max-cycles", "-5"]).is_err());
         assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--trace-range", "9..1"]).is_err());
+    }
+
+    #[test]
+    fn provision_needs_bundle_and_flash_file() {
+        let cli = Cli::try_parse_from([
+            "evo-cli",
+            "provision",
+            "os.84b2",
+            "--flash-file",
+            "nv.evoflash",
+        ])
+        .expect("parse");
+        let Command::Provision { bundle, flash_file } = cli.command else {
+            panic!("not provision");
+        };
+        assert_eq!(bundle, PathBuf::from("os.84b2"));
+        assert_eq!(flash_file, PathBuf::from("nv.evoflash"));
+        assert!(Cli::try_parse_from(["evo-cli", "provision", "os.84b2"]).is_err());
+        assert!(Cli::try_parse_from(["evo-cli", "provision", "--flash-file", "f"]).is_err());
     }
 
     /// GDB drives the run: no budget and no trace, but breakpoints and the unmapped log.

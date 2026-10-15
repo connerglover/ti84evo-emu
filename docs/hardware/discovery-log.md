@@ -464,8 +464,10 @@ fakes found each one; the fix is a model change with its own test):
    menu" launches the OS once (the next power-on returns to Self-Test). The firmware sets
    UID ..0001 itself after an OS install (probably: reset reason 8 in the retained record at
    0x2017_DDD0, 0x0014f786) or when all ten self-tests pass (0x00109520, which also writes
-   UID ..0004 = 0); the Engineering menu's "Self Test" item toggles it (case 8 of
+   UID ..0004 = 0); the Engineering menu's "Boot Select" item toggles it (action 8 of
    0x0015dafc). `m4_image1_launches` uses the Exit item: ENTER at 2.5 s, 0 at 3.1 s.
+   `evo_core::provision` (fix wave Task 3) sets it through the Engineering menu
+   (`boot-flow.md` §3.5).
 
 **Hypotheses of the plan, and what became of them.**
 

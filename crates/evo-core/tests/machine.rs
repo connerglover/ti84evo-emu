@@ -1169,3 +1169,33 @@ fn set_key_after_sleep_uses_current_time() {
     m.set_key(Key::Matrix { row: 0, col: 0 }, true);
     assert_eq!(m.sched.next_deadline(), Some(500_000 + SCAN_CYCLES));
 }
+
+/// `power_cycle` is a new `Machine` from `nv_state()`: flash and security registers are kept;
+/// the CPU, SRAM, time, resets and breakpoints start over.
+#[test]
+fn power_cycle_keeps_nv_and_restarts_the_rest() {
+    let b = looping().bundle();
+    let mut m =
+        Machine::from_bundle_nv(&b, &Layout::EVO_7_1, Some(nv_with_marks(0xFF))).expect("boot");
+    let fresh_pc = m.cpu.regs.pc;
+    assert!(m.bus.poke(0x2000_1000, 4, 0x1234_5678));
+    m.breakpoints.insert(addr(CODE + 0x40));
+    m.run(1_000);
+    assert!(m.sched.now > 0);
+    assert_ne!(m.cpu.regs.r[0], 0);
+
+    m.power_cycle();
+    assert_eq!(m.sched.now, 0);
+    assert_eq!(m.resets, 0);
+    assert!(m.breakpoints.is_empty());
+    assert_eq!(m.cpu.regs.pc, fresh_pc);
+    assert_eq!(m.cpu.regs.r[0], 0);
+    assert_eq!(m.bus.peek(0x2000_1000, 4), Some(0), "SRAM starts over");
+    assert_eq!(m.bus.peek(0x3000_0000, 4), Some(0x0004_2016), "BL2 header");
+    let nv = m.nv_state();
+    assert_eq!(nv.flash()[0x9_0000], 0xA5, "flash is kept");
+    assert_eq!(nv.secregs()[0], 0x12, "security registers are kept");
+    // It still runs the same program.
+    m.run(1_000);
+    assert_ne!(m.cpu.regs.r[0], 0);
+}

@@ -211,7 +211,49 @@ NV counter 3, and TI TLV 0xA0 (product ID 1) against the hardware product ID
 payload address in TLVs 0xB1..0xB8 (images 2..9).
 
 On a fresh unit (empty ITS) the target is 1: the BSP shows the unit info screen, then (after
-ENTER) the "Self-Test" menu; "0. Exit this menu" sends LAUNCH "OS" once.
+ENTER) the "Self-Test" menu; "0. Exit this menu" sends LAUNCH "OS" once. Provisioning
+(§3.5) sets UID ..0001 so that later power-ons launch the OS directly.
+
+### 3.5 Factory provisioning: the Engineering menu (fix wave Task 3)
+
+The BSP's own Engineering menu sets the persistent "boot to OS" flag. `evo_core::provision`
+and `evo-cli provision <bundle> --flash-file F` drive it with the keypad; nothing writes ITS
+or flash directly. Found with breakpoints and screenshots in a throwaway probe on bundle
+7.1.0.4421; every step below was observed.
+
+1. **Power on with `alpha` + `sin` + `enter` held** (boot combo 9, `keypad.md`). `get_combo`
+   returns 9 at about 92.5 M cycles (breakpoint 0x0015_D488, r4). The BSP writes ITS UID
+   ..0004 := 2 (0x0010_8414, from 0x0015_D4D6) and sets the boot target to 1, the diagnostic
+   app. The keys can be released after `get_combo`.
+2. **The diagnostic app** starts at 0x0011_7AFC (about 110 M). It reads UIDs ..0002 and ..0004,
+   shows the unit info screen (0x0010_7290 waits for ENTER), then calls the menu chooser
+   0x0011_7BE0. The chooser reads UID ..0004 again (r0 at 0x0011_7BE6): **2 opens the
+   Engineering menu** (object 0x2001_0EF4), anything else the Self-Test menu. After the
+   chooser the app writes UID ..0004 := 0, so the Engineering menu is one-shot.
+3. **ENTER** on the info screen opens the Engineering menu. Retrying ENTER every 500 ms until
+   the chooser runs works; the first ENTER at about 1.1 s already lands (chooser at about
+   189 M). Its items are "1. About", "2. Boot Select: Self-Test", "3. Self Test",
+   "4. Utilities", "5. Reset", "6. Logging", "7. Tests" and "0. Exit this menu". Digit keys
+   select directly; no confirmation and no reboot are needed.
+4. **2 (Boot Select)** toggles the flag. The item fills +0x38..+0x4B of the menu object: its
+   label pointer is at +0x38, its action code 8 at +0x40 and the dispatcher 0x0015_DAFC at
+   +0x44. The handler writes
+   UID ..0001 through 0x0010_83C8 at once. The label pointer at +0x38 changes from "Boot
+   Select: Self-Test" to "Boot Select: Calc OS" (written by 0x0016_8808..0x0016_8888), and the
+   screen shows the new line. The label follows the stored flag: on a unit that is already
+   provisioned it reads "Calc OS" when the menu opens, so `provision` does not press 2 again.
+5. **0 (Exit this menu)** launches the OS in the same boot. The BSP first validates image 1
+   (about 160 M cycles), then enters 0x0044_BC90.
+6. **Persistence.** The flag is in the ITS area of flash (0x000A_C000..), so
+   `Machine::nv_state()` and a flash file keep it. A new power-on with no key held goes
+   through Battery Good to state OS and enters image 1 at about 300 M cycles. It never
+   reaches the diagnostic app. A third power-on, from the flash the second boot re-saved, does
+   the same (`provisioned_flash_boots_to_os_without_keys`).
+
+`provision` checks the menu title ("Engineering") and the Boot Select label before it presses
+anything. Its waits are breakpoints at the BSP 7.1.0.4413 addresses above, so another BSP
+version needs them checked. `Machine::power_cycle` does the power-off/on: the machine that
+`from_bundle_nv` would build from `nv_state()`.
 
 ### 3.4 How image 1 (the NS OS) is entered
 
@@ -273,7 +315,7 @@ previous boot.
 8. **The BSP launch gate (resolved, Task 24).** Board inputs on GPIO pins 9 and 11, the
    CRU product-ID strap, the SHA-256 continue bit and the placement of images 2..9 (§3.3,
    `discovery-log.md` §"Post-logo stall"). A fresh unit then needs the Self-Test menu's
-   "Exit" to launch the OS.
+   "Exit" to launch the OS, once; a provisioned unit (§3.5) launches it on every power-on.
 9. Later: image 1 runs through the BSP service table (0x2009_B100), so NS OS hardware needs
    follow the BSP's drivers.
 
@@ -284,8 +326,8 @@ previous boot.
 - What should flash offset 0 hold? Service 0x106 type 0xD expects an MCUboot image (magic
   0x96F3_B83D, the Launcher/BL2?) and returns -132 without it. The launch does not depend
   on it (Task 24); the info screen shows BL1/BL2 0.0.0.0.
-- How should an emulated unit get its factory ITS state (UID ..0001 "boot to OS")? Today a
-  fresh flash file boots into Self-Test every time.
+- Resolved (fix wave Task 3): an emulated unit gets its factory ITS state (UID ..0001 "boot
+  to OS") from the Engineering menu's Boot Select, driven by `evo-cli provision` (§3.5).
 - Resolved: the BSP uses RTX5 (CMSIS-RTOS2). 0x2004_4DC0 is an RTX timer ("Animation"),
   not a thread; the LAUNCH thread's control block is at 0x2003_9DD8.
 
@@ -300,6 +342,7 @@ counts are recorded here as each one passes.
 | M2 | secure boot completes; NS hand-off at 0x0011_6D50; `Starting BSP` on UART0 | hand-off 70,784,675 (first boot, 0 resets; 70,282,729 on the second power-on from the saved NV state); `Starting BSP` by 80,784,676 (the test checks UART0 every 10 M cycles, so this is an upper bound); Task 16 |
 | M3 | the boot logo on the emulated screen | 90,000,000 (the TI logo alone is on the screen from about 80 M to 100 M; Task 23, "M3 notes") |
 | M4 | OS image 1 entered at 0x0044_BC90 | 656,271,393 (fresh unit: ENTER at 2.5 s and 0 at 3.1 s in the Self-Test app; Task 24, "M4 notes") |
+| provisioned | image 1 entered with no key input after `provision` (§3.5) | 299,930,397 (power-on 2: 299,944,694 from a flash file; power-on 3: 299,868,494 from the flash power-on 2 re-saved; fix wave Task 3) |
 
 The M1 banner now arrives by cycle 70,000,001 (same 10 M-cycle granularity): with the SPIF
 the Read-ID probe no longer times out.
