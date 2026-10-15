@@ -314,3 +314,34 @@ every fetch to save work that, in the real boot, never happens any more.
 | `boot_to_self_test`, code-epoch changes | 12 253 | 0 |
 | `boot_to_self_test`, thread CPU time | 131.4 M cycles/s | 136.4 M cycles/s (awake cycles unchanged) |
 | `busy_loop`, thread CPU time | 52.7 M cycles/s | 54.7 M cycles/s |
+
+### 15. `Machine::run` steps in batches inside the CPU
+
+`Cpu::run_steps(bus, budget, before, stop)` calls the step in a loop of its own and returns
+after the step that uses up `budget`, after a step that `stop` (here: "a device ran"), PPB
+misses or a system-reset request end, or on a step that sleeps, hits `BKPT` or locks up.
+`before(bus, pc, secure, elapsed)` runs ahead of every step. With no breakpoint set,
+`Machine::run` hands it the cycles to the next due event or the end of the run. The hook
+writes the trace entry, `pc_hint` and the step's own start time into the map, so every
+device access sees exactly the time it saw before. After the run the machine syncs the bus
+and advances time once. Before the last step of a run no device ran, nothing was queued and
+no event was due, so per-step syncing and advancing would have done nothing there.
+
+`Machine::set_batching(false)` restores the step-by-step loop (`run_with`'s path). Two tests
+pin the equivalence. `batching_matches_single_steps` runs a synthetic program with SysTick
+and device interrupts, device events, pulses and WFI in uneven slices both ways and compares
+the whole machine after every slice (save state, trace, awake cycles). The milestone test
+`batching_is_invisible` boots the real OS with a key script both ways and compares UART0,
+screen and state hashes every 25 M cycles up to 400 M. Breaking any of the moved bookkeeping
+(for example the per-step bus time) fails the first one.
+
+Decision: the batch is a CPU-side loop with host hooks rather than a loop in `Machine` around
+`Cpu::step`. A machine-side loop was tried first and measured 20 % *slower* than the per-step
+loop. It changed how the compiler inlined `Cpu::step`, which costs more than the checks it
+skipped. Inside the CPU the step is inlined into the loop once, and its setup is paid once per
+batch.
+
+| | Before | After |
+|---|---|---|
+| `busy_loop`, thread CPU time | 59.3 M cycles/s | 65.6 M cycles/s (42 %) |
+| `boot_to_self_test`, thread CPU time | 158.0 M cycles/s | 166.4 M cycles/s (107 %; awake cycles unchanged) |

@@ -25,6 +25,18 @@ pub enum StepResult {
     Lockup,
 }
 
+/// How a [`Cpu::run_steps`] run ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunEnd {
+    /// Cycles of the steps that ended in [`StepResult::Executed`] (the last one included if
+    /// it did).
+    pub cycles: u64,
+    /// The result of the last step.
+    pub last: StepResult,
+    /// The PC the last step started at.
+    pub pc: u32,
+}
+
 /// Why the processor went to sleep, which decides what wakes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SleepKind {
@@ -543,6 +555,43 @@ impl Cpu {
     /// Take a pending exception that preempts the current execution priority, else execute one
     /// instruction (and take any exception it caused or that became pending meanwhile).
     pub fn step(&mut self, bus: &mut impl Bus) -> StepResult {
+        self.step_inline(bus)
+    }
+
+    /// [`step`](Self::step) repeatedly, in one loop, until a step does not end in
+    /// [`StepResult::Executed`] or, after an executed step: the run has used `budget` cycles or
+    /// more, `stop(bus)` says so, the step queued unimplemented PPB accesses
+    /// ([`has_ppb_misses`](Self::has_ppb_misses)) or requested a system reset
+    /// ([`sysreset_requested`](Self::sysreset_requested)). At least one step runs.
+    ///
+    /// `before(bus, pc, secure, elapsed)` runs before each step, with the PC and security
+    /// state the step starts in and the cycles the run had used by then: the host's per-step
+    /// bookkeeping (e.g. the time a device access sees). Each step is exactly a `step`.
+    #[inline]
+    pub fn run_steps<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        budget: u64,
+        mut before: impl FnMut(&mut B, u32, bool, u64),
+        mut stop: impl FnMut(&B) -> bool,
+    ) -> RunEnd {
+        let mut cycles = 0u64;
+        loop {
+            let pc = self.regs.pc;
+            before(bus, pc, self.regs.sec == Sec::Secure, cycles);
+            let last = self.step_inline(bus);
+            let StepResult::Executed { cycles: n } = last else {
+                return RunEnd { cycles, last, pc };
+            };
+            cycles += u64::from(n);
+            if cycles >= budget || stop(bus) || self.has_ppb_misses() || self.sysreset_requested() {
+                return RunEnd { cycles, last, pc };
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn step_inline(&mut self, bus: &mut impl Bus) -> StepResult {
         if self.stay_locked_up() {
             return StepResult::Lockup;
         }
@@ -757,5 +806,84 @@ mod tests {
         // The copy still runs, filling its own cache.
         assert_eq!(copy.step(&mut ram), StepResult::Executed { cycles: 1 });
         assert_eq!(copy.regs.pc, 0x10A);
+    }
+
+    /// A RAM image whose reset handler at 0x100 runs `code`.
+    fn program(code: &[u16]) -> (Cpu, Ram) {
+        let mut ram = Ram(vec![0; 0x1000]);
+        ram.0[0..4].copy_from_slice(&0x800u32.to_le_bytes());
+        ram.0[4..8].copy_from_slice(&0x101u32.to_le_bytes());
+        for (i, hw) in code.iter().enumerate() {
+            ram.0[0x100 + 2 * i..0x102 + 2 * i].copy_from_slice(&hw.to_le_bytes());
+        }
+        let mut cpu = Cpu::new();
+        cpu.reset(&mut ram);
+        (cpu, ram)
+    }
+
+    #[test]
+    fn run_steps_is_step_in_a_loop() {
+        // adds r0, #1 ; b . - 2 (2 cycles: 1 + branch)
+        let code = [0x3001, 0xE7FD];
+        let (mut a, mut ram_a) = program(&code);
+        let (mut b, mut ram_b) = program(&code);
+        let mut seen = Vec::new();
+        let end = a.run_steps(
+            &mut ram_a,
+            10,
+            |_, pc, secure, elapsed| seen.push((pc, secure, elapsed)),
+            |_| false,
+        );
+        let mut cycles = 0;
+        let mut expect = Vec::new();
+        while cycles < 10 {
+            expect.push((b.regs.pc, true, cycles));
+            let StepResult::Executed { cycles: n } = b.step(&mut ram_b) else {
+                panic!("not executed");
+            };
+            cycles += u64::from(n);
+        }
+        assert_eq!(seen, expect, "before() sees each step's PC, state and time");
+        assert_eq!(
+            end,
+            RunEnd {
+                cycles,
+                last: StepResult::Executed { cycles: 1 },
+                pc: 0x100
+            }
+        );
+        assert_eq!(a, b);
+        assert_eq!(
+            cycles, 10,
+            "1 + 2 + 1 + 2 + 1 + 2 + 1 cycles, then the budget is used"
+        );
+    }
+
+    #[test]
+    fn run_steps_ends_on_stop_sleep_bkpt_and_after_one_step() {
+        let (mut cpu, mut ram) = program(&[0x3001, 0x3001, 0xBF30, 0xBE07]);
+        // `stop` after the second step.
+        let mut n = 0;
+        let end = cpu.run_steps(
+            &mut ram,
+            u64::MAX,
+            |_, _, _, _| {},
+            |_| {
+                n += 1;
+                n == 2
+            },
+        );
+        assert_eq!((end.cycles, end.pc, cpu.regs.r[0]), (2, 0x102, 2));
+        // WFI ends the run with its result; its cycle is not counted.
+        let end = cpu.run_steps(&mut ram, u64::MAX, |_, _, _, _| {}, |_| false);
+        assert_eq!(end.last, StepResult::Sleep(SleepKind::Wfi));
+        assert_eq!((end.cycles, end.pc), (0, 0x104));
+        let end = cpu.run_steps(&mut ram, 0, |_, _, _, _| {}, |_| false);
+        assert_eq!(
+            end.last,
+            StepResult::Bkpt(7),
+            "a zero budget still runs one step"
+        );
+        assert_eq!(end.pc, 0x106);
     }
 }

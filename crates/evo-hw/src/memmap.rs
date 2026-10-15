@@ -429,6 +429,12 @@ impl MemoryMap {
         std::mem::take(&mut self.device_activity)
     }
 
+    /// [`take_device_activity`](Self::take_device_activity) without clearing it.
+    #[inline]
+    pub fn device_activity(&self) -> bool {
+        self.device_activity
+    }
+
     /// Edge IRQs requested since the last call, in order.
     pub fn take_pulses(&mut self) -> Vec<u16> {
         std::mem::take(&mut self.pulses)

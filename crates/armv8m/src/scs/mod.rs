@@ -288,6 +288,12 @@ impl Cpu {
         }
     }
 
+    /// Whether `AIRCR.SYSRESETREQ` is latched (without consuming it).
+    #[inline]
+    pub fn sysreset_requested(&self) -> bool {
+        self.scs.scb.sysresetreq
+    }
+
     /// Consume a latched `AIRCR.SYSRESETREQ` (the machine resets the system when it sees one).
     pub fn take_sysreset_request(&mut self) -> bool {
         std::mem::take(&mut self.scs.scb.sysresetreq)
