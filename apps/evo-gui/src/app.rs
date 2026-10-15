@@ -9,8 +9,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use egui::{
-    Align, Frame, Id, Layout, Margin, Pos2, Rect, Response, RichText, Sense, Vec2, ViewportCommand,
-    WidgetInfo, WidgetType, pos2, vec2,
+    Align, Frame, Id, Label, Layout, Margin, Pos2, Rect, Response, RichText, Sense, Vec2,
+    ViewportCommand, WidgetInfo, WidgetType, pos2, vec2,
 };
 
 use crate::backend::{
@@ -42,6 +42,13 @@ pub const TITLE: &str = "TI-84 Evo Emulator";
 const HEADER_H: f32 = 44.0;
 /// Size of the header title, in points.
 const TITLE_SIZE: f32 = 18.0;
+/// Header room kept for the status text before the backend name gets any, in points.
+const STATUS_ROOM: f32 = 110.0;
+/// Widest slot for the backend name in the header, in points; a longer name is elided.
+const NAME_MAX_W: f32 = 240.0;
+/// Below this slot width the header leaves the backend name out (its tooltip on the status
+/// still shows it), in points.
+const NAME_MIN_W: f32 = 80.0;
 /// Space around the calculator inside the central panel, in points.
 const CENTRAL_MARGIN: i8 = 8;
 /// Duration of the key press animation, in seconds.
@@ -465,8 +472,13 @@ impl EvoApp {
         self.keymap_window.capturing()
     }
 
-    /// Writes flash to disk; a failure becomes a toast.
+    /// Writes flash to disk; a failure becomes a toast. Skipped while the unit still needs
+    /// provisioning: after a failed first run the flash is wherever provisioning stopped, and
+    /// a flash file would stop the next launch from provisioning again.
     fn persist(&mut self) {
+        if self.backend.needs_provision() {
+            return;
+        }
         if let Err(e) = self.backend.persist() {
             self.toasts
                 .push(format!("Flash not saved: {e}"), ToastKind::Error);
@@ -734,18 +746,31 @@ impl EvoApp {
         }
     }
 
+    /// The title on the left; the status and the backend name on the right. Nothing
+    /// overlaps at any window width: the name is elided to a slot of at most
+    /// [`NAME_MAX_W`] and left out when the slot would be narrower than [`NAME_MIN_W`], and
+    /// the status and title are elided to the room that is left.
     fn header(&self, ui: &mut egui::Ui) {
         let status = if self.provisioning() {
             PROVISION_NOTICE.to_owned()
         } else {
             status_text(self.status, self.paused, self.speed.percent())
         };
+        let name = self.backend.name();
         ui.horizontal_centered(|ui| {
-            ui.label(RichText::new(TITLE).size(TITLE_SIZE).color(LABEL_DARK));
+            ui.add(Label::new(RichText::new(TITLE).size(TITLE_SIZE).color(LABEL_DARK)).truncate());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(self.backend.name()).color(LABEL_DARK));
-                ui.separator();
-                ui.label(RichText::new(status).color(LABEL_DARK));
+                let slot = (ui.available_width() - STATUS_ROOM).min(NAME_MAX_W);
+                if slot >= NAME_MIN_W {
+                    let size = vec2(slot, ui.available_height());
+                    ui.allocate_ui_with_layout(size, Layout::right_to_left(Align::Center), |ui| {
+                        ui.add(Label::new(RichText::new(name).color(LABEL_DARK)).truncate())
+                            .on_hover_text(name);
+                    });
+                    ui.separator();
+                }
+                ui.add(Label::new(RichText::new(status).color(LABEL_DARK)).truncate())
+                    .on_hover_text(name);
             });
         });
     }

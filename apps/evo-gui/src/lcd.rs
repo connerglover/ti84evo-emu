@@ -32,6 +32,21 @@ impl ScaleFilter {
     }
 }
 
+/// The gray the LCD image is multiplied by at backlight PWM duty `level` (`0.0..=1.0`).
+///
+/// Black when the backlight is off (`level` <= 0 or NaN). A lit backlight maps to
+/// `0.75 + 0.25·√level`: the eye sees brightness about logarithmically, so a straight
+/// duty-to-gray multiply would turn OS 7.1's default duty (about 0.46) into mid-gray. With
+/// the curve the default reads as white (about 92 %), like the Evo web emulator the spec
+/// matches (§6.4), and a lower OS level still dims the screen visibly.
+pub fn backlight_tint(level: f32) -> Color32 {
+    if level.is_nan() || level <= 0.0 {
+        return Color32::BLACK;
+    }
+    let gray = 0.75 + 0.25 * level.min(1.0).sqrt();
+    Color32::from_gray((255.0 * gray).round() as u8)
+}
+
 /// Where the LCD image is drawn inside the screen area `lcd` (points).
 ///
 /// `Smooth` uses all of `lcd`. `Nearest` uses an integer scale `s` (physical
@@ -117,12 +132,7 @@ impl LcdView {
         backlight: f32,
         filter: ScaleFilter,
     ) {
-        let level = if backlight.is_nan() {
-            0.0
-        } else {
-            backlight.clamp(0.0, 1.0)
-        };
-        self.tint = Color32::from_gray((255.0 * level) as u8);
+        self.tint = backlight_tint(backlight);
         self.filter = filter;
         let Some(frame) = frame.filter(|f| f.is_valid()) else {
             self.signal = false;

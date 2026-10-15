@@ -74,6 +74,10 @@ pub struct MachineBackend {
     nv_path: PathBuf,
     /// True from an open with no flash file until provisioning succeeds.
     fresh: bool,
+    /// [`Machine::nv_fingerprint`] of the flash the file at `nv_path` holds (read at open or
+    /// last written); `None` when there is no such file yet. `persist` skips the write while
+    /// it matches.
+    on_disk: Option<[u8; 32]>,
     /// The last LCD image, converted for the GUI.
     frame: Frame,
 }
@@ -113,6 +117,7 @@ impl MachineBackend {
             None
         };
         let machine = Machine::from_bundle_nv(&bundle, &Layout::EVO_7_1, nv)?;
+        let on_disk = (!fresh).then(|| machine.nv_fingerprint());
         Ok(Self {
             machine,
             bundle,
@@ -120,6 +125,7 @@ impl MachineBackend {
             tag: format!("machine:{hash:016x}"),
             nv_path,
             fresh,
+            on_disk,
             frame: Frame {
                 width: 0,
                 height: 0,
@@ -232,13 +238,26 @@ impl EmuBackend for MachineBackend {
     }
 
     fn persist(&mut self) -> Result<(), BackendError> {
+        // Until provisioning succeeds the flash file must not exist: it is what tells the
+        // next launch that the unit is provisioned.
+        if self.fresh {
+            return Ok(());
+        }
+        // The periodic save runs on the UI thread: hashing the flash costs far less than
+        // copying and writing 16 MiB with a sync, and the guest rarely writes flash.
+        let now = self.machine.nv_fingerprint();
+        if self.on_disk == Some(now) && self.nv_path.exists() {
+            return Ok(());
+        }
         if let Some(dir) = self.nv_path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| BackendError::Persist(e.to_string()))?;
         }
         self.machine
             .nv_state()
             .write_file(&self.nv_path)
-            .map_err(|e| BackendError::Persist(e.to_string()))
+            .map_err(|e| BackendError::Persist(e.to_string()))?;
+        self.on_disk = Some(now);
+        Ok(())
     }
 
     fn needs_provision(&self) -> bool {

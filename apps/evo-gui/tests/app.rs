@@ -9,7 +9,7 @@ use evo_gui::backend::fake::{FAKE_PC, FakeBackend};
 use evo_gui::backend::{EmuBackend, Frame, RunStatus};
 use evo_gui::keypad::KeyId;
 use evo_gui::keypad::geometry::{DPAD_CENTER, KEYPAD_ORIGIN};
-use evo_gui::lcd::{ScaleFilter, lcd_draw_rect};
+use evo_gui::lcd::{ScaleFilter, backlight_tint, lcd_draw_rect};
 use evo_gui::store::Store;
 use evo_gui::toolbar::Tool;
 
@@ -63,6 +63,71 @@ fn header_shows_title_and_backend() {
     h.get_by_label("TI-84 Evo Emulator");
     h.get_by_label("demo");
     h.get_by_label("Paused");
+}
+
+/// The header's title, status and backend name (when shown) at window width `w`: their rects
+/// must not overlap and must stay inside the window.
+fn assert_header_fits(w: f32, name: &str) -> bool {
+    let opts = AppOptions {
+        start_paused: true,
+        ..AppOptions::new(data_dir())
+    };
+    let fake = FakeBackend::new().named(name);
+    let mut h = Harness::builder()
+        .with_size([w, 960.0])
+        .with_pixels_per_point(1.0)
+        .build_eframe(|cc| EvoApp::new(&cc.egui_ctx, Box::new(fake), opts));
+    h.run_steps(3);
+    let title = h.get_by_label("TI-84 Evo Emulator").rect();
+    let status = h.get_by_label("Paused").rect();
+    let name = h.query_by_label(name).map(|n| n.rect());
+    let mut rects = vec![("title", title), ("status", status)];
+    rects.extend(name.map(|r| ("name", r)));
+    for (i, (a, ra)) in rects.iter().enumerate() {
+        assert!(
+            ra.left() >= 0.0 && ra.right() <= w,
+            "{a} {ra:?} outside a {w} pt window"
+        );
+        for (b, rb) in &rects[i + 1..] {
+            assert!(
+                !ra.intersects(*rb) || ra.intersect(*rb).area() < 0.5,
+                "{a} {ra:?} overlaps {b} {rb:?} at {w} pt"
+            );
+        }
+    }
+    name.is_some()
+}
+
+#[test]
+fn header_does_not_overlap_itself() {
+    const BUNDLE: &str = "TI84Evo_Bundle_7.1.0.4421.84b2";
+    const LONG: &str = "TI84Evo_Bundle_7.1.0.4421_copy_from_the_downloads_folder.84b2";
+    // The default width shows the backend name; a long one is elided to fit.
+    assert!(assert_header_fits(520.0, BUNDLE));
+    assert!(assert_header_fits(520.0, LONG));
+    // At the minimum window size there is no room for it.
+    assert_header_fits(320.0, BUNDLE);
+    assert_header_fits(360.0, LONG);
+}
+
+#[test]
+fn backlight_tint_keeps_the_default_level_near_white() {
+    let gray = |level: f32| backlight_tint(level).r();
+    // Off is dark; full is white.
+    assert_eq!(backlight_tint(0.0), egui::Color32::BLACK);
+    assert_eq!(backlight_tint(f32::NAN), egui::Color32::BLACK);
+    assert_eq!(backlight_tint(1.0), egui::Color32::WHITE);
+    assert_eq!(backlight_tint(7.0), egui::Color32::WHITE);
+    // OS 7.1's default duty (0.4588) reads as a white LCD, not mid-gray.
+    assert!(gray(0.4588) >= 0xE8, "default level {:#x}", gray(0.4588));
+    // The lowest lit level still shows the screen; brighter is never darker.
+    assert!(gray(0.01) >= 0xC0, "dimmest level {:#x}", gray(0.01));
+    let mut last = 0;
+    for i in 1..=100 {
+        let g = gray(i as f32 / 100.0);
+        assert!(g >= last, "level {i}%: {g} < {last}");
+        last = g;
+    }
 }
 
 #[test]
@@ -496,6 +561,44 @@ fn screenshot_button_writes_png() {
 }
 
 #[test]
+fn long_toast_after_a_short_one_stays_wide() {
+    let dir = fresh_dir("toastwidth");
+    let mut h = harness_in(FakeBackend::new(), true, dir.to_path_buf());
+    h.run_steps(1);
+    click(&mut h, "Save state");
+    click(&mut h, "Slot 2");
+    h.get_by_label("Saved slot 2");
+    h.run_steps(10);
+    click(&mut h, "Screenshot");
+    h.run_steps(2);
+    let r = h.get_by_label_contains("Screenshot saved to").rect();
+    // The 520 pt window leaves room for a 360 pt toast: the path wraps to a few lines, not
+    // to the width of "Saved slot 2".
+    assert!(r.width() >= 300.0, "toast {r:?}");
+    assert!(r.height() <= 80.0, "toast {r:?}");
+    assert!(r.left() >= 0.0 && r.right() <= 520.0, "toast {r:?}");
+}
+
+#[test]
+fn toast_fits_a_narrow_window() {
+    let dir = fresh_dir("toastnarrow");
+    let opts = AppOptions {
+        start_paused: true,
+        ..AppOptions::new(dir.to_path_buf())
+    };
+    let mut h = Harness::builder()
+        .with_size([320.0, 600.0])
+        .with_pixels_per_point(1.0)
+        .build_eframe(|cc| EvoApp::new(&cc.egui_ctx, Box::new(FakeBackend::new()), opts));
+    h.run_steps(1);
+    click(&mut h, "Screenshot");
+    h.run_steps(2);
+    let r = h.get_by_label_contains("Screenshot saved to").rect();
+    assert!(r.width() >= 240.0, "toast {r:?}");
+    assert!(r.left() >= 0.0 && r.right() <= 320.0, "toast {r:?}");
+}
+
+#[test]
 fn screenshot_without_display_shows_error_toast() {
     let dir = fresh_dir("noshot");
     let mut h = harness_in(FakeBackend::without_display(), true, dir.to_path_buf());
@@ -895,5 +998,24 @@ fn failed_provisioning_shows_error_and_keeps_machine() {
     h.get_by_label("provisioning failed: the fake always fails");
     assert_eq!(h.state().backend().name(), "demo");
     assert!(h.state().backend().needs_provision());
+    assert_eq!(probe.persists(), 0);
+}
+
+#[test]
+fn failed_provisioning_is_not_saved_so_the_next_launch_retries() {
+    let fake = FakeBackend::new().needing_provision().failing_provision();
+    let probe = fake.probe();
+    let dir = fresh_dir("provisionfailsave");
+    let mut h = harness_in(fake, true, dir.to_path_buf());
+    h.run_steps(1);
+    finish_provisioning(&mut h);
+    assert!(h.state().backend().needs_provision());
+    // eframe's periodic and shutdown save, Reset and Load state all persist flash: none of
+    // them may write the half-provisioned flash.
+    eframe::App::save(h.state_mut(), &mut MemStorage::default());
+    click(&mut h, "Reset");
+    click(&mut h, "Load state");
+    click(&mut h, "Slot 1");
+    assert_eq!(probe.resets(), 1);
     assert_eq!(probe.persists(), 0);
 }

@@ -305,17 +305,59 @@ fn flash_file_is_loaded_and_written_back() {
     assert_eq!(NvState::read_file(&path).unwrap().flash()[0x9_0000], 0xA5);
 }
 
+/// Writes erased flash with `marker` at 0x9_0000 to `path`.
+fn write_marked_flash(path: &Path, marker: u8) {
+    let erased = NvState::erased();
+    let mut flash = erased.flash().to_vec();
+    flash[0x9_0000] = marker;
+    NvState::new(flash, erased.secregs().to_vec())
+        .unwrap()
+        .write_file(path)
+        .unwrap();
+}
+
 #[test]
-fn persist_creates_flash_file() {
+fn unprovisioned_unit_is_not_persisted() {
+    // A fresh unit (no flash file) stays fresh until provisioning succeeds; writing its flash
+    // would make the next launch skip provisioning.
     let root = nv_dir();
     let dir = root.join("flash");
     let bundle = bundle_bytes(&COUNTER);
     let path = nv_path_for(&dir, &bundle);
     let mut b = MachineBackend::from_bytes(&bundle, "test.84b2".into(), &dir).unwrap();
-    assert!(!path.exists());
+    assert!(b.needs_provision());
+    b.run_for(1000);
     b.persist().unwrap();
-    assert!(path.exists());
-    assert!(NvState::read_file(&path).is_ok());
+    assert!(!path.exists());
+    assert!(!dir.exists());
+}
+
+#[test]
+fn unchanged_flash_is_not_rewritten() {
+    let dir = nv_dir();
+    let bundle = bundle_bytes(&COUNTER);
+    let path = nv_path_for(&dir, &bundle);
+    write_marked_flash(&path, 0xA5);
+    let mut b = MachineBackend::from_bytes(&bundle, "test.84b2".into(), &dir).unwrap();
+    b.run_for(1000);
+    // Something else replaces the file: a persist of the unchanged machine leaves it alone.
+    write_marked_flash(&path, 0x5A);
+    b.persist().unwrap();
+    assert_eq!(NvState::read_file(&path).unwrap().flash()[0x9_0000], 0x5A);
+}
+
+#[test]
+fn persist_recreates_a_missing_flash_file() {
+    let root = nv_dir();
+    let dir = root.join("flash");
+    let bundle = bundle_bytes(&COUNTER);
+    let path = nv_path_for(&dir, &bundle);
+    std::fs::create_dir_all(&dir).unwrap();
+    write_marked_flash(&path, 0xA5);
+    let mut b = MachineBackend::from_bytes(&bundle, "test.84b2".into(), &dir).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    b.persist().unwrap();
+    assert_eq!(NvState::read_file(&path).unwrap().flash()[0x9_0000], 0xA5);
 }
 
 #[test]

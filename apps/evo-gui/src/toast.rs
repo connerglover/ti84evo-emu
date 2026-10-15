@@ -10,6 +10,10 @@ use crate::theme::{LABEL_LIGHT, TOAST_BG, TOAST_ERROR_BG};
 pub const TOAST_SECS: f64 = 4.0;
 /// Gap between the toasts and the bottom of the window, in points.
 const BOTTOM_GAP: f32 = 16.0;
+/// Widest a toast gets, in points; longer text wraps.
+const MAX_WIDTH: f32 = 360.0;
+/// Least gap between a toast and each side of the window, in points.
+const SIDE_GAP: f32 = 16.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToastKind {
@@ -81,11 +85,18 @@ impl Toasts {
         }
         let progress = self.progress.iter().map(|text| (text, ToastKind::Info));
         let toasts = self.items.iter().map(|t| (&t.text, t.kind));
+        // A fixed column width: the Area would otherwise keep the width of an earlier,
+        // shorter toast and wrap a long one into a tall strip over the keypad.
+        let width = MAX_WIDTH
+            .min(ctx.content_rect().width() - 2.0 * SIDE_GAP)
+            .max(0.0);
         egui::Area::new(Id::new("evo-toasts"))
             .order(Order::Foreground)
             .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -BOTTOM_GAP))
             .interactable(false)
             .show(ctx, |ui| {
+                ui.set_min_width(width);
+                ui.set_max_width(width);
                 ui.vertical_centered(|ui| {
                     for (text, kind) in progress.chain(toasts) {
                         let fill: Color32 = match kind {

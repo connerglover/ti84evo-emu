@@ -94,6 +94,8 @@ pub struct FakeBackend {
     uart: Vec<u8>,
     breakpoints: Vec<u32>,
     state_tag: String,
+    /// What `name` reports.
+    name: String,
     /// What `needs_provision` reports; `provision` clears it on success.
     fresh: bool,
     provision_fails: bool,
@@ -121,6 +123,7 @@ impl FakeBackend {
             uart: Vec::new(),
             breakpoints: Vec::new(),
             state_tag: "demo".to_owned(),
+            name: "demo".to_owned(),
             fresh: false,
             provision_fails: false,
             gate: None,
@@ -154,6 +157,12 @@ impl FakeBackend {
 
     pub fn with_state_tag(mut self, tag: &str) -> Self {
         self.state_tag = tag.to_owned();
+        self
+    }
+
+    /// A fake that reports `name` instead of "demo" (the header shows it).
+    pub fn named(mut self, name: &str) -> Self {
+        self.name = name.to_owned();
         self
     }
 
@@ -222,7 +231,7 @@ fn fill(frame: &mut Frame, x: u32, y: u32, w: u32, h: u32, rgb: [u8; 3]) {
 
 impl EmuBackend for FakeBackend {
     fn name(&self) -> &str {
-        "demo"
+        &self.name
     }
 
     fn state_tag(&self) -> String {

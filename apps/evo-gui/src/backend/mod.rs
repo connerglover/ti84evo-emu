@@ -111,7 +111,8 @@ pub trait EmuBackend: Send {
     fn state_tag(&self) -> String;
     /// The current LCD frame; `None` when the display is off or not modeled.
     fn framebuffer(&mut self) -> Option<&Frame>;
-    /// Backlight level in `0.0..=1.0`; the LCD view dims the frame by it.
+    /// Backlight level (PWM duty) in `0.0..=1.0`; the LCD view dims the frame by
+    /// [`backlight_tint`](crate::lcd::backlight_tint) of it.
     fn backlight(&self) -> f32;
     fn set_key(&mut self, key: KeyId, pressed: bool);
     fn run_for(&mut self, cycles: u64) -> RunStatus;
@@ -125,7 +126,10 @@ pub trait EmuBackend: Send {
     fn load_state(&mut self, bytes: &[u8]) -> Result<(), BackendError>;
     /// Resets the machine; flash is kept.
     fn reset(&mut self);
-    /// Writes flash (non-volatile state) to disk; a no-op where there is none.
+    /// Writes flash (non-volatile state) to disk; a no-op where there is none, while
+    /// [`needs_provision`](Self::needs_provision) (so a failed first run is retried at the
+    /// next launch) and when flash is unchanged since the last write. The app calls it from
+    /// eframe's periodic save on the UI thread, so the unchanged case must be cheap.
     fn persist(&mut self) -> Result<(), BackendError>;
     /// True when the machine has never been set up to boot its OS (it started from an
     /// erased flash): the app then runs [`provision`](Self::provision) before anything else.
