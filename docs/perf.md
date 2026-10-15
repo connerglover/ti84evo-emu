@@ -160,3 +160,17 @@ A raw `Cpu::step` loop on the same machine (no `Machine` bookkeeping) runs at 59
 |---|---|---|
 | `busy_loop`, thread CPU time | 35.3 M cycles/s | 50.8 M cycles/s (33 %) |
 | `boot_to_self_test`, thread CPU time | 96.4 M cycles/s | 126.7 M cycles/s (awake cycles unchanged) |
+
+### 8. Cheaper device accesses and event checks
+
+- `MemoryMap` remembers the window its last general-path access hit and tries it before the
+  binary search (device polling hits the same window over and over).
+- The OR of every device's IRQ lines is kept up to date when a device's lines change, instead
+  of being folded over all devices after every device access.
+- `Scheduler` keeps the cycle of its earliest event, so `pop_due` answers "nothing due"
+  without touching the heap.
+
+| | Before | After |
+|---|---|---|
+| `busy_loop`, thread CPU time | 50.8 M cycles/s | 50.4 M cycles/s (no device or event traffic) |
+| `boot_to_self_test`, thread CPU time | 126.7 M cycles/s | 132.8 M cycles/s (awake cycles unchanged) |

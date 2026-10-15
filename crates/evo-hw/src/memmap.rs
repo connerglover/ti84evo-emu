@@ -96,6 +96,12 @@ pub struct MemoryMap {
     /// in it, so writes to it must change `code_epoch`. Grown on demand.
     #[serde(skip)]
     code_pages: Vec<Vec<bool>>,
+    /// Index of the window the last general-path access hit (a hint; any value is safe).
+    #[serde(skip)]
+    last_region: usize,
+    /// The OR of every slot's `irq_out`, updated whenever one changes.
+    #[serde(skip)]
+    irq_lines: u64,
 }
 
 /// Source of [`MemoryMap::code_epoch`] values, unique within the process.
@@ -319,6 +325,7 @@ impl MemoryMap {
     ) -> Option<R> {
         let slot = self.slots.get_mut(id)?;
         self.device_activity = true;
+        let old_irq = slot.irq_out;
         // `id` fits: add_device checked every slot index.
         let mut ctx = DevCtx::new(
             self.now,
@@ -333,7 +340,11 @@ impl MemoryMap {
             secure,
         );
         let r = f(slot.dev.as_mut(), &mut ctx);
-        if ctx.buffers_written() {
+        let written = ctx.buffers_written();
+        if slot.irq_out != old_irq {
+            self.update_irq_lines();
+        }
+        if written {
             self.code_changed();
         }
         Some(r)
@@ -383,7 +394,12 @@ impl MemoryMap {
 
     /// Level IRQ lines: the OR of every device's lines (bit n = line n).
     pub fn irq_lines(&self) -> u64 {
-        self.slots.iter().fold(0, |acc, s| acc | s.irq_out)
+        self.irq_lines
+    }
+
+    /// Recompute [`irq_lines`](Self::irq_lines) after a device's lines changed.
+    fn update_irq_lines(&mut self) {
+        self.irq_lines = self.slots.iter().fold(0, |acc, s| acc | s.irq_out);
     }
 
     /// Whether any device ran or had its state loaded since the last call: until one does,
@@ -456,6 +472,7 @@ impl MemoryMap {
         for (slot, st) in self.slots.iter_mut().zip(states) {
             slot.irq_out = st.irq_out;
         }
+        self.update_irq_lines();
         Ok(())
     }
 
@@ -551,8 +568,15 @@ impl MemoryMap {
     }
 
     /// Classify an access of `width` bytes at `addr` (addresses wrap at 2^32, like the CPU's).
-    fn span(&self, addr: u32, width: u8) -> Span {
-        if let Some(i) = region::find(&self.regions, addr) {
+    fn span(&mut self, addr: u32, width: u8) -> Span {
+        // Device polling hits the same window again and again: try the last one first.
+        let last = self
+            .regions
+            .get(self.last_region)
+            .filter(|r| r.base <= addr && u64::from(addr) < r.end())
+            .map(|_| self.last_region);
+        if let Some(i) = last.or_else(|| region::find(&self.regions, addr)) {
+            self.last_region = i;
             let r = &self.regions[i];
             let off = addr - r.base;
             return if u64::from(off) + u64::from(width) <= u64::from(r.size) {
