@@ -22,7 +22,25 @@ pub struct Nvic {
     /// long: the IPR registers index it directly, so decoding any other length fails.
     #[serde(deserialize_with = "priority_bytes")]
     pub priority: Vec<u8>,
+    /// Set once no IRQ was found both pending and enabled ([`Nvic::none_live`]); cleared by
+    /// every change to `pending` or `enabled`, which therefore go through this type's methods
+    /// only. Lets `Cpu::step` skip the scan before and after every instruction. Not state:
+    /// starts clear, is not serialized, and equality ignores it.
+    #[serde(skip)]
+    quiet: Quiet,
 }
+
+/// See `Nvic::quiet`.
+#[derive(Clone, Copy, Debug, Default)]
+struct Quiet(bool);
+
+impl PartialEq for Quiet {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Quiet {}
 
 /// Decodes `Nvic::priority`, rejecting any length but `NUM_IRQS` (save states are untrusted).
 fn priority_bytes<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
@@ -45,6 +63,7 @@ impl Default for Nvic {
             level: [0; WORDS],
             itns: [0; WORDS],
             priority: vec![0; NUM_IRQS],
+            quiet: Quiet::default(),
         }
     }
 }
@@ -89,6 +108,18 @@ pub(crate) fn irqs(words: &[u32; WORDS]) -> impl Iterator<Item = usize> + '_ {
 }
 
 impl Nvic {
+    /// True if no IRQ is both pending and enabled.
+    pub(crate) fn none_live(&mut self) -> bool {
+        if !self.quiet.0 {
+            let mut live = 0;
+            for w in 0..WORDS {
+                live |= self.pending[w] & self.enabled[w];
+            }
+            self.quiet = Quiet(live == 0);
+        }
+        self.quiet.0
+    }
+
     pub fn is_enabled(&self, irq: usize) -> bool {
         get(&self.enabled, irq)
     }
@@ -102,6 +133,7 @@ impl Nvic {
     }
 
     pub fn set_pending(&mut self, irq: usize, v: bool) {
+        self.quiet = Quiet(false);
         put(&mut self.pending, irq, v);
     }
 
@@ -169,6 +201,7 @@ impl Nvic {
             v
         };
         let mut newly_pending = 0;
+        self.quiet = Quiet(false);
         match off {
             0x000..0x040 if i < WORDS => self.enabled[i] |= bits,
             0x080..0x0C0 if i < WORDS => self.enabled[i] &= !bits,

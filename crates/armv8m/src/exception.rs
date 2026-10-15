@@ -7,7 +7,7 @@
 use crate::bus::{Access, AccessKind, Bus};
 use crate::cpu::Cpu;
 use crate::regs::{Sec, Xpsr};
-use crate::scs::nvic::irqs;
+use crate::scs::nvic::{self, irqs};
 use crate::scs::sau::{
     SFSR_AUVIOL, SFSR_INVEP, SFSR_INVER, SFSR_INVIS, SFSR_INVTRAN, SFSR_SFARVALID,
 };
@@ -354,11 +354,15 @@ impl Cpu {
 
     /// The pending exception that preempts the current execution priority, if any.
     pub(crate) fn preemptable_pending(&self) -> Option<(u16, Sec)> {
+        // Fast rejection, run before and after every instruction: `highest_pending` only
+        // considers pending system exceptions and IRQs that are both pending and enabled.
         let scb = &self.scs.scb;
-        if scb.pending.s == 0
-            && scb.pending.ns == 0
-            && self.scs.nvic.pending.iter().all(|&w| w == 0)
-        {
+        let n = &self.scs.nvic;
+        let mut live = 0;
+        for w in 0..nvic::WORDS {
+            live |= n.pending[w] & n.enabled[w];
+        }
+        if scb.pending.s | scb.pending.ns == 0 && live == 0 {
             return None;
         }
         let (num, sec) = self.highest_pending()?;
@@ -526,6 +530,11 @@ impl Cpu {
     /// Take the highest-priority pending exception if it preempts the current execution
     /// priority. Returns true if an exception entry was performed (or it locked up trying).
     pub(crate) fn take_pending(&mut self, bus: &mut impl Bus) -> bool {
+        // The common case, before and after every instruction: nothing is pending at all.
+        let scb = &self.scs.scb;
+        if scb.pending.s | scb.pending.ns == 0 && self.scs.nvic.none_live() {
+            return false;
+        }
         let Some((num, sec)) = self.preemptable_pending() else {
             return false;
         };

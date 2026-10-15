@@ -356,6 +356,27 @@ fn primask_masks_irq() {
     assert_eq!(frame(&cpu, &bus)[6], 0x106, "return address after cpsie");
 }
 
+/// Steps with nothing pending (which let the core skip its pending scan) do not hide an IRQ
+/// pended afterwards, whichever way it is pended.
+#[test]
+fn irq_pended_after_quiet_steps_is_taken() {
+    let (mut cpu, mut bus) = cpu_with_code(&[NOP, NOP, NOP, NOP, B_SELF]);
+    handler(&mut bus, 16 + 3, 0x200, &[BX_LR]);
+    enable_irqs(&mut cpu, 1 << 3);
+    run2(&mut cpu, &mut bus);
+    assert_eq!(ipsr(&cpu), 0);
+    cpu.set_irq_level(3, true);
+    executed(cpu.step(&mut bus));
+    assert_eq!(ipsr(&cpu), 19, "level IRQ");
+    cpu.set_irq_level(3, false);
+    executed(cpu.step(&mut bus)); // bx lr: return
+    assert_eq!(ipsr(&cpu), 0);
+    executed(cpu.step(&mut bus));
+    cpu.ppb_write32(NVIC_ISPR0, 1 << 3);
+    executed(cpu.step(&mut bus));
+    assert_eq!(ipsr(&cpu), 19, "ISPR write");
+}
+
 #[test]
 fn disabled_irq_stays_pending() {
     let (mut cpu, mut bus) = cpu_with_code(&[NOP, NOP, B_SELF]);

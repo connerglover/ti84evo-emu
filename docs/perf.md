@@ -94,3 +94,18 @@ unless the flag is set (the PPB-miss drain stays unconditional).
 |---|---|---|
 | `Machine::step` | 54.1 ns | 44.8 ns |
 | `busy_loop` | 23.0 M cycles/s | 22.9 M cycles/s (within noise) |
+
+### 4. Skip the pending-exception scan when nothing is pending
+
+`Cpu::step` looks for a pending exception before and after every instruction; the quick
+rejection scanned all 15 NVIC pending words each time. `Nvic` now remembers that no IRQ is both
+pending and enabled until `pending` or `enabled` changes (all changes go through its methods),
+so the common case is two flag tests. The hint is not state: not serialized, ignored by
+equality, clear after a restore.
+
+From this step on, `busy_loop` is also timed by thread CPU time in an out-of-tree sampling
+harness (same program, same `Machine::run`), which other load on the host does not disturb.
+
+| | Before | After |
+|---|---|---|
+| `busy_loop`, thread CPU time | 26.1 M cycles/s | 28.7 M cycles/s (18 %) |
