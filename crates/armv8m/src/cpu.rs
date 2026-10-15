@@ -537,6 +537,8 @@ impl Cpu {
     }
 
     /// Raise `fault` for the instruction at PC (which stays on it).
+    #[cold]
+    #[inline(never)]
     fn fault(&mut self, fault: Fault) -> Exec {
         if self.raise_fault(fault) {
             Exec::Done {

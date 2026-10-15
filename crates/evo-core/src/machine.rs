@@ -90,28 +90,34 @@ struct RecentStep {
     secure: bool,
 }
 
-/// Ring buffer of the last [`RECENT_STEPS`] CPU steps.
-#[derive(Default)]
+/// Ring buffer of the last [`RECENT_STEPS`] CPU steps (a power of two).
 pub(crate) struct RecentSteps {
-    /// Up to `RECENT_STEPS` entries; once full, `next` is the oldest.
-    steps: Vec<RecentStep>,
-    /// Where the next step is written once `steps` is full.
-    next: usize,
+    steps: [RecentStep; RECENT_STEPS],
+    /// Steps pushed so far; the next one goes to `pushed % RECENT_STEPS`.
+    pushed: u64,
+}
+
+impl Default for RecentSteps {
+    fn default() -> Self {
+        Self {
+            steps: [RecentStep::default(); RECENT_STEPS],
+            pushed: 0,
+        }
+    }
 }
 
 impl RecentSteps {
+    #[inline]
     fn push(&mut self, step: RecentStep) {
-        if self.steps.len() < RECENT_STEPS {
-            self.steps.push(step);
-        } else {
-            self.steps[self.next] = step;
-            self.next = (self.next + 1) % RECENT_STEPS;
-        }
+        self.steps[self.pushed as usize % RECENT_STEPS] = step;
+        self.pushed += 1;
     }
 
     /// Oldest first.
     fn iter(&self) -> impl Iterator<Item = &RecentStep> {
-        let (newer, older) = self.steps.split_at(self.next);
+        let filled = self.pushed.min(RECENT_STEPS as u64) as usize;
+        let next = self.pushed as usize % RECENT_STEPS;
+        let (newer, older) = self.steps[..filled.max(next)].split_at(next);
         older.iter().chain(newer)
     }
 }
@@ -318,10 +324,20 @@ impl Machine {
     /// Pass what the devices and the CPU queued since the last call on: (1) IRQ line changes
     /// to the NVIC, (2) pulses, (3) event requests to the scheduler, (4) the CPU's
     /// unimplemented PPB accesses to the unmapped log.
+    #[inline]
     fn sync_bus(&mut self) {
         if self.bus.take_device_activity() {
             self.sync_devices();
         }
+        if self.cpu.has_ppb_misses() {
+            self.drain_ppb_misses();
+        }
+    }
+
+    /// Step (4) of [`sync_bus`](Self::sync_bus).
+    #[cold]
+    #[inline(never)]
+    fn drain_ppb_misses(&mut self) {
         for miss in self.cpu.take_ppb_misses() {
             let kind = if miss.write.is_some() {
                 UnmappedKind::Write
@@ -340,6 +356,7 @@ impl Machine {
     }
 
     /// Steps (1) to (3) of [`sync_bus`](Self::sync_bus), needed only after a device ran.
+    #[inline(never)]
     fn sync_devices(&mut self) {
         let lines = self.bus.irq_lines();
         let mut changed = lines ^ self.applied_irqs;
@@ -412,7 +429,7 @@ impl Machine {
             }
             let pc = self.cpu.regs.pc;
             let resumed = self.stopped_at.take() == Some(pc);
-            if self.breakpoints.contains(&pc) && !resumed {
+            if !resumed && !self.breakpoints.is_empty() && self.breakpoints.contains(&pc) {
                 self.stopped_at = Some(pc);
                 return StopReason::Breakpoint(pc);
             }
@@ -591,6 +608,8 @@ impl Machine {
     /// unmapped log are kept, pending events are dropped (a device that keeps running asks for
     /// its event again in `reset`), and time keeps counting. Device IRQ lines still high after
     /// the reset pend again.
+    #[cold]
+    #[inline(never)]
     fn system_reset(&mut self) {
         self.resets += 1;
         log::info!(

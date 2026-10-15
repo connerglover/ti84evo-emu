@@ -141,3 +141,22 @@ what the guest does.
 |---|---|---|
 | `busy_loop`, thread CPU time | 32.2 M cycles/s | 35.3 M cycles/s (23 %) |
 | `boot_to_self_test`, thread CPU time | — | 96.4 M cycles/s, 34.1 M awake cycles/s (15 090 epoch changes) |
+
+### 7. Lean per-step bookkeeping, rare paths out of line
+
+- The recent-steps ring is a fixed array indexed by a step counter (no length checks).
+- `sync_bus` is an inlined pair of flag tests; device sync and the PPB-miss drain are separate
+  out-of-line functions (`Cpu::has_ppb_misses` guards the drain).
+- The breakpoint lookup is skipped while there are no breakpoints.
+- Rarely taken paths are kept out of the step functions (`#[cold]` / `#[inline(never)]`):
+  `Machine::system_reset`, `Cpu::fault`, `raise_fault`, `raise_sync`, `enter_lockup`,
+  exception entry, exception return and function return. Inlined, they bloated the hot loop
+  enough to cost a fifth of the throughput (measured by removing the never-taken
+  `take_sysreset_request` branch: 37.5 → 45.7 M cycles/s).
+
+A raw `Cpu::step` loop on the same machine (no `Machine` bookkeeping) runs at 59.8 M cycles/s.
+
+| | Before | After |
+|---|---|---|
+| `busy_loop`, thread CPU time | 35.3 M cycles/s | 50.8 M cycles/s (33 %) |
+| `boot_to_self_test`, thread CPU time | 96.4 M cycles/s | 126.7 M cycles/s (awake cycles unchanged) |

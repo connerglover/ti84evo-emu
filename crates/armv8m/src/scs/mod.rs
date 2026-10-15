@@ -246,6 +246,11 @@ impl Cpu {
         std::mem::take(&mut self.ppb_misses)
     }
 
+    /// Whether `take_ppb_misses` has anything to return.
+    pub fn has_ppb_misses(&self) -> bool {
+        !self.ppb_misses.is_empty()
+    }
+
     /// Host (debugger/test) read of a PPB word: privileged, no fault, in the current security
     /// state's view; the Non-secure alias (`0xE002_xxxx`) always reads the Non-secure view.
     pub fn ppb_read32(&mut self, addr: u32) -> u32 {
