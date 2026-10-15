@@ -61,6 +61,51 @@ pub struct Cpu {
     /// The SoC's attribution unit (configuration: kept across reset, not serialized).
     #[serde(skip)]
     idau: IdauHandle,
+    /// Attribution of recently used 32-byte blocks (see `attr_of`). Not state: not
+    /// serialized, ignored by equality, flushed whenever the SAU or the IDAU changes.
+    #[serde(skip)]
+    attr_cache: AttrCache,
+}
+
+/// Entries of `AttrCache`, a power of two.
+const ATTR_CACHE: usize = 256;
+/// `AttrCache` entry flag: the entry is valid.
+const ATTR_VALID: u32 = 1 << 3;
+
+/// Direct-mapped cache of `Cpu::security_of` by 32-byte block (the attribution granule:
+/// SAU regions are 32-byte aligned, and `Idau` implementations must be constant per block).
+/// An entry is the block address, `ATTR_VALID` and the attribution in bits 0..3; 0 is empty.
+#[derive(Clone, Debug)]
+struct AttrCache([u32; ATTR_CACHE]);
+
+impl Default for AttrCache {
+    fn default() -> Self {
+        Self([0; ATTR_CACHE])
+    }
+}
+
+impl PartialEq for AttrCache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for AttrCache {}
+
+const ATTRS: [Attr; 4] = [
+    Attr::Secure,
+    Attr::NonSecureCallable,
+    Attr::NonSecure,
+    Attr::Exempt,
+];
+
+fn attr_code(a: Attr) -> u32 {
+    match a {
+        Attr::Secure => 0,
+        Attr::NonSecureCallable => 1,
+        Attr::NonSecure => 2,
+        Attr::Exempt => 3,
+    }
 }
 
 impl Default for Cpu {
@@ -136,6 +181,7 @@ impl Cpu {
             sp_violation: false,
             ppb_misses: Vec::new(),
             idau: IdauHandle::default(),
+            attr_cache: AttrCache::default(),
         }
     }
 
@@ -164,17 +210,36 @@ impl Cpu {
         let idau = std::mem::take(&mut self.idau);
         *self = saved;
         self.idau = idau;
+        self.flush_attr_cache();
     }
 
     /// Install the SoC's IDAU (default: `DefaultIdau`, address bit 28 set is Secure).
     pub fn set_idau(&mut self, idau: Box<dyn Idau>) {
         self.idau = IdauHandle::new(idau);
+        self.flush_attr_cache();
     }
 
     /// Security attribution of `addr`: the SAU combined with the IDAU (most secure wins); the
     /// system space from `0xE000_0000` is `Exempt`.
     pub fn security_of(&self, addr: u32) -> Attr {
         self.attribution(addr).attr
+    }
+
+    /// [`security_of`](Self::security_of) through the attribution cache.
+    pub(crate) fn attr_of(&mut self, addr: u32) -> Attr {
+        let block = addr & !0x1F;
+        let slot = &mut self.attr_cache.0[(addr >> 5) as usize % ATTR_CACHE];
+        if *slot & !0x1F == block && *slot & ATTR_VALID != 0 {
+            return ATTRS[(*slot & 3) as usize];
+        }
+        let attr = self.scs.sau.check(addr, self.idau.get()).attr;
+        self.attr_cache.0[(addr >> 5) as usize % ATTR_CACHE] = block | ATTR_VALID | attr_code(attr);
+        attr
+    }
+
+    /// Forget every cached attribution: the SAU or the IDAU changed.
+    pub(crate) fn flush_attr_cache(&mut self) {
+        self.attr_cache = AttrCache::default();
     }
 
     /// `SecurityCheck()` for `addr`, with the region numbers `TT` reports.
@@ -186,8 +251,8 @@ impl Cpu {
     /// replaced): Non-secure memory is accessed Non-secure even from Secure state, exempt memory
     /// in state `from`. `None` when Non-secure state reaches Secure or Non-secure callable
     /// memory, which is a SecureFault AUVIOL.
-    pub(crate) fn attribute(&self, addr: u32, acc: Access, from: Sec) -> Option<Access> {
-        let secure = match self.security_of(addr) {
+    pub(crate) fn attribute(&mut self, addr: u32, acc: Access, from: Sec) -> Option<Access> {
+        let secure = match self.attr_of(addr) {
             Attr::Exempt => from == Sec::Secure,
             Attr::NonSecure => false,
             Attr::Secure | Attr::NonSecureCallable => {
@@ -218,8 +283,8 @@ impl Cpu {
     /// attribution of `addr`, which must match the current security state: Non-secure code may
     /// enter Secure memory only at an `SG` in a Non-secure callable region (else INVEP), and
     /// Secure code reaches Non-secure memory only through BXNS/BLXNS (else INVTRAN).
-    fn fetch(&self, bus: &mut impl Bus, addr: u32) -> Result<(Instr, u8), Fault> {
-        let attr = self.security_of(addr);
+    fn fetch(&mut self, bus: &mut impl Bus, addr: u32) -> Result<(Instr, u8), Fault> {
+        let attr = self.attr_of(addr);
         let sec = self.regs.sec;
         match (sec, attr) {
             (Sec::NonSecure, Attr::Secure) => return Err(Fault::InvEp),

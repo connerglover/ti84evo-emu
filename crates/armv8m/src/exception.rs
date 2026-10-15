@@ -492,7 +492,7 @@ impl Cpu {
     /// Write one word of a stack frame that belongs to security state `sec`. The access has
     /// the frame's security; a Non-secure frame reaching Secure memory is a SecureFault AUVIOL.
     pub(crate) fn stack_write(
-        &self,
+        &mut self,
         bus: &mut impl Bus,
         addr: u32,
         v: u32,
@@ -510,7 +510,7 @@ impl Cpu {
 
     /// Read one word of a stack frame that belongs to security state `sec` (see `stack_write`).
     fn stack_read(
-        &self,
+        &mut self,
         bus: &mut impl Bus,
         addr: u32,
         sec: Sec,

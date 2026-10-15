@@ -458,7 +458,10 @@ impl Cpu {
                 }
             }
             MPU..=MPU_END => return self.scs.mpu.get_mut(view).write(word - MPU, v),
-            SAU..=SAU_END if secure => return self.scs.sau.write(word - SAU, v),
+            SAU..=SAU_END if secure => {
+                self.flush_attr_cache();
+                return self.scs.sau.write(word - SAU, v);
+            }
             SAU..=SAU_END => {}
             STIR => {
                 // Non-secure software can only pend interrupts that target Non-secure state.

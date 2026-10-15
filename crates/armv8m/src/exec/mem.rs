@@ -40,7 +40,7 @@ fn fault(cause: MemFault) -> Flow {
 }
 
 /// Security attribution of a data access to `addr` (see `Cpu::attribute`).
-fn attribute(cpu: &Cpu, addr: u32, acc: Access) -> Result<Access, MemFault> {
+fn attribute(cpu: &mut Cpu, addr: u32, acc: Access) -> Result<Access, MemFault> {
     cpu.attribute(addr, acc, cpu.regs.sec)
         .ok_or(MemFault::Secure(addr))
 }

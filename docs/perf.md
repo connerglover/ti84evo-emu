@@ -109,3 +109,15 @@ harness (same program, same `Machine::run`), which other load on the host does n
 | | Before | After |
 |---|---|---|
 | `busy_loop`, thread CPU time | 26.1 M cycles/s | 28.7 M cycles/s (18 %) |
+
+### 5. Attribution cache
+
+Every fetch and data access asked the SAU and the IDAU for the attribution of its address.
+`Cpu` now caches it in a 256-entry direct-mapped table by 32-byte block (the attribution
+granule), flushed on every SAU register write, on `set_idau` and on `restore_from`; the `Idau`
+trait documents that its answer must be constant per block. `TT`, `decode_at` and the public
+`security_of` still compute it afresh.
+
+| | Before | After |
+|---|---|---|
+| `busy_loop`, thread CPU time | 28.7 M cycles/s | 32.2 M cycles/s (21 %) |

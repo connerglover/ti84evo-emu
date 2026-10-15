@@ -1260,3 +1260,45 @@ fn tt_mpu_fields_need_privilege() {
         (1 << 8) | SRVALID | TT_R | TT_RW | TT_NSR | TT_NSRW
     );
 }
+
+/// The core caches attribution per 32-byte block; reprogramming the SAU (or installing an
+/// IDAU) must take effect at once for data accesses and fetches alike.
+#[test]
+fn sau_changes_apply_to_cached_attribution() {
+    let (mut cpu, mut bus) = tz();
+    // NS: ldr r1, [r0] (twice) at 0x100.
+    bus.code(0x100, &[LDR_R1_R0, LDR_R1_R0, B_SELF]);
+    bus.put(0x2000_0010, 0x1234_5678);
+    enter_ns(&mut cpu, 0x100);
+    cpu.regs.r[0] = 0x2000_0010;
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.regs.r[1], 0x1234_5678);
+    assert!(!bus.last_access(0x2000_0010).secure);
+
+    // Secure software disables region 1 (NS RAM): 0x2000_0010 is now Secure, and the next
+    // Non-secure load of it is a SecureFault AUVIOL.
+    cpu.regs.sec = Sec::Secure;
+    cpu.ppb_write32(SAU_RNR, 1);
+    cpu.ppb_write32(SAU_RLAR, 0);
+    cpu.regs.sec = Sec::NonSecure;
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.regs.sec, Sec::Secure, "SecureFault taken");
+    assert_eq!(cpu.ppb_read32(SFSR) & AUVIOL, AUVIOL);
+    assert_eq!(cpu.ppb_read32(SFAR), 0x2000_0010);
+
+    // Fetches: Secure code at 0x1000_0100 runs (with ALLNS the default IDAU keeps it NSC);
+    // once an IDAU makes everything Non-secure, the next fetch is an INVTRAN SecureFault.
+    let (mut cpu, mut bus) = tz();
+    bus.code(0x1000_0100, &[NOP, NOP, B_SELF]);
+    cpu.ppb_write32(SAU_CTRL, 0b10);
+    step(&mut cpu, &mut bus);
+    struct AllNs;
+    impl Idau for AllNs {
+        fn attr(&self, _addr: u32) -> Option<(Attr, Option<u8>)> {
+            Some((Attr::NonSecure, None))
+        }
+    }
+    cpu.set_idau(Box::new(AllNs));
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.ppb_read32(SFSR) & INVTRAN, INVTRAN);
+}
