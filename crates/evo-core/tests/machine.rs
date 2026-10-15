@@ -9,6 +9,7 @@ use armv8m::Sec;
 use evo_core::{EventKind, Key, Machine, StopReason, UartPort};
 use evo_hw::dev::gpio::Gpio;
 use evo_hw::dev::keypad::{Keypad, SCAN_CYCLES};
+use evo_hw::dev::sysctl::{CRU_WAKE_ON_KEY, Cru};
 use evo_hw::{DevCtx, Device, ResetKind, StateError, UnmappedKind};
 use evo_image::testutil::secure_image_bundle;
 use evo_image::{Bundle, ImageError, Layout};
@@ -1280,4 +1281,63 @@ fn poked_code_runs_new_instructions() {
     let at = m.cpu.regs.r[0];
     run_to(&mut m, CODE + 2);
     assert_eq!(m.cpu.regs.r[0], at + 2);
+}
+
+/// Reset handler: arms deep sleep as OS 7.1's Power partition does (SPCTRL +0xD4 = 0x10), then
+/// `wfi ; adds r0, #1 ; b wfi`. Nothing is enabled in the NVIC, so only a forced wake ends the
+/// WFI.
+fn deep_sleeper() -> Payload {
+    let mut p = Payload::new();
+    p.vector(1, CODE).code(
+        CODE,
+        &[
+            0x4902,    // ldr r1, [pc, #8]  ; =0x5020_10D4
+            0x2210,    // movs r2, #0x10
+            0x600A,    // str r2, [r1]
+            WFI,       // wfi
+            ADDS_R0_1, // adds r0, #1
+            0xE7FC,    // b wfi
+            0x10D4,    // .word 0x5020_10D4
+            0x5020,
+        ],
+    );
+    p
+}
+
+fn wake_status(m: &Machine) -> u32 {
+    m.bus.device::<Cru>("cru").expect("cru").reg(0x08)
+}
+
+/// The OS switched the unit off (auto power down or 2nd+ON): pressing ON wakes it, with the
+/// ON bit in CRU WAKE_STATUS, so the OS resumes after its deep-sleep WFI.
+#[test]
+fn on_key_wakes_the_unit_from_deep_sleep() {
+    let mut m = deep_sleeper().boot();
+    assert_eq!(m.run(10_000), StopReason::Idle);
+    assert!(m.asleep());
+    let r0 = m.cpu.regs.r[0];
+    // Another key does not wake a unit that is off.
+    m.set_key(Key::Matrix { row: 6, col: 0 }, true);
+    m.set_key(Key::Matrix { row: 6, col: 0 }, false);
+    assert!(m.asleep());
+    assert_eq!(wake_status(&m), 0);
+    m.set_key(Key::On, true);
+    assert!(!m.asleep(), "ON ends the deep sleep");
+    assert_eq!(wake_status(&m), CRU_WAKE_ON_KEY);
+    m.run(10_000);
+    assert!(m.asleep(), "the next WFI sleeps again");
+    assert_eq!(m.cpu.regs.r[0], r0 + 1, "the guest ran on after its WFI");
+    // Releasing ON is not a second wake.
+    m.set_key(Key::On, false);
+    assert!(m.asleep());
+}
+
+/// ON while deep sleep is not armed is an ordinary key: it raises IRQ 0 and nothing else.
+#[test]
+fn on_key_does_not_force_a_wake_from_ordinary_sleep() {
+    let mut m = sleeper().boot();
+    assert_eq!(m.run(1_000), StopReason::Idle);
+    m.set_key(Key::On, true);
+    assert!(m.asleep(), "IRQ 0 is masked: the WFI stays asleep");
+    assert_eq!(wake_status(&m), 0);
 }

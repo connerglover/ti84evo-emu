@@ -32,6 +32,11 @@ const SPCTRL_INTSTAT: u32 = 0x20;
 const SPCTRL_INTCLR: u32 = 0x24;
 /// Lifecycle/provisioning status: read-only 0 (the unprovisioned branch of every consumer).
 const SPCTRL_LCS: u32 = 0xC0;
+/// Deep-sleep control (`docs/hardware/security.md` §2): W `0x10` before the deep-sleep WFI,
+/// W `0x100` after the wake.
+const SPCTRL_DEEP_SLEEP: u32 = 0xD4;
+/// +0xD4 bit 4: deep sleep armed.
+const DEEP_SLEEP_ARMED: u32 = 0x10;
 
 /// Secure Privilege Control at `0x5020_1000`: PPC attribute words and control bits as plain
 /// storage, +0x20 read-only, +0x24 W1C on +0x20, +0xC0 read-only 0.
@@ -60,6 +65,12 @@ impl Spctrl {
             SPCTRL_INTCLR | SPCTRL_LCS => 0,
             _ => self.regs.word(off),
         }
+    }
+
+    /// True while the guest has armed deep sleep: +0xD4 bit 4, which the TF-M Power partition
+    /// sets before its deep-sleep WFI and clears after the wake.
+    pub fn deep_sleep_armed(&self) -> bool {
+        self.regs.word(SPCTRL_DEEP_SLEEP) & DEEP_SLEEP_ARMED != 0
     }
 }
 
@@ -122,7 +133,13 @@ pub const CRU_UID_LO: u32 = 0x4556_4F31;
 /// 0xA0, which is 1 in OS 7.1 (`docs/hardware/security.md`).
 pub const CRU_CHIPINFO: u32 = 1 << 25;
 
+/// +0x08 WAKE_STATUS bit the ON key sets when it wakes the unit from deep sleep. Which bit
+/// is the ON key is inferred: OS 7.1 resumes from deep sleep with any of bits 0, 1, 3 or 6
+/// set (`docs/hardware/security.md` §3, "Wake from deep sleep"), and bit 0 is reason 0.
+pub const CRU_WAKE_ON_KEY: u32 = 1 << 0;
+
 const CRU_CLKSEL: u32 = 0x04;
+const CRU_WAKE_STATUS: u32 = 0x08;
 const CRU_UID: u32 = 0x0C;
 const CRU_INFO: u32 = 0x10;
 const CRU_PLLCTRL: u32 = 0x1C;
@@ -168,6 +185,13 @@ impl Cru {
             }
             _ => self.regs.word(off),
         }
+    }
+
+    /// A wake source fired: ORs `bits` into +0x08 WAKE_STATUS (the firmware clears it by
+    /// writing 0).
+    pub fn set_wake(&mut self, bits: u32) {
+        let v = self.regs.word(CRU_WAKE_STATUS) | bits;
+        self.regs.set(CRU_WAKE_STATUS, 4, v);
     }
 }
 

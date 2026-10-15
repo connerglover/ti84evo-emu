@@ -5,6 +5,7 @@
 use evo_hw::dev::gpio::Gpio;
 use evo_hw::dev::keypad::{Key, Keypad};
 use evo_hw::dev::lcdc::{Frame, Lcdc};
+use evo_hw::dev::sysctl::{CRU_WAKE_ON_KEY, Cru, Spctrl};
 use evo_hw::dev::uart::Uart16550;
 use evo_hw::dev::usb::UsbTypeC;
 
@@ -67,8 +68,22 @@ impl Machine {
     /// register, sets the key-down status and schedules a scan (IRQ 13 when the guest unmasked
     /// it); the ON key pulses IRQ 0 on press. Held keys survive a System reset. A matrix
     /// position outside 0..8 is logged and ignored.
+    ///
+    /// Pressing ON while the guest has armed deep sleep (SPCTRL +0xD4 bit 4: the OS switched
+    /// the unit off, e.g. by auto power down) is the wake-up source as well: it sets the CRU
+    /// WAKE_STATUS ON bit and ends the CPU's sleep, so the OS resumes where it stopped
+    /// (`docs/hardware/security.md` §3, "Wake from deep sleep").
     pub fn set_key(&mut self, key: Key, pressed: bool) {
         self.with_dev("keypad", |k: &mut Keypad, ctx| k.set_key(key, pressed, ctx));
+        let off = || {
+            self.bus
+                .device::<Spctrl>("spctrl")
+                .is_some_and(Spctrl::deep_sleep_armed)
+        };
+        if key == Key::On && pressed && off() {
+            self.with_dev("cru", |c: &mut Cru, _| c.set_wake(CRU_WAKE_ON_KEY));
+            self.wake();
+        }
     }
 
     /// True once after the guest released the power hold (GPIO pin 1, an output, went from

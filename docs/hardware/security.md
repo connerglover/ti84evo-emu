@@ -504,6 +504,18 @@ So a wake event (keypad, OnKey, RTC, ...) has to be visible as an NVIC interrupt
 WFI), and the PLL has to report lock afterwards. +0x08 can stay 0 unless a model wants to
 model "pending wake skips the sleep".
 
+#### Wake from deep sleep
+
+Observed 2026-10-15 on the 7.1 bundle (emulator, release build): after about 180 s of guest
+idle time in the calculator app, OS 7.1 powers the unit down by itself (auto power down). The
+LCD goes off and the CPU sleeps in the WFI of the sequence above (PC 0x100d83f0) with no
+NVIC interrupt enabled that could end it, so the ON key's IRQ 0 does not wake it. The
+emulator therefore treats ON as the wake source while SPCTRL `+0xD4` bit 4 is set (step 3
+set it, step 6 clears it): a press sets WAKE_STATUS (`+0x08`) bit 0 and ends the WFI. The OS
+then resumes and turns the LCD back on; three power-down/ON cycles in a row worked, and the
+keypad worked after each. **Inferred:** which `+0x08` bit is the ON key (bit 0 is decoded as
+reason 0), and that real hardware wakes on ON this way.
+
 ### Minimal CRU model
 
 - Storage-backed 32-bit registers over 0x000..0xFFF, with these exceptions:
