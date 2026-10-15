@@ -124,7 +124,8 @@ fn sha_abc() {
     w[0] = 0x6162_6380;
     w[15] = 0x18;
     write_block(&mut h, &mut s, &w);
-    h.write(&mut s, SHA_CTRL, 4, 0x0E);
+    // 0x0A: start a message (the firmware's first block; bit 2 clear loads the IV).
+    h.write(&mut s, SHA_CTRL, 4, 0x0A);
     let want = [
         0xba7816bf, 0x8f01cfea, 0x414140de, 0x5dae2223, 0xb00361a3, 0x96177a9c, 0xb410ff61,
         0xf20015ad,
@@ -150,10 +151,12 @@ fn sha_two_blocks() {
 
     let mut h = DevHarness::new();
     let mut s = Sha256Engine::new();
+    // The firmware (0x100b367c) writes 0x0A for a message's first block and 0x0E (bit 2:
+    // continue from the running hash) for every later one.
     write_block(&mut h, &mut s, &words[..16]);
-    h.write(&mut s, SHA_CTRL, 4, 0x0E);
-    write_block(&mut h, &mut s, &words[16..]);
     h.write(&mut s, SHA_CTRL, 4, 0x0A);
+    write_block(&mut h, &mut s, &words[16..]);
+    h.write(&mut s, SHA_CTRL, 4, 0x0E);
     assert_eq!(
         digest(&mut h, &mut s),
         [
@@ -161,6 +164,24 @@ fn sha_two_blocks() {
             0x19db06c1
         ]
     );
+}
+
+#[test]
+fn sha_first_block_ignores_the_previous_message() {
+    // Two messages back to back: the second's first block (0x0A) must start from the IV, not
+    // from the first message's digest.
+    let mut h = DevHarness::new();
+    let mut s = Sha256Engine::new();
+    let mut w = [0u32; 16];
+    w[0] = 0x6162_6380;
+    w[15] = 0x18;
+    write_block(&mut h, &mut s, &w);
+    h.write(&mut s, SHA_CTRL, 4, 0x0A);
+    let first = digest(&mut h, &mut s);
+    write_block(&mut h, &mut s, &w);
+    h.write(&mut s, SHA_CTRL, 4, 0x0A);
+    assert_eq!(digest(&mut h, &mut s), first);
+    assert_eq!(first[0], 0xba7816bf);
 }
 
 #[test]

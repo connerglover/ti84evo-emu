@@ -153,8 +153,10 @@ const SHA_H_LAST: u32 = 0x7C;
 
 /// CTRL bit 1: start one block.
 const CTRL_START: u32 = 1 << 1;
-/// CTRL bit 2: load the SHA-256 initial hash value before the block.
-const CTRL_LOAD_IV: u32 = 1 << 2;
+/// CTRL bit 2: continue from the running hash. Clear, the block starts a new message from the
+/// SHA-256 initial hash value. The firmware writes 0x0A for a message's first block and 0x0E
+/// for every later one (0x100b367c; `docs/hardware/crypto.md`).
+const CTRL_CONTINUE: u32 = 1 << 2;
 /// CTRL bit 11: BUSY. The model hashes synchronously, so it always reads 0.
 const CTRL_BUSY: u32 = 1 << 11;
 
@@ -172,7 +174,7 @@ const SHA256_IV: [u32; 8] = [
 
 /// SHA-256 block engine. W[0..15] (+0x10..+0x4C, read/write) hold the message words as
 /// standard big-endian SHA words; H[0..7] (+0x60..+0x7C, read-only) the running hash. A CTRL
-/// write with bit 1 set loads the IV into H if bit 2 is set, then compresses W into H at once.
+/// write with bit 1 set loads the IV into H if bit 2 is clear, then compresses W into H at once.
 /// CTRL reads back what was written with BUSY (bit 11) clear. Every reset clears everything.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Sha256Engine {
@@ -228,7 +230,7 @@ impl Device for Sha256Engine {
             SHA_CTRL => {
                 self.ctrl = v;
                 if v & CTRL_START != 0 {
-                    if v & CTRL_LOAD_IV != 0 {
+                    if v & CTRL_CONTINUE == 0 {
                         self.h = SHA256_IV;
                     }
                     self.process();

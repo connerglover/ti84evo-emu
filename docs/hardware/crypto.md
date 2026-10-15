@@ -92,9 +92,9 @@ Block process (excerpt):
 100b35f8: ldr  r0, [r1, #0]
 100b35fc: rev  r0, r0            ; message word, big-endian
 100b35fe: str  r0, [r2, #16]     ; +0x10 = W0 ... +0x4C = W15
-100b367c: movs r0, #10           ; 0x0A: start, continue
-100b3680: cmp.w lr, #0           ; ctx->first?
-100b3686: moveq r0, #14          ; 0x0E: start + load IV (first block)
+100b367c: movs r0, #10           ; 0x0A: start a new message (first block)
+100b3680: cmp.w lr, #0           ; ctx->first (read, then cleared at 0x100b35f0)
+100b3686: moveq r0, #14          ; first == 0: 0x0E, continue from the running hash
 100b3688: str  r0, [r1, #0]      ; CTRL
 ```
 
@@ -102,21 +102,26 @@ Registers:
 
 | off | name | access | semantics |
 |---|---|---|---|
-| 0x00 | CTRL/STATUS | W, R polled | W 0x0E = first block (bit 2 = load the SHA-256 IV, bit 1 = start, bit 3 = SHA-256 mode?). W 0x0A = next block. R bit 11 = BUSY (wait until 0) |
+| 0x00 | CTRL/STATUS | W, R polled | W 0x0A = first block of a message (bit 1 = start, bit 3 = SHA-256 mode?; bit 2 clear: start from the SHA-256 IV). W 0x0E = every later block (bit 2 = continue from the running hash). R bit 11 = BUSY (wait until 0) |
 | 0x10–0x4C | DATA W[0..15] | W | 16 message words for this block, as standard big-endian SHA words (the firmware does `rev` on little-endian memory) |
 | 0x60–0x7C | DIGEST H[0..7] | R | running hash state after the block, standard words. The firmware reads each word 4 times and takes bytes 31:24, 23:16, 15:8, 7:0 into the output in order |
 
 ### SHA model
 
 - Keep W[16], H[8] and CTRL.
-- On a CTRL write with bit 1 set: if bit 2 is set, set H = the standard SHA-256 initial hash
-  value (FIPS 180-4). Then run one SHA-256 compression of W into H, synchronously. BUSY
+- On a CTRL write with bit 1 set: if bit 2 is clear, set H = the standard SHA-256 initial
+  hash value (FIPS 180-4). Then run one SHA-256 compression of W into H, synchronously. BUSY
   (bit 11) reads 0, so the 100 ms wait passes at once.
 - Reads of +0x00 return the stored CTRL with bit 11 = 0.
 - Reset: everything 0. No IRQ.
 - About 40 blocks per secure boot; the NS side uses it through the crypto service.
 - Correctness matters: with zero digests the boot still proceeds, but every hash, HMAC/HKDF
   and any signature check (the BSP's "Validating OS...") would be wrong.
+- **Correction (Task 24).** The research text read the `moveq` above the wrong way round
+  (bit 2 set = load the IV). With that model every multi-block digest was wrong: the secure
+  OS service (0x4000_0107) hashed image 1 (42,212 blocks, about 35 M cycles), the result did
+  not match the image's SHA-256 TLV, and the BSP refused to launch the OS. Single-block
+  digests were wrong too (they started from the previous message's hash).
 
 ## Open questions
 
