@@ -1,16 +1,17 @@
 //! Keypad scanner at `0x4010_3000` (IRQ 13) and the ON key (IRQ 0) (`docs/hardware/keypad.md`).
 //!
-//! Registers: MODE +0x00 and SIZE +0x04 are plain storage, STATUS +0x08 (bit 1 key-down, bit 0
-//! scan done; write 1 to clear), MASK +0x0C (the same two bits), and the 8 row registers at
-//! +0x10 + 2·r, one halfword per row with bit `c` set while the key at (row r, column c) is
+//! Registers: MODE +0x00 and SIZE +0x04 are plain storage, STATUS +0x08 (bit 1 key change,
+//! bit 0 scan done; write 1 to clear), MASK +0x0C (the same two bits), and the 8 row registers
+//! at +0x10 + 2·r, one halfword per row with bit `c` set while the key at (row r, column c) is
 //! held. MODE, SIZE, STATUS and MASK take aligned 32-bit accesses only; the rows read at any
 //! aligned width (a word read returns rows r and r + 1) and are read-only. Every other access
 //! reads 0, ignores writes and is reported as unhandled.
 //!
-//! A press sets the row bit and STATUS bit 1 and schedules a scan [`SCAN_CYCLES`] later; a
-//! release also schedules a scan. A scan sets STATUS bit 0 and, while any key is held,
-//! schedules the next one: the scanner keeps scanning while keys are down, as the BSP needs
-//! six stable scans before it decodes the rows. IRQ 13 (level) = `STATUS & MASK != 0`.
+//! A press or a release changes the row bit, sets STATUS bit 1 and schedules a scan
+//! [`SCAN_CYCLES`] later. A scan sets STATUS bit 0 and schedules the next one while any key is
+//! held or the guest unmasks scan-done (MASK bit 0; unmasking it starts the scanner): the BSP
+//! decodes the rows on the sixth scan-done after a key change, so a release, too, needs six
+//! scans before the BSP sees the key go up. IRQ 13 (level) = `STATUS & MASK != 0`.
 //!
 //! The ON key is not in the matrix: a press pulses IRQ 0 (its handler reads no register), a
 //! release does nothing.
@@ -125,8 +126,9 @@ const ROW_END: u32 = ROW0 + 2 * ROWS as u32;
 
 /// STATUS / MASK bits.
 const SCAN_DONE: u32 = 1 << 0;
-const KEY_DOWN: u32 = 1 << 1;
-const INT_BITS: u32 = SCAN_DONE | KEY_DOWN;
+/// Bit 1: a key went down or up since the guest last cleared it.
+const KEY_CHANGE: u32 = 1 << 1;
+const INT_BITS: u32 = SCAN_DONE | KEY_CHANGE;
 
 /// The keypad scanner.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -169,10 +171,10 @@ impl Keypad {
         }
         if pressed {
             self.rows[row] |= bit;
-            self.status |= KEY_DOWN;
         } else {
             self.rows[row] &= !bit;
         }
+        self.status |= KEY_CHANGE;
         ctx.schedule_at(ctx.now.saturating_add(SCAN_CYCLES));
         self.update_irq(ctx);
     }
@@ -248,16 +250,23 @@ impl Device for Keypad {
             MODE => self.mode = v,
             SIZE => self.size = v,
             STATUS => self.status &= !v,
-            MASK => self.mask = v & INT_BITS,
+            MASK => {
+                let unmasked = v & !self.mask & SCAN_DONE != 0;
+                self.mask = v & INT_BITS;
+                // While keys are held the scanner already runs.
+                if unmasked && !self.any_held() {
+                    ctx.schedule_at(ctx.now.saturating_add(SCAN_CYCLES));
+                }
+            }
             _ => {}
         }
         self.update_irq(ctx);
     }
 
-    /// A scan: STATUS bit 0, and the next scan while keys are held.
+    /// A scan: STATUS bit 0, and the next scan while keys are held or scan-done is unmasked.
     fn event(&mut self, ctx: &mut DevCtx<'_>) {
         self.status |= SCAN_DONE;
-        if self.any_held() {
+        if self.any_held() || self.mask & SCAN_DONE != 0 {
             ctx.schedule_at(ctx.now.saturating_add(SCAN_CYCLES));
         }
         self.update_irq(ctx);
@@ -273,7 +282,7 @@ impl Device for Keypad {
             ..Keypad::new()
         };
         if self.any_held() {
-            self.status = KEY_DOWN;
+            self.status = KEY_CHANGE;
             ctx.schedule_at(ctx.now.saturating_add(SCAN_CYCLES));
         } else {
             ctx.cancel_event();

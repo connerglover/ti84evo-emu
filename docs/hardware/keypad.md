@@ -31,11 +31,12 @@ first device access after the hand-off:
 Keypad IRQ 13 handler (0x0010_e05c):
 1. It writes NVIC ICPR and ICER bit 13.
 2. `s = +0x08; +0x08 = s` (write-back: W1C).
-3. If `s & 2` (key down): clear the scan counter byte 0x2001_3298 and `+0x0C |= 1`.
-4. If `s & 1` (scan done): counter++; on the **6th** scan-done it reads the halfword rows
+3. If `s & 2` (key change): clear the scan counter byte 0x2001_3298 and `+0x0C |= 1`.
+4. If `s & 1` (scan done): counter++; on the **6th** scan-done it clears the counter and
+   `+0x0C` bit 0 (one decode per key change), reads the halfword rows
    `+0x1E, +0x1C, …, +0x10` (rows 7..0) and turns each set bit into a code
    **code = (7 − row)·8 + bit + 1** (the TI-84 Plus CE GetCSC `sk_*` numbering). Up to 3 codes
-   are kept, ascending; more than 3 keys down gives n = 0. Then `cb_keys(codes, n)` (0x0010_e1da).
+   are kept, ascending; no key or more than 3 keys down gives n = 0. Then `cb_keys(codes, n)` (0x0010_e1da).
 5. `cb_keys` (0x0015_f07c): n = 1 → getkey queue (event type 1); n = 2 or 3 → the boot-combo
    matcher 0x0015_2d18; n = 0 → release.
 
@@ -50,7 +51,7 @@ The layout of the TI-84 Plus CE keypad controller (0xF50000 on that calculator):
 |---|---|---|
 | +0x00 | MODE | storage (BSP: 0x5B68_0C33; mode [1:0] = 3, continuous scan) |
 | +0x04 | SIZE | storage (BSP: 0x0808, 8 rows × 8 columns) |
-| +0x08 | STATUS | bit 1 = key down, bit 0 = scan done; write 1 to clear |
+| +0x08 | STATUS | bit 1 = key change (a press or a release), bit 0 = scan done; write 1 to clear |
 | +0x0C | MASK | the same two bits; other bits read 0 |
 | +0x10 + 2·r | ROW r (r = 0..7) | read-only halfword: bit c set while key (r, c) is held |
 
@@ -60,13 +61,17 @@ as unhandled.
 
 ## Model
 
-- **Press** (matrix key): set the row bit, set STATUS bit 1, schedule a scan `SCAN_CYCLES`
-  (156 000 cycles = 1 ms) later. **Release**: clear the row bit, schedule a scan. Pressing a
-  held key or releasing a free one changes nothing; positions outside 0..8 log a warning.
-- **Scan** (the scheduled event): set STATUS bit 0; while any key is held, schedule the next
-  scan 1 ms later. The scanner keeps scanning while keys are down because the BSP decodes the
-  rows only on the 6th scan-done after a key-down; the boot-combo wait (`get_combo`,
-  0x0010_d528) gives up after 50 ms.
+- **Press / release** (matrix key): set / clear the row bit, set STATUS bit 1, schedule a scan
+  `SCAN_CYCLES` (156 000 cycles = 1 ms) later. Pressing a held key or releasing a free one
+  changes nothing; positions outside 0..8 log a warning. A release must be a key change: the
+  BSP learns that a key went up only from the n = 0 decode after it. (Until fix wave Task 1 a
+  release set no bit, so the BSP never saw a key go up and the OS dropped the second of two
+  taps of the same key, e.g. `7 7` typed one 7.)
+- **Scan** (the scheduled event): set STATUS bit 0; while any key is held or MASK bit 0 is set,
+  schedule the next scan 1 ms later; setting MASK bit 0 with no key held starts the scanner.
+  The BSP decodes the rows only on the 6th scan-done after a key change and masks scan-done
+  again after it, so scanning stops 1 ms after the decode of a release. The boot-combo wait
+  (`get_combo`, 0x0010_d528) gives up after 50 ms.
 - **IRQ 13** (level) = `STATUS & MASK != 0`.
 - **ON key**: pulse IRQ 0 on press (the only edge source), nothing on release. It is not in
   the matrix (see open question 1).

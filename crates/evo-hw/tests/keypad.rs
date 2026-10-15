@@ -79,8 +79,70 @@ fn scans_repeat_while_held_and_stop_after_release() {
     set_key(&mut h, &mut k, m(6, 0), false);
     assert_eq!(h.event, Some(Some(h.now + SCAN_CYCLES)), "release scans");
     assert!(h.fire(&mut k));
-    assert_eq!(h.event, None, "no further scans with no key held");
+    assert_eq!(
+        h.event, None,
+        "no further scans with no key held and scan-done masked"
+    );
     assert!(!h.fire(&mut k));
+}
+
+/// The BSP decodes the rows only after a key change (STATUS bit 1) and then six scan-dones; a
+/// release must be a key change too, or the BSP never sees the rows go empty and takes the
+/// next press of the same key for the key still being held.
+#[test]
+fn release_is_a_key_change() {
+    let mut h = DevHarness::new();
+    let mut k = Keypad::new();
+    h.write(&mut k, MASK, 4, 2);
+    set_key(&mut h, &mut k, m(4, 1), true);
+    h.write(&mut k, STATUS, 4, 3);
+    assert_eq!(h.irq, 0);
+    set_key(&mut h, &mut k, m(4, 1), false);
+    assert_eq!(h.read(&mut k, STATUS, 4) & 2, 2, "key change on release");
+    assert_eq!(h.irq, IRQ_BIT);
+    assert_eq!(h.read(&mut k, ROWS + 8, 2), 0);
+}
+
+/// While the guest unmasks scan-done (the BSP does from a key change until it has decoded the
+/// rows), the scanner keeps scanning even with no key held, as it does in continuous mode.
+#[test]
+fn scans_continue_while_scan_done_is_unmasked() {
+    let mut h = DevHarness::new();
+    let mut k = Keypad::new();
+    h.write(&mut k, MASK, 4, 2);
+    set_key(&mut h, &mut k, m(4, 1), true);
+    set_key(&mut h, &mut k, m(4, 1), false);
+    // The BSP's handler: acknowledge, unmask scan-done; then six scans.
+    h.write(&mut k, STATUS, 4, 2);
+    h.write(&mut k, MASK, 4, 3);
+    for n in 1..=6 {
+        assert!(h.fire(&mut k), "scan {n}");
+        assert_eq!(h.read(&mut k, STATUS, 4), 1);
+        assert_eq!(h.irq, IRQ_BIT);
+        h.write(&mut k, STATUS, 4, 1);
+        assert_eq!(
+            h.event,
+            Some(Some(h.now + SCAN_CYCLES)),
+            "scan {n} schedules"
+        );
+    }
+    // Decoded: the BSP masks scan-done again; the pending scan is the last one.
+    h.write(&mut k, MASK, 4, 2);
+    assert!(h.fire(&mut k));
+    assert_eq!(h.event, None);
+    assert_eq!(h.irq, 0, "scan-done is masked");
+}
+
+/// Unmasking scan-done with nothing pending starts the scanner.
+#[test]
+fn unmasking_scan_done_starts_scanning() {
+    let mut h = DevHarness::new();
+    let mut k = Keypad::new();
+    h.now = 5_000;
+    h.write(&mut k, MASK, 4, 1);
+    assert_eq!(h.event, Some(Some(5_000 + SCAN_CYCLES)));
+    assert!(h.fire(&mut k));
+    assert_eq!(h.irq, IRQ_BIT);
 }
 
 #[test]
