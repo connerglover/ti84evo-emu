@@ -1,8 +1,9 @@
 # Keypad scanner at 0x4010_3000 (IRQ 13) and the ON key (IRQ 0)
 
-Status: modelled (`crates/evo-hw/src/dev/keypad.rs`). The key map and boot combos below come
-from two independent static RE passes of the bundle 7.1.0.4421 BSP (image 0), reconciled; the
-Self-Test and Engineering combos are confirmed in emulation (`m2_*_boot_combo` milestone tests).
+Status: modelled (`crates/evo-hw/src/dev/keypad.rs`). The boot combos below come from two
+independent static RE passes of the bundle 7.1.0.4421 BSP (image 0), reconciled; the Self-Test
+and Engineering combos are confirmed in emulation (`m2_*_boot_combo` milestone tests). The key
+map is checked key by key on the OS (`all_keys_type_expected_text`, "Key map").
 All addresses are NS.
 
 ## Identity
@@ -33,10 +34,11 @@ Keypad IRQ 13 handler (0x0010_e05c):
 2. `s = +0x08; +0x08 = s` (write-back: W1C).
 3. If `s & 2` (key change): clear the scan counter byte 0x2001_3298 and `+0x0C |= 1`.
 4. If `s & 1` (scan done): counter++; on the **6th** scan-done it clears the counter and
-   `+0x0C` bit 0 (one decode per key change), reads the halfword rows
-   `+0x1E, +0x1C, …, +0x10` (rows 7..0) and turns each set bit into a code
-   **code = (7 − row)·8 + bit + 1** (the TI-84 Plus CE GetCSC `sk_*` numbering). Up to 3 codes
-   are kept, ascending; no key or more than 3 keys down gives n = 0. Then `cb_keys(codes, n)` (0x0010_e1da).
+   `+0x0C` bit 0 (one decode per key change), reads the halfword rows `+0x1E, +0x1C, …, +0x10`
+   (rows 7..0) and turns each set bit into a code **code = (7 − row)·8 + bit + 1** (the TI-84
+   Plus CE GetCSC numbering, though not every Evo key sits at its CE code: "Key map"). Up to 3
+   codes are kept, ascending; no key or more than 3 keys down gives n = 0. Then
+   `cb_keys(codes, n)` (0x0010_e1da).
 5. `cb_keys` (0x0015_f07c): n = 1 → getkey queue (event type 1); n = 2 or 3 → the boot-combo
    matcher 0x0015_2d18; n = 0 → release.
 
@@ -90,20 +92,53 @@ ignored); `r<R>c<C>` is accepted too.
 | row \ col | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
 |---|---|---|---|---|---|---|---|---|
 | 7 | `down` | `left` | `right` | `up` | | | | |
-| 6 | `enter` | `add` (+) | `sub` (−) | `mul` (×) | `div` (÷) | `power` (^) | `clear` | |
+| 6 | `enter` | `toggle` | `add` (+) | `sub` (−) | `mul` (×) | `div` (÷) | `clear` | |
 | 5 | `chs` ((−)) | `3` | `6` | `9` | `rparen` | `tan` | `vars` | |
 | 4 | `decpnt` (.) | `2` | `5` | `8` | `lparen` | `cos` | `prgm` | `stat` |
-| 3 | `0` | `1` | `4` | `7` | `comma` | `sin` | `apps` | `xton` (X,T,θ,n) |
-| 2 | | `sto` | `ln` | `log` | `square` (x²) | `recip` (x⁻¹) | `math` | `alpha` |
+| 3 | `0` | `1` | `4` | `7` | `comma` | `sin` | `frac` (n/d) | `xton` (X,T,θ,n) |
+| 2 | | `sto` | `ln` | `log` | `square` (x²) | `power` (^) | `math` | `alpha` |
 | 1 | `graph` | `trace` | `zoom` | `window` | `yequ` (Y=) | `2nd` | `mode` | `del` |
 | 0 | (ON, inferred) | | | | | | | |
 
 `on` is the ON key (IRQ 0), not row 0 column 0.
 
-Evidence: the Self-Test Key Test grid (cells drawn by 0x0015_6244 reproduce the physical
-layout), the CE GetCSC numbering, the digit table at 0x0017_85C2, getkey's "code == 9" ENTER
-test, the USB HID table at 0x0018_421C (arrows, ENTER, DEL) and the combo table below. The
-Key Test passes with 49 keys: every key above except ON.
+This is the TI-84 Evo keypad, which is not the TI-84 Plus CE's. TOGGLE (answer ↔ fraction,
+2nd MEM, alpha ") takes the CE's + position (code 0x0A) and pushes + − × ÷ one column on, so
+÷ sits where the CE has ^ (0x0E); ^ (2nd ˣ√, alpha D) sits where the CE has x⁻¹ (0x2E), and
+the fraction key (2nd ANGLE, alpha B) where it has APPS (0x27). The Evo has no x⁻¹ or APPS
+key. Before fix wave Task 1 the table followed the CE, and `2 add 3` typed `23` on the OS.
+
+Evidence: every key checked on the OS (below); TI's online TI-84 Evo emulator, whose keypad
+gives each key's id (label, 2nd and alpha function) and BSP scan code, matching this table
+for all 49 matrix keys; the USB HID table at 0x0018_421C (KP+ KP− KP* KP/ on 0x0B..0x0E,
+arrows, ENTER, DEL); the digit table at 0x0017_85C2; getkey's "code == 9" ENTER test; and
+the combo table below. The Self-Test Key Test grid (cells drawn by 0x0015_6244) passes with
+49 keys, every key above except ON; its cell positions do not name the keys, and reading the
+CE labels into them was what put + − × ÷ ^ one column off.
+
+### Verification on the OS
+
+The `all_keys_type_expected_text` milestone test (`crates/evo-core/tests/milestones.rs`,
+needs `EVO_OS_IMAGE`, release) boots OS 7.1.0.4421 to the Calculator app and checks all 50
+keys there, each by what it does:
+
+- It reads the edit line from RAM: the calculator keeps the line before the cursor as 16-bit
+  tokens in a gap buffer, located through a {start, cursor} word pair that points at it (the
+  test types 9 8 last and finds the pair whose cursor is just past them). Tokens: digit d =
+  0xE401 + d, letters A..Z = 0xE800.., θ 0xE81A, + − × ÷ ^ = 0xE428..0xE42C, sin( cos( tan(
+  0xE43F/41/43 with their inverses one above, and so on (the test's `tok` module).
+- In MathPrint, x² and ^ open templates, so the test first switches to CLASSIC (MODE, three
+  UPs, RIGHT, ENTER, 2nd MODE); MathPrint's templated x² against CLASSIC's flat ² checks MODE.
+- Typing keys type their token (29 sequences), 2nd gives each key's second function, and
+  ALPHA gives the letters as the keypad labels them (A on MATH … Z on 2, θ, space, :, ?, ").
+- DEL, LEFT, RIGHT, UP, CLEAR, ENTER (with 2nd ENTRY) and ON (to the launcher and back) are
+  checked by the line they leave; MATH, VARS, STAT, PRGM (2nd DRAW), Y= (alpha F1), WINDOW
+  (F2), TRACE (F4), DOWN and UP by the token a menu item types; GRAPH, ZOOM (item 4 shows
+  the graph, item 6 changes WINDOW), TOGGLE (0.25 ↔ 1/4 and back) and the screen keys by
+  comparing screens.
+
+Swapping two keys in `KEY_NAMES` (e.g. `add`/`sub`, `zoom`/`window`, `graph`/`trace`) fails
+the test with the keys named.
 
 ## Boot key combos
 
@@ -113,13 +148,13 @@ compares the sorted held codes and stores the slot index in **0x2001_0DB8** (10 
 | idx | keys held | effect (cold boot unless noted) |
 |---|---|---|
 | 0 | `alpha` + `ln` + `enter` (alpha S) | **Self-Test menu** (ITS UID ..0004 := 1) |
-| 1 | `alpha` + `recip` + `enter` (alpha D) | wake path only: log event + message 0x0105 |
+| 1 | `alpha` + `power` + `enter` (alpha D) | wake path only: log event + message 0x0105 |
 | 2 | `left` + `right` | hotkey message {0x0A, 1} |
 | 3 | `2` + `8` | hotkey {0x0A, 3} |
 | 4 | `3` + `9` | hotkey {0x0A, 4} |
 | 5 | `enter` + `clear` | hotkey {0x0A, 5} |
-| 6 | `enter` + `sub` | hotkey {0x0A, 6} |
-| 7 | `enter` + `div` | hotkey {0x0A, 0} |
+| 6 | `enter` + `add` | hotkey {0x0A, 6} |
+| 7 | `enter` + `mul` | hotkey {0x0A, 0} |
 | 8 | `2nd` + `del` | boot state 2 (purpose unverified; likely OS receive / maintenance) |
 | 9 | `alpha` + `sin` + `enter` (alpha E) | **Engineering menu** (ITS UID ..0004 := 2) |
 
@@ -137,12 +172,13 @@ BSP also starts the diagnostic app without any combo.
 
 ## Open questions
 
-1. Is ON also wired into the matrix at row 0, column 0 (code 0x39)? Only the Key Test grid
-   and a HID Esc entry suggest it; no code path needs it. The model keeps ON on IRQ 0 only;
-   `r0c0` can be pressed separately.
-2. The USB HID table maps codes 0x0B..0x0E to KP+/KP−/KP*/KP/, one off from the CE layout
-   above (+ is 0x0A). Grid, combos and CE numbering agree with the table above; if it is wrong,
-   only `add`/`sub`/`mul`/`div`/`power` move.
+1. Is ON also wired into the matrix? The Key Test grid and a HID Esc entry suggest row 0,
+   column 0 (code 0x39); TI's online emulator gives ON scan code 0x10 (row 6, column 7). No
+   BSP code path needs either. On the OS, `r6c7` types nothing in the calculator and any
+   `r0c*` shows "ERROR: UNEXPECTED". The model keeps ON on IRQ 0 only (which on the OS goes
+   to the app launcher); `r0c0` and `r6c7` can be pressed separately.
+2. Resolved (fix wave Task 1): the USB HID table was right that + − × ÷ are codes
+   0x0B..0x0E; the Evo keypad is not the CE's ("Key map").
 3. The meaning of the MODE fields other than the mode, and the real scan period.
 4. Whether STATUS bit 0 needs MASK bit 0 (the model sets it regardless).
 5. What combo 8 (2ND + DEL) and secure service 0x4000_0108 do.

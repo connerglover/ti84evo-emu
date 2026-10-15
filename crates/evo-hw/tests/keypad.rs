@@ -251,26 +251,63 @@ fn system_reset_keeps_keys_and_relatches_key_down() {
 }
 
 #[test]
-fn key_names_follow_the_ce_layout() {
-    // code = (7 - row) * 8 + col + 1 (CE GetCSC numbering).
+fn key_names_follow_the_evo_layout() {
+    // code = (7 - row) * 8 + col + 1, the BSP's key code. The TI-84 Evo layout, not the CE's:
+    // TOGGLE at 0x0A pushes + - × ÷ one place on, ^ is where the CE has x⁻¹ and the fraction
+    // key where it has APPS (`docs/hardware/keypad.md` "Key map").
     let code = |k: Key| match k {
         Key::Matrix { row, col } => (7 - row) * 8 + col + 1,
         Key::On => 0,
     };
     for (name, code_want) in [
         ("down", 0x01),
+        ("left", 0x02),
+        ("right", 0x03),
         ("up", 0x04),
         ("enter", 0x09),
-        ("add", 0x0A),
+        ("toggle", 0x0A),
+        ("add", 0x0B),
+        ("sub", 0x0C),
+        ("mul", 0x0D),
+        ("div", 0x0E),
         ("clear", 0x0F),
+        ("chs", 0x11),
         ("3", 0x12),
+        ("6", 0x13),
+        ("9", 0x14),
+        ("rparen", 0x15),
+        ("tan", 0x16),
+        ("vars", 0x17),
+        ("decpnt", 0x19),
         ("2", 0x1A),
+        ("5", 0x1B),
+        ("8", 0x1C),
+        ("lparen", 0x1D),
+        ("cos", 0x1E),
+        ("prgm", 0x1F),
+        ("stat", 0x20),
         ("0", 0x21),
+        ("1", 0x22),
+        ("4", 0x23),
+        ("7", 0x24),
+        ("comma", 0x25),
         ("sin", 0x26),
+        ("frac", 0x27),
+        ("xton", 0x28),
+        ("sto", 0x2A),
         ("ln", 0x2B),
+        ("log", 0x2C),
+        ("square", 0x2D),
+        ("power", 0x2E),
+        ("math", 0x2F),
         ("alpha", 0x30),
         ("graph", 0x31),
+        ("trace", 0x32),
+        ("zoom", 0x33),
+        ("window", 0x34),
+        ("yequ", 0x35),
         ("2nd", 0x36),
+        ("mode", 0x37),
         ("del", 0x38),
     ] {
         let k = Key::from_name(name).unwrap_or_else(|| panic!("{name}"));
@@ -280,6 +317,13 @@ fn key_names_follow_the_ce_layout() {
     assert_eq!(Key::from_name("on"), Some(Key::On));
     assert_eq!(Key::from_name("ENTER"), Some(m(6, 0)), "case-insensitive");
     assert_eq!(Key::from_name("bogus"), None);
+    for ce_only in ["recip", "apps"] {
+        assert_eq!(
+            Key::from_name(ce_only),
+            None,
+            "the Evo has no {ce_only} key"
+        );
+    }
     assert_eq!(KEY_NAMES.len(), 50, "49 matrix keys and ON");
     let mut keys: Vec<Key> = KEY_NAMES.iter().map(|&(_, k)| k).collect();
     keys.sort_by_key(|k| format!("{k:?}"));

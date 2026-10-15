@@ -45,19 +45,22 @@ const fn mk(row: u8, col: u8) -> Key {
     Key::Matrix { row, col }
 }
 
-/// Every key by its TI-84 name (lower case; `docs/hardware/keypad.md` "Key map"): the TI-84
-/// Plus CE matrix, GetCSC code = (7 − row)·8 + col + 1.
+/// Every key by its name (lower case; `docs/hardware/keypad.md` "Key map"): the TI-84 Evo
+/// matrix, BSP key code = (7 − row)·8 + col + 1. It is the TI-84 Plus CE matrix except that
+/// TOGGLE takes the CE's + position and pushes + − × ÷ one column on (÷ where the CE has ^),
+/// ^ is where the CE has x⁻¹, and the fraction key where it has APPS; each key is checked on
+/// the real OS by the `all_keys_type_expected_text` milestone test.
 pub const KEY_NAMES: &[(&str, Key)] = &[
     ("down", mk(7, 0)),
     ("left", mk(7, 1)),
     ("right", mk(7, 2)),
     ("up", mk(7, 3)),
     ("enter", mk(6, 0)),
-    ("add", mk(6, 1)),
-    ("sub", mk(6, 2)),
-    ("mul", mk(6, 3)),
-    ("div", mk(6, 4)),
-    ("power", mk(6, 5)),
+    ("toggle", mk(6, 1)),
+    ("add", mk(6, 2)),
+    ("sub", mk(6, 3)),
+    ("mul", mk(6, 4)),
+    ("div", mk(6, 5)),
     ("clear", mk(6, 6)),
     ("chs", mk(5, 0)),
     ("3", mk(5, 1)),
@@ -80,13 +83,13 @@ pub const KEY_NAMES: &[(&str, Key)] = &[
     ("7", mk(3, 3)),
     ("comma", mk(3, 4)),
     ("sin", mk(3, 5)),
-    ("apps", mk(3, 6)),
+    ("frac", mk(3, 6)),
     ("xton", mk(3, 7)),
     ("sto", mk(2, 1)),
     ("ln", mk(2, 2)),
     ("log", mk(2, 3)),
     ("square", mk(2, 4)),
-    ("recip", mk(2, 5)),
+    ("power", mk(2, 5)),
     ("math", mk(2, 6)),
     ("alpha", mk(2, 7)),
     ("graph", mk(1, 0)),
