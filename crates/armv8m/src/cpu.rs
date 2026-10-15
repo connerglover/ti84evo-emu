@@ -95,8 +95,16 @@ struct ICacheEntry {
 
 /// Direct-mapped cache of decoded instructions, indexed by halfword address. Allocated on
 /// the first fill, so a CPU on a bus that caches nothing (`Bus::cache_code`) never pays for it.
-#[derive(Clone, Debug, Default)]
+/// A clone starts empty: the cache is not state, and copying it would cost a 128 KiB copy
+/// (e.g. on every save state) to save a few decodes.
+#[derive(Debug, Default)]
 struct ICache(Vec<ICacheEntry>);
+
+impl Clone for ICache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
 
 impl PartialEq for ICache {
     fn eq(&self, _other: &Self) -> bool {
@@ -676,5 +684,75 @@ impl Cpu {
             _ => {}
         }
         Exec::Done { cycles, sleep }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A flat RAM bus at address 0 that lets the core cache all of it.
+    struct Ram(Vec<u8>);
+
+    impl Bus for Ram {
+        fn read8(&mut self, addr: u32, _a: Access) -> Result<u8, crate::bus::BusError> {
+            Ok(self.0[addr as usize])
+        }
+        fn read16(&mut self, addr: u32, _a: Access) -> Result<u16, crate::bus::BusError> {
+            let a = addr as usize;
+            Ok(u16::from_le_bytes([self.0[a], self.0[a + 1]]))
+        }
+        fn read32(&mut self, addr: u32, _a: Access) -> Result<u32, crate::bus::BusError> {
+            let a = addr as usize;
+            Ok(u32::from_le_bytes(self.0[a..a + 4].try_into().unwrap()))
+        }
+        fn write8(&mut self, addr: u32, v: u8, _a: Access) -> Result<(), crate::bus::BusError> {
+            self.0[addr as usize] = v;
+            Ok(())
+        }
+        fn write16(&mut self, addr: u32, v: u16, _a: Access) -> Result<(), crate::bus::BusError> {
+            let a = addr as usize;
+            self.0[a..a + 2].copy_from_slice(&v.to_le_bytes());
+            Ok(())
+        }
+        fn write32(&mut self, addr: u32, v: u32, _a: Access) -> Result<(), crate::bus::BusError> {
+            let a = addr as usize;
+            self.0[a..a + 4].copy_from_slice(&v.to_le_bytes());
+            Ok(())
+        }
+        fn code_epoch(&self) -> u64 {
+            1
+        }
+        fn cache_code(&mut self, _addr: u32, _len: u32) -> bool {
+            true
+        }
+    }
+
+    /// A CPU that has run a few `movs r0, #1` from address 0x100 (vector table at 0).
+    fn warm_cpu() -> (Cpu, Ram) {
+        let mut ram = Ram(vec![0; 0x1000]);
+        ram.0[0..4].copy_from_slice(&0x800u32.to_le_bytes());
+        ram.0[4..8].copy_from_slice(&0x101u32.to_le_bytes());
+        for i in 0..8 {
+            ram.0[0x100 + 2 * i..0x102 + 2 * i].copy_from_slice(&0x2001u16.to_le_bytes());
+        }
+        let mut cpu = Cpu::new();
+        cpu.reset(&mut ram);
+        for _ in 0..4 {
+            cpu.step(&mut ram);
+        }
+        (cpu, ram)
+    }
+
+    #[test]
+    fn clone_starts_with_an_empty_instruction_cache() {
+        let (cpu, mut ram) = warm_cpu();
+        assert!(!cpu.icache.0.is_empty(), "the original cached its code");
+        let mut copy = cpu.clone();
+        assert!(copy.icache.0.is_empty(), "the copy does not carry the cache");
+        assert_eq!(copy, cpu);
+        // The copy still runs, filling its own cache.
+        assert_eq!(copy.step(&mut ram), StepResult::Executed { cycles: 1 });
+        assert_eq!(copy.regs.pc, 0x10A);
     }
 }

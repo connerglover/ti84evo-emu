@@ -239,3 +239,24 @@ structural change rather than another lever, for example executing straight-line
 without the per-instruction exception and SysTick bookkeeping, or a banked register file
 where SP is a plain register. Inlining choices visibly move the result by ±20 % (see steps 7
 and 10), so any such change should be measured with the thread-CPU harness.
+
+## Round 2
+
+Starting point (commit 4b00b45), thread CPU time, best of three: `busy_loop` 62.5 M cycles/s,
+raw `Cpu::step` loop 77.1 M cycles/s, `boot_to_self_test` 159.0 M cycles/s (138 149 424 awake
+cycles, 15 090 code-epoch changes). The in-repo bench (wall time, host busy with other builds)
+gave 46.4 M and 123.6 M cycles/s.
+
+The sampling harness from step 4 now also prints a histogram by instruction address, which
+`dumpbin /disasm` turns into the hot instructions; the line tables alone attribute most samples
+to the caller once everything is inlined.
+
+### 11. A cloned CPU starts with an empty instruction cache
+
+`Cpu::clone` (e.g. in `Machine::save_state`) copied the 4096-entry instruction cache, 128 KiB.
+The cache is not state, so a clone now starts empty and fills its own.
+
+| | Before | After |
+|---|---|---|
+| `Cpu::clone` | 4 063 ns | 99 ns |
+| `Machine::save_state` | 11.3 ms | 11.4 ms (dominated by SRAM) |
