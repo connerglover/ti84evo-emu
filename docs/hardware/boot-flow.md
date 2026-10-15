@@ -214,6 +214,35 @@ On a fresh unit (empty ITS) the target is 1: the BSP shows the unit info screen,
 ENTER) the "Self-Test" menu; "0. Exit this menu" sends LAUNCH "OS" once. Provisioning
 (§3.5) sets UID ..0001 so that later power-ons launch the OS directly.
 
+### 3.4 How image 1 (the NS OS) is entered
+
+The BSP launch code at 0x0015_26f0 runs image 1 as a callee in the same NS state, without
+changing VTOR (so image 1 has no NS vector table of its own; VTOR_NS stays 0x0010_0400). It
+reads the entry from image 1's MCUboot header:
+
+```
+101526f0: movw r0, #0
+101526f4: movt r0, #0x38          ; 0x0038_0000 slot
+101526f8: ldrh r1, [r0, #8]       ; ih_hdr_size (0x200)
+101526fa: add  r0, r1
+101526fc: ldr  r6, [r0, #4]       ; reset word = 0x0044_BC91
+...
+10152716: blx  r6
+```
+
+The OS entry trampoline stores r0, the BSP's service table (0x0018_2024 in BSP 7.1.0.4413),
+to 0x2009_B100. It checks a
+compatibility pair (0x380aee: 0x380c6c vs 0x380c80; on mismatch it calls 0x380930(15) and
+then 0x44bce4), then jumps to 0x0038_0209.
+
+All OS-to-BSP calls go through `ip = [[0x2009_B100] + r0*4]`; `bx ip`. The stub is at
+0x44bc9e.
+
+Image 1 holds very few peripheral literals: blocks 0x4000_0000, 0x4000_4000 and 0x4010_0000,
+plus sparse hits that are mostly data false positives. The OS therefore reaches hardware
+mostly through the BSP API, and the first peripherals the NS OS touches are the BSP's
+(§3.2).
+
 ### 3.5 Factory provisioning: the Engineering menu (fix wave Task 3)
 
 The BSP's own Engineering menu sets the persistent "boot to OS" flag. `evo_core::provision`
@@ -254,35 +283,6 @@ or flash directly. Found with breakpoints and screenshots in a throwaway probe o
 anything. Its waits are breakpoints at the BSP 7.1.0.4413 addresses above, so another BSP
 version needs them checked. `Machine::power_cycle` does the power-off/on: the machine that
 `from_bundle_nv` would build from `nv_state()`.
-
-### 3.4 How image 1 (the NS OS) is entered
-
-The BSP launch code at 0x0015_26f0 runs image 1 as a callee in the same NS state, without
-changing VTOR (so image 1 has no NS vector table of its own; VTOR_NS stays 0x0010_0400). It
-reads the entry from image 1's MCUboot header:
-
-```
-101526f0: movw r0, #0
-101526f4: movt r0, #0x38          ; 0x0038_0000 slot
-101526f8: ldrh r1, [r0, #8]       ; ih_hdr_size (0x200)
-101526fa: add  r0, r1
-101526fc: ldr  r6, [r0, #4]       ; reset word = 0x0044_BC91
-...
-10152716: blx  r6
-```
-
-The OS entry trampoline stores r0, the BSP's service table (0x0018_2024 in BSP 7.1.0.4413),
-to 0x2009_B100. It checks a
-compatibility pair (0x380aee: 0x380c6c vs 0x380c80; on mismatch it calls 0x380930(15) and
-then 0x44bce4), then jumps to 0x0038_0209.
-
-All OS-to-BSP calls go through `ip = [[0x2009_B100] + r0*4]`; `bx ip`. The stub is at
-0x44bc9e.
-
-Image 1 holds very few peripheral literals: blocks 0x4000_0000, 0x4000_4000 and 0x4010_0000,
-plus sparse hits that are mostly data false positives. The OS therefore reaches hardware
-mostly through the BSP API, and the first peripherals the NS OS touches are the BSP's
-(§3.2).
 
 ## 4. BL2 shared data (not a peripheral, but required)
 
