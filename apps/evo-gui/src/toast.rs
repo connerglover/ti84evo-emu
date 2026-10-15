@@ -24,10 +24,11 @@ struct Toast {
     shown_at: Option<f64>,
 }
 
-/// A queue of toasts.
+/// A queue of toasts, plus at most one progress message that stays until it is cleared.
 #[derive(Default)]
 pub struct Toasts {
     items: Vec<Toast>,
+    progress: Option<String>,
 }
 
 impl Toasts {
@@ -44,13 +45,22 @@ impl Toasts {
         });
     }
 
-    /// The texts of the live toasts, oldest first.
+    /// Shows `text` above the toasts until the next call; `None` removes it.
+    pub fn set_progress(&mut self, text: Option<String>) {
+        self.progress = text;
+    }
+
+    /// The progress message, then the texts of the live toasts, oldest first.
     pub fn texts(&self) -> Vec<&str> {
-        self.items.iter().map(|t| t.text.as_str()).collect()
+        self.progress
+            .iter()
+            .map(String::as_str)
+            .chain(self.items.iter().map(|t| t.text.as_str()))
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.items.is_empty() && self.progress.is_none()
     }
 
     /// Drops expired toasts and draws the rest; each is an `egui::Label`.
@@ -61,22 +71,24 @@ impl Toasts {
         }
         self.items
             .retain(|t| now - t.shown_at.unwrap_or(now) < TOAST_SECS);
-        let Some(first_expiry) = self
+        let first_expiry = self
             .items
             .iter()
             .map(|t| t.shown_at.unwrap_or(now) + TOAST_SECS)
-            .reduce(f64::min)
-        else {
+            .reduce(f64::min);
+        if first_expiry.is_none() && self.progress.is_none() {
             return;
-        };
+        }
+        let progress = self.progress.iter().map(|text| (text, ToastKind::Info));
+        let toasts = self.items.iter().map(|t| (&t.text, t.kind));
         egui::Area::new(Id::new("evo-toasts"))
             .order(Order::Foreground)
             .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -BOTTOM_GAP))
             .interactable(false)
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    for t in &self.items {
-                        let fill: Color32 = match t.kind {
+                    for (text, kind) in progress.chain(toasts) {
+                        let fill: Color32 = match kind {
                             ToastKind::Info => TOAST_BG,
                             ToastKind::Error => TOAST_ERROR_BG,
                         };
@@ -86,15 +98,16 @@ impl Toasts {
                             .inner_margin(Margin::symmetric(12, 8))
                             .show(ui, |ui| {
                                 ui.add(
-                                    egui::Label::new(RichText::new(&t.text).color(LABEL_LIGHT))
-                                        .wrap(),
+                                    egui::Label::new(RichText::new(text).color(LABEL_LIGHT)).wrap(),
                                 );
                             });
                     }
                 });
             });
         // Wake up to remove the toast even while nothing else repaints.
-        let wait = (first_expiry - now).max(0.0);
-        ctx.request_repaint_after(Duration::from_secs_f64(wait));
+        if let Some(expiry) = first_expiry {
+            let wait = (expiry - now).max(0.0);
+            ctx.request_repaint_after(Duration::from_secs_f64(wait));
+        }
     }
 }

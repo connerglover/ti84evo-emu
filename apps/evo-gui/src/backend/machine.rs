@@ -72,6 +72,8 @@ pub struct MachineBackend {
     tag: String,
     /// `{nv_dir}/{fnv1a64 of the bundle bytes:016x}.nv`.
     nv_path: PathBuf,
+    /// True from an open with no flash file until provisioning succeeds.
+    fresh: bool,
     /// The last LCD image, converted for the GUI.
     frame: Frame,
 }
@@ -90,12 +92,14 @@ impl MachineBackend {
 
     /// Boots the bundle in `bytes`; `name` is for display only. If the bundle's flash file
     /// [`nv_path`](Self::nv_path) exists, the machine starts from it; a flash file that cannot
-    /// be read is an [`OpenError::Flash`] and is left untouched. Otherwise flash starts erased.
+    /// be read is an [`OpenError::Flash`] and is left untouched. Otherwise flash starts erased
+    /// and the backend [`needs_provision`](EmuBackend::needs_provision).
     pub fn from_bytes(bytes: &[u8], name: String, nv_dir: &Path) -> Result<Self, OpenError> {
         let bundle = Bundle::from_bytes(bytes)?;
         let hash = fnv1a64(bytes);
         let nv_path = nv_dir.join(format!("{hash:016x}.nv"));
-        let nv = if nv_path.exists() {
+        let fresh = !nv_path.exists();
+        let nv = if !fresh {
             match NvState::read_file(&nv_path) {
                 Ok(nv) => Some(nv),
                 Err(source) => {
@@ -115,6 +119,7 @@ impl MachineBackend {
             name,
             tag: format!("machine:{hash:016x}"),
             nv_path,
+            fresh,
             frame: Frame {
                 width: 0,
                 height: 0,
@@ -234,6 +239,25 @@ impl EmuBackend for MachineBackend {
             .nv_state()
             .write_file(&self.nv_path)
             .map_err(|e| BackendError::Persist(e.to_string()))
+    }
+
+    fn needs_provision(&self) -> bool {
+        self.fresh
+    }
+
+    fn provision(&mut self) -> Result<(), BackendError> {
+        // `evo_core::provision` uses breakpoints of its own and clears them.
+        let breakpoints = std::mem::take(&mut self.machine.breakpoints);
+        let result = evo_core::provision(&mut self.machine);
+        self.machine.breakpoints = breakpoints;
+        match result {
+            Ok(report) => {
+                log::info!("provisioned: {report:?}");
+                self.fresh = false;
+                Ok(())
+            }
+            Err(e) => Err(BackendError::Provision(e.to_string())),
+        }
     }
 
     fn cpu(&self) -> CpuView {

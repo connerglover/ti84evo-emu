@@ -222,7 +222,15 @@ fn tool_table() {
     assert_eq!(
         Tool::ALL,
         [
-            Screenshot, SaveState, LoadState, Reset, Smooth, Debug, Keymap, About
+            Screenshot,
+            SaveState,
+            LoadState,
+            Reset,
+            Reprovision,
+            Smooth,
+            Debug,
+            Keymap,
+            About
         ]
     );
     let rows: Vec<_> = Tool::ALL
@@ -236,6 +244,7 @@ fn tool_table() {
             ("\u{1F4BE}", "Save", "Save state"),
             ("\u{1F4C2}", "Load", "Load state"),
             ("\u{1F504}", "Reset", "Reset"),
+            ("\u{1F527}", "Prov", "Re-provision"),
             (
                 "\u{1F5BC}",
                 "Smooth",

@@ -1,6 +1,7 @@
 //! A deterministic stand-in machine for tests, golden snapshots and demo mode.
 
 use std::collections::BTreeSet;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,8 @@ struct Shared {
     resets: u32,
     persists: u32,
     run_calls: u32,
+    /// `provision` calls started.
+    provisions: u32,
 }
 
 fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
@@ -61,6 +64,10 @@ impl FakeProbe {
     pub fn run_calls(&self) -> u32 {
         lock(&self.0).run_calls
     }
+    /// How many times `provision` was called.
+    pub fn provisions(&self) -> u32 {
+        lock(&self.0).provisions
+    }
 }
 
 enum Display {
@@ -87,6 +94,11 @@ pub struct FakeBackend {
     uart: Vec<u8>,
     breakpoints: Vec<u32>,
     state_tag: String,
+    /// What `needs_provision` reports; `provision` clears it on success.
+    fresh: bool,
+    provision_fails: bool,
+    /// When set, `provision` waits for a message (or the sender's drop) before it ends.
+    gate: Option<Receiver<()>>,
 }
 
 impl Default for FakeBackend {
@@ -109,6 +121,9 @@ impl FakeBackend {
             uart: Vec::new(),
             breakpoints: Vec::new(),
             state_tag: "demo".to_owned(),
+            fresh: false,
+            provision_fails: false,
+            gate: None,
         }
     }
 
@@ -140,6 +155,26 @@ impl FakeBackend {
     pub fn with_state_tag(mut self, tag: &str) -> Self {
         self.state_tag = tag.to_owned();
         self
+    }
+
+    /// A fake that reports `needs_provision` until it is provisioned.
+    pub fn needing_provision(mut self) -> Self {
+        self.fresh = true;
+        self
+    }
+
+    /// A fake whose `provision` fails.
+    pub fn failing_provision(mut self) -> Self {
+        self.provision_fails = true;
+        self
+    }
+
+    /// Makes `provision` wait until the returned sender sends (or is dropped), so a test
+    /// can look at the app while provisioning runs.
+    pub fn provision_gate(&mut self) -> Sender<()> {
+        let (tx, rx) = channel();
+        self.gate = Some(rx);
+        tx
     }
 
     pub fn probe(&self) -> FakeProbe {
@@ -283,6 +318,30 @@ impl EmuBackend for FakeBackend {
     fn persist(&mut self) -> Result<(), BackendError> {
         let mut s = self.shared();
         s.persists = s.persists.saturating_add(1);
+        Ok(())
+    }
+
+    fn needs_provision(&self) -> bool {
+        self.fresh
+    }
+
+    fn provision(&mut self) -> Result<(), BackendError> {
+        {
+            let mut s = self.shared();
+            s.provisions = s.provisions.saturating_add(1);
+        }
+        if let Some(gate) = &self.gate {
+            // A dropped sender ends the wait too.
+            let _ = gate.recv();
+        }
+        if self.provision_fails {
+            return Err(BackendError::Provision("the fake always fails".to_owned()));
+        }
+        self.fresh = false;
+        // Like the real machine, provisioning ends in a fresh boot.
+        let mut s = self.shared();
+        s.cycles = 0;
+        s.held.clear();
         Ok(())
     }
 

@@ -97,6 +97,8 @@ pub enum BackendError {
     BadState(String),
     #[error("could not save flash: {0}")]
     Persist(String),
+    #[error("provisioning failed: {0}")]
+    Provision(String),
 }
 
 /// An emulated machine as the GUI sees it.
@@ -125,6 +127,14 @@ pub trait EmuBackend: Send {
     fn reset(&mut self);
     /// Writes flash (non-volatile state) to disk; a no-op where there is none.
     fn persist(&mut self) -> Result<(), BackendError>;
+    /// True when the machine has never been set up to boot its OS (it started from an
+    /// erased flash): the app then runs [`provision`](Self::provision) before anything else.
+    fn needs_provision(&self) -> bool;
+    /// Factory provisioning: sets the machine up so that it boots straight to its OS, and
+    /// leaves it booting the OS. It can take many seconds, so the app calls it on a worker
+    /// thread; it does not write flash to disk (the app persists afterwards). Breakpoints are
+    /// kept. On `Err` the machine is left where provisioning stopped.
+    fn provision(&mut self) -> Result<(), BackendError>;
     fn cpu(&self) -> CpuView;
     /// Reads memory without side effects; `None` for unreadable bytes.
     fn peek(&self, addr: u32, len: usize) -> Vec<Option<u8>>;

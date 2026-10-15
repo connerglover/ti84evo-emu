@@ -775,3 +775,125 @@ fn notice_is_shown_as_a_toast() {
     h.run_steps(1);
     h.get_by_label(DEMO_NOTICE);
 }
+
+// ---------------------------------------------------------------------------
+// First-run provisioning and Re-provision.
+
+const PREPARING: &str = "Preparing calculator\u{2026}";
+
+/// Steps until provisioning has ended, at most about 10 s of wall time.
+fn finish_provisioning(h: &mut Harness<'static, EvoApp>) {
+    for _ in 0..1000 {
+        if !h.state().provisioning() {
+            h.run_steps(2);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        h.run_steps(1);
+    }
+    panic!("provisioning did not end");
+}
+
+#[test]
+fn fresh_unit_is_provisioned_off_the_ui_thread() {
+    let mut fake = FakeBackend::new().needing_provision();
+    let gate = fake.provision_gate();
+    let probe = fake.probe();
+    let dir = fresh_dir("provision");
+    let mut h = harness_in(fake, false, dir.to_path_buf());
+    h.run_steps(3);
+    // The UI keeps running while provisioning waits on the gate.
+    assert!(h.state().provisioning());
+    assert_eq!(probe.provisions(), 1);
+    assert_eq!(
+        h.query_all_by_label(PREPARING).count(),
+        2,
+        "toast and header"
+    );
+    // Emulation and flash writes wait for it.
+    let runs = probe.run_calls();
+    h.run_steps(5);
+    assert_eq!(probe.run_calls(), runs);
+    assert_eq!(probe.persists(), 0);
+    // Keys pressed meanwhile do not reach the machine.
+    h.event(Event::Key {
+        key: Key::Num5,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run_steps(2);
+
+    gate.send(()).unwrap();
+    finish_provisioning(&mut h);
+    assert!(!h.state().provisioning());
+    assert!(!h.state().backend().needs_provision());
+    assert_eq!(probe.provisions(), 1);
+    // The provisioned flash is written at once, then the machine runs.
+    assert_eq!(probe.persists(), 1);
+    h.get_by_label("Calculator ready");
+    assert!(h.query_by_label(PREPARING).is_none());
+    assert!(probe.run_calls() > runs);
+    assert!(!probe.key_log().contains(&(KeyId::Five, true)));
+}
+
+#[test]
+fn provisioned_unit_starts_without_provisioning() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness(fake, false);
+    h.run_steps(3);
+    assert!(!h.state().provisioning());
+    assert_eq!(probe.provisions(), 0);
+    assert!(h.query_by_label(PREPARING).is_none());
+}
+
+#[test]
+fn reprovision_tool_provisions_again() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let dir = fresh_dir("reprovision");
+    let mut h = harness_in(fake, true, dir.to_path_buf());
+    h.run_steps(1);
+    click(&mut h, "Re-provision");
+    finish_provisioning(&mut h);
+    assert_eq!(probe.provisions(), 1);
+    assert_eq!(probe.persists(), 1);
+    h.get_by_label("Calculator ready");
+}
+
+#[test]
+fn machine_tools_wait_for_provisioning() {
+    let mut fake = FakeBackend::new().needing_provision();
+    let gate = fake.provision_gate();
+    let probe = fake.probe();
+    let dir = fresh_dir("provisionbusy");
+    let mut h = harness_in(fake, true, dir.to_path_buf());
+    h.run_steps(2);
+    click(&mut h, "Reset");
+    click(&mut h, "Re-provision");
+    assert_eq!(
+        h.query_all_by_label("Wait until the calculator is ready")
+            .count(),
+        2
+    );
+    assert_eq!(probe.resets(), 0);
+    drop(gate);
+    finish_provisioning(&mut h);
+    assert_eq!(probe.provisions(), 1);
+}
+
+#[test]
+fn failed_provisioning_shows_error_and_keeps_machine() {
+    let fake = FakeBackend::new().needing_provision().failing_provision();
+    let probe = fake.probe();
+    let dir = fresh_dir("provisionfail");
+    let mut h = harness_in(fake, true, dir.to_path_buf());
+    h.run_steps(1);
+    finish_provisioning(&mut h);
+    h.get_by_label("provisioning failed: the fake always fails");
+    assert_eq!(h.state().backend().name(), "demo");
+    assert!(h.state().backend().needs_provision());
+    assert_eq!(probe.persists(), 0);
+}

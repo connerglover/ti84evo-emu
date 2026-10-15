@@ -28,6 +28,7 @@ pub enum Tool {
     SaveState,
     LoadState,
     Reset,
+    Reprovision,
     Smooth,
     Debug,
     Keymap,
@@ -36,11 +37,12 @@ pub enum Tool {
 
 impl Tool {
     /// Every tool, top to bottom.
-    pub const ALL: [Tool; 8] = [
+    pub const ALL: [Tool; 9] = [
         Tool::Screenshot,
         Tool::SaveState,
         Tool::LoadState,
         Tool::Reset,
+        Tool::Reprovision,
         Tool::Smooth,
         Tool::Debug,
         Tool::Keymap,
@@ -54,6 +56,7 @@ impl Tool {
             Tool::SaveState => "\u{1F4BE}",
             Tool::LoadState => "\u{1F4C2}",
             Tool::Reset => "\u{1F504}",
+            Tool::Reprovision => "\u{1F527}",
             Tool::Smooth => "\u{1F5BC}",
             Tool::Debug => "\u{1F41B}",
             Tool::Keymap => "\u{2328}",
@@ -68,6 +71,7 @@ impl Tool {
             Tool::SaveState => "Save",
             Tool::LoadState => "Load",
             Tool::Reset => "Reset",
+            Tool::Reprovision => "Prov",
             Tool::Smooth => "Smooth",
             Tool::Debug => "Debug",
             Tool::Keymap => "Keys",
@@ -82,6 +86,7 @@ impl Tool {
             Tool::SaveState => "Save state",
             Tool::LoadState => "Load state",
             Tool::Reset => "Reset",
+            Tool::Reprovision => "Re-provision",
             Tool::Smooth => "Smooth scaling (better at non-integer sizes)",
             Tool::Debug => "Debug panels",
             Tool::Keymap => "Keyboard mapping",
@@ -91,7 +96,7 @@ impl Tool {
 }
 
 /// For each tool in [`Tool::ALL`] order, whether its icon is drawable.
-pub fn drawable_icons(ctx: &egui::Context) -> [bool; 8] {
+pub fn drawable_icons(ctx: &egui::Context) -> [bool; 9] {
     let font = FontId::proportional(ICON_SIZE);
     Tool::ALL.map(|t| has_glyphs(ctx, &font, t.icon()))
 }
@@ -110,7 +115,7 @@ pub struct ToolbarOutput {
 /// and Space/Enter (calculator keys) never click them.
 pub fn toolbar_buttons(
     ui: &mut egui::Ui,
-    icons: &[bool; 8],
+    icons: &[bool; 9],
     active: impl Fn(Tool) -> bool,
 ) -> ToolbarOutput {
     let mut out = ToolbarOutput {

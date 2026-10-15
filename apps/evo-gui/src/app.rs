@@ -3,15 +3,20 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use egui::{
     Align, Frame, Id, Layout, Margin, Pos2, Rect, Response, RichText, Sense, Vec2, ViewportCommand,
     WidgetInfo, WidgetType, pos2, vec2,
 };
 
-use crate::backend::{CLOCK_HZ, EmuBackend, RunStatus};
+use crate::backend::{
+    BackendError, CLOCK_HZ, CpuView, DisasmLine, EmuBackend, Frame as LcdFrame, RunStatus,
+    UnmappedRow,
+};
 use crate::debug::{DEBUG_MIN_W, DEBUG_W, DebugPanel};
 use crate::input::{KeyAction, KeyLatch, KeyboardTracker, Keymap, Source, pc_key_label};
 use crate::keymap_window::KeymapWindow;
@@ -59,6 +64,85 @@ pub fn debug_max_width(window_w: f32) -> f32 {
 /// The toast shown when no bundle was given and the demo backend runs.
 pub const DEMO_NOTICE: &str =
     "No OS bundle given: running the demo backend. Usage: evo-gui <bundle.84b2>";
+
+/// The progress message (and header status) while the machine is provisioned.
+pub const PROVISION_NOTICE: &str = "Preparing calculator\u{2026}";
+/// The toast after provisioning succeeded.
+pub const PROVISION_DONE: &str = "Calculator ready";
+/// The toast for a machine tool used while provisioning runs.
+pub const PROVISION_BUSY: &str = "Wait until the calculator is ready";
+/// How often the app checks on a running provisioning.
+const PROVISION_POLL: Duration = Duration::from_millis(50);
+
+/// What the provisioning thread hands back: the backend, and how provisioning went.
+type ProvisionResult = (Box<dyn EmuBackend>, Result<(), BackendError>);
+
+/// The app's backend while the real one is away on the provisioning thread: no display, no
+/// time, nothing to change. Its name and state tag are the real backend's.
+struct Away {
+    name: String,
+    tag: String,
+}
+
+impl EmuBackend for Away {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn state_tag(&self) -> String {
+        self.tag.clone()
+    }
+    fn framebuffer(&mut self) -> Option<&LcdFrame> {
+        None
+    }
+    fn backlight(&self) -> f32 {
+        0.0
+    }
+    fn set_key(&mut self, _key: KeyId, _pressed: bool) {}
+    fn run_for(&mut self, _cycles: u64) -> RunStatus {
+        RunStatus::Idle
+    }
+    fn step(&mut self) -> RunStatus {
+        RunStatus::Idle
+    }
+    fn cycles(&self) -> u64 {
+        0
+    }
+    fn take_uart(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
+    fn save_state(&self) -> Result<Vec<u8>, BackendError> {
+        Err(BackendError::Unsupported("saving while provisioning"))
+    }
+    fn load_state(&mut self, _bytes: &[u8]) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported("loading while provisioning"))
+    }
+    fn reset(&mut self) {}
+    fn persist(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
+    fn needs_provision(&self) -> bool {
+        false
+    }
+    fn provision(&mut self) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported("provisioning twice at once"))
+    }
+    fn cpu(&self) -> CpuView {
+        CpuView::default()
+    }
+    fn peek(&self, _addr: u32, len: usize) -> Vec<Option<u8>> {
+        vec![None; len]
+    }
+    fn disasm(&self, _addr: u32, _count: usize) -> Vec<DisasmLine> {
+        Vec::new()
+    }
+    fn unmapped(&self) -> Vec<UnmappedRow> {
+        Vec::new()
+    }
+    fn breakpoints(&self) -> Vec<u32> {
+        Vec::new()
+    }
+    fn toggle_breakpoint(&mut self, _addr: u32) {}
+}
 
 /// Which backend `main` starts.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,6 +232,8 @@ fn pointer_edge(resp: &Response, was_down: bool) -> PointerEdge {
 /// The emulator application.
 pub struct EvoApp {
     backend: Box<dyn EmuBackend>,
+    /// The thread provisioning the real backend; `backend` is an [`Away`] meanwhile.
+    provisioning: Option<JoinHandle<ProvisionResult>>,
     data_dir: PathBuf,
     paused: bool,
     debug_open: bool,
@@ -181,7 +267,7 @@ pub struct EvoApp {
     toasts: Toasts,
     /// Per tool, whether its icon is drawable; filled on the first frame,
     /// once the fonts are loaded.
-    icons: Option<[bool; 8]>,
+    icons: Option<[bool; 9]>,
     /// The open slot picker and where it sits.
     picker: Option<(PickerMode, Pos2)>,
     about_open: bool,
@@ -191,7 +277,9 @@ pub struct EvoApp {
 }
 
 impl EvoApp {
-    /// Builds the app and installs its fonts and light theme into `cc_ctx`.
+    /// Builds the app and installs its fonts and light theme into `cc_ctx`. A backend that
+    /// [`needs_provision`](EmuBackend::needs_provision) is provisioned at once, on a worker
+    /// thread.
     pub fn new(cc_ctx: &egui::Context, backend: Box<dyn EmuBackend>, opts: AppOptions) -> Self {
         install_fonts(cc_ctx);
         cc_ctx.set_theme(egui::ThemePreference::Light);
@@ -199,8 +287,10 @@ impl EvoApp {
         if let Some(notice) = opts.notice {
             toasts.push(notice, ToastKind::Info);
         }
-        Self {
+        let needs_provision = backend.needs_provision();
+        let mut app = Self {
             backend,
+            provisioning: None,
             store: Store::new(opts.data_dir.clone()),
             toasts,
             icons: None,
@@ -234,11 +324,94 @@ impl EvoApp {
             lcd: LcdView::new(),
             filter: opts.prefs.filter,
             transform: CalcTransform::fit(egui::Rect::ZERO),
+        };
+        if needs_provision {
+            app.start_provision();
+        }
+        app
+    }
+
+    /// True while the machine is being provisioned (first run or Re-provision).
+    pub fn provisioning(&self) -> bool {
+        self.provisioning.is_some()
+    }
+
+    /// Moves the backend to a worker thread that provisions it; an [`Away`] stands in.
+    fn start_provision(&mut self) {
+        if self.provisioning.is_some() {
+            return;
+        }
+        self.resync();
+        let away = Box::new(Away {
+            name: self.backend.name().to_owned(),
+            tag: self.backend.state_tag(),
+        });
+        let mut backend = std::mem::replace(&mut self.backend, away);
+        let spawned = std::thread::Builder::new()
+            .name("evo-provision".to_owned())
+            .spawn(move || {
+                // A panic must not take the backend with it.
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| backend.provision()))
+                    .unwrap_or_else(|_| {
+                        Err(BackendError::Provision(
+                            "the provisioning thread panicked".into(),
+                        ))
+                    });
+                (backend, result)
+            });
+        match spawned {
+            Ok(handle) => {
+                self.provisioning = Some(handle);
+                self.toasts.set_progress(Some(PROVISION_NOTICE.to_owned()));
+            }
+            // The backend is lost with the closure only if the OS refuses a thread.
+            Err(e) => self
+                .toasts
+                .push(format!("Cannot start provisioning: {e}"), ToastKind::Error),
+        }
+    }
+
+    /// Takes the backend back once the provisioning thread is done: saves the provisioned
+    /// flash and lets the machine run, or reports the failure.
+    fn poll_provision(&mut self, ctx: &egui::Context) {
+        let Some(handle) = &self.provisioning else {
+            return;
+        };
+        if !handle.is_finished() {
+            ctx.request_repaint_after(PROVISION_POLL);
+            return;
+        }
+        let Some(handle) = self.provisioning.take() else {
+            return;
+        };
+        self.toasts.set_progress(None);
+        match handle.join() {
+            Ok((backend, result)) => {
+                self.backend = backend;
+                self.resync();
+                match result {
+                    Ok(()) => {
+                        self.persist();
+                        self.toasts.push(PROVISION_DONE, ToastKind::Info);
+                    }
+                    Err(e) => self.toasts.push(e.to_string(), ToastKind::Error),
+                }
+            }
+            // `catch_unwind` in the thread makes this unreachable in practice.
+            Err(_) => self
+                .toasts
+                .push("The provisioning thread was lost", ToastKind::Error),
         }
     }
 
     pub fn backend(&self) -> &dyn EmuBackend {
         self.backend.as_ref()
+    }
+
+    /// The backend, for tests that read its frame. While provisioning runs this is a
+    /// stand-in with no display.
+    pub fn backend_mut(&mut self) -> &mut dyn EmuBackend {
+        self.backend.as_mut()
     }
 
     pub fn paused(&self) -> bool {
@@ -370,11 +543,23 @@ impl EvoApp {
     }
 
     fn apply_tool(&mut self, tool: Tool, button: Rect) {
+        let machine_tool = matches!(
+            tool,
+            Tool::Screenshot | Tool::SaveState | Tool::LoadState | Tool::Reset | Tool::Reprovision
+        );
+        if machine_tool && self.provisioning() {
+            self.toasts.push(PROVISION_BUSY, ToastKind::Info);
+            return;
+        }
         match tool {
             Tool::Screenshot => self.screenshot(),
             Tool::SaveState => self.toggle_picker(PickerMode::Save, button),
             Tool::LoadState => self.toggle_picker(PickerMode::Load, button),
             Tool::Reset => self.reset_machine(),
+            Tool::Reprovision => {
+                self.picker = None;
+                self.start_provision();
+            }
             Tool::Smooth => {
                 self.filter = match self.filter {
                     ScaleFilter::Nearest => ScaleFilter::Smooth,
@@ -477,7 +662,7 @@ impl EvoApp {
 
     /// Step 2 of `logic`: emulate this frame's share of time.
     fn emulate(&mut self, ctx: &egui::Context) {
-        if self.paused {
+        if self.paused || self.provisioning() {
             self.speed.reset();
             return;
         }
@@ -550,7 +735,11 @@ impl EvoApp {
     }
 
     fn header(&self, ui: &mut egui::Ui) {
-        let status = status_text(self.status, self.paused, self.speed.percent());
+        let status = if self.provisioning() {
+            PROVISION_NOTICE.to_owned()
+        } else {
+            status_text(self.status, self.paused, self.speed.percent())
+        };
         ui.horizontal_centered(|ui| {
             ui.label(RichText::new(TITLE).size(TITLE_SIZE).color(LABEL_DARK));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -678,6 +867,7 @@ impl EvoApp {
 
 impl eframe::App for EvoApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_provision(ctx);
         self.keyboard(ctx);
         self.emulate(ctx);
         self.latch.tick(self.backend.cycles());
