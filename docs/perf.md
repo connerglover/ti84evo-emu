@@ -210,3 +210,32 @@ cache against Unicorn: 4 passed.
 | `busy_loop`, thread CPU time | 54.2 M cycles/s | 64.3 M cycles/s (41 %) |
 | raw `Cpu::step` loop | 64.6 M cycles/s | 77.1 M cycles/s |
 | `boot_to_self_test`, thread CPU time | 132.8 M cycles/s | 156.0 M cycles/s (100 %; awake cycles unchanged) |
+
+## Result
+
+Stopped after the levers in the plan (instruction cache, `MemoryMap` fast path, no per-step
+allocation or trace work, cheaper `sync_bus`, batched scheduler checks) and the follow-ups
+above were used up. Busy guest code does **not** reach real time: it runs at about 41 % of
+it.
+
+| Benchmark | Baseline | Final, in-repo bench (wall time, best of 3) | Final, thread CPU time |
+|---|---|---|---|
+| `busy_loop` | 13.4 M cycles/s (9 %) | 48.4 M cycles/s (31 %) | 64.3 M cycles/s (41 %) |
+| `boot_to_self_test` | 27.0 M cycles/s (17 %), 9.6 M awake | 127.8 M cycles/s (82 %), 45.3 M awake | 156.0 M cycles/s (100 %) |
+
+The wall-time column was measured with other builds running on the host; the thread-CPU
+column is what the interpreter itself does. The real-OS milestone suite (`milestones.rs`,
+12 tests) takes 38.6 s instead of 172.8 s, and prints the same cycle counts and screen hash as
+before.
+
+Guest-visible behaviour is unchanged: difftest against Unicorn (`DIFFTEST_CASES=20000`, with
+the instruction cache now in the loop), the `tools/testprogs` programs, M1–M4 and every other
+milestone test pass, and the boot reaches exactly the same awake-cycle count and the same
+milestone cycle numbers and M3 screen hash as the baseline commit.
+
+What remains: a raw `Cpu::step` loop does about 77 M cycles/s (about 13 ns per instruction),
+and `Machine::run` adds a fifth on top of that. Getting busy code to 156 M cycles/s needs a
+structural change rather than another lever, for example executing straight-line blocks
+without the per-instruction exception and SysTick bookkeeping, or a banked register file
+where SP is a plain register. Inlining choices visibly move the result by ±20 % (see steps 7
+and 10), so any such change should be measured with the thread-CPU harness.
