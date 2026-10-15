@@ -8,7 +8,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use evo_core::{Key, NvState};
-use evo_gui::backend::machine::{MachineBackend, OpenError, core_key, fnv1a64, rgb888_to_rgba};
+use evo_gui::backend::machine::{
+    MachineBackend, OpenError, core_key, fnv1a64, inspect_bundle, rgb888_to_rgba,
+};
 use evo_gui::backend::{BackendError, EmuBackend, RunStatus};
 use evo_gui::keypad::KeyId;
 use evo_hw::dev::keypad::KEY_NAMES;
@@ -411,4 +413,30 @@ fn test_dirs_are_removed() {
     assert!(path.exists());
     drop(dir);
     assert!(!path.exists(), "{} was left behind", path.display());
+}
+
+#[test]
+fn inspect_bundle_reads_metadata() {
+    let info = inspect_bundle(&bundle_bytes(&COUNTER)).unwrap();
+    assert_eq!(info.build_version, "9.8.7.6543");
+    assert_eq!(info.target_device, "84XX");
+    assert_eq!(info.prodid, 42);
+    assert!(inspect_bundle(b"nope").is_err());
+}
+
+#[test]
+fn new_methods_are_unsupported_until_wired() {
+    let mut b = backend(&COUNTER);
+    assert!(matches!(
+        b.poke(0x3000_0000, &[1]),
+        Err(BackendError::Unsupported(_))
+    ));
+    assert!(matches!(b.export_ram(), Err(BackendError::Unsupported(_))));
+    assert!(matches!(
+        b.set_watchpoints(vec![]),
+        Err(BackendError::Unsupported(_))
+    ));
+    assert!(b.memory_regions().is_empty());
+    assert!(b.peripherals().is_empty());
+    assert!(b.take_key_events().is_empty());
 }

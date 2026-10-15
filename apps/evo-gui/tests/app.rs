@@ -54,6 +54,22 @@ fn status_text_strings() {
         status_text(Breakpoint(0x1000_0200), true, Some(87)),
         "Breakpoint at 0x10000200"
     );
+    let watch = Watchpoint {
+        addr: 0x2000_0100,
+        dir: evo_gui::backend::AccessDir::Write,
+        value: 0x2A,
+        pc: 0x1000_0200,
+    };
+    for (paused, speed) in [(false, None), (true, Some(87))] {
+        assert_eq!(
+            status_text(watch, paused, speed),
+            "Watchpoint (write) at 0x20000100, pc 0x10000200"
+        );
+        assert_eq!(
+            status_text(Goal { pc: 0x1000_0244 }, paused, speed),
+            "Stopped at 0x10000244"
+        );
+    }
 }
 
 #[test]

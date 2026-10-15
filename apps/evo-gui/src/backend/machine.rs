@@ -15,7 +15,8 @@ use evo_hw::dev::lcdc::Pwm;
 use evo_image::{Bundle, ImageError, Layout};
 
 use crate::backend::{
-    BackendError, CpuView, DisasmLine, EmuBackend, Frame, RunStatus, UnmappedRow,
+    BackendError, BusRecord, CpuView, DeviceView, DisasmLine, EmuBackend, Frame, Goal,
+    HardwareView, HwChange, KeyEvent, MemRegion, RunStatus, UartId, UnmappedRow, Watchpoint,
 };
 use crate::keypad::KeyId;
 
@@ -29,6 +30,25 @@ pub enum OpenError {
     /// The flash file exists but cannot be read; it is left untouched.
     #[error("{path}: {source}")]
     Flash { path: PathBuf, source: NvError },
+}
+
+/// What a bundle's metadata says about the OS it holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BundleInfo {
+    /// e.g. `7.1.0.4421`.
+    pub build_version: String,
+    pub target_device: String,
+    pub prodid: u32,
+}
+
+/// Parses the bundle in `bytes` and returns its metadata, without booting it.
+pub fn inspect_bundle(bytes: &[u8]) -> Result<BundleInfo, OpenError> {
+    let meta = Bundle::from_bytes(bytes)?.metadata;
+    Ok(BundleInfo {
+        build_version: meta.build_version,
+        target_device: meta.target_device,
+        prodid: meta.prodid,
+    })
 }
 
 const _: () = assert!(crate::backend::CLOCK_HZ == evo_core::CPU_HZ);
@@ -360,5 +380,96 @@ impl EmuBackend for MachineBackend {
         if !bps.remove(&addr) {
             bps.insert(addr);
         }
+    }
+
+    // Not wired to the core yet (Plan 4, Lane W): each returns `Unsupported`, an empty
+    // value, or does nothing.
+
+    fn poke(&mut self, _addr: u32, _bytes: &[u8]) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported("writing memory"))
+    }
+
+    fn memory_regions(&self) -> Vec<MemRegion> {
+        Vec::new()
+    }
+
+    fn set_core_reg(&mut self, _index: usize, _value: u32) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported("writing registers"))
+    }
+
+    fn set_banked_reg(&mut self, _name: &str, _value: u32) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported("writing registers"))
+    }
+
+    fn set_breakpoints(&mut self, addrs: Vec<u32>) {
+        self.machine.breakpoints = addrs.into_iter().collect();
+    }
+
+    fn begin_goal(&mut self, _goal: Goal) -> Result<bool, BackendError> {
+        Err(BackendError::Unsupported("step over, step out and run to"))
+    }
+
+    fn cancel_goal(&mut self) {}
+
+    fn watchpoints(&self) -> Vec<Watchpoint> {
+        Vec::new()
+    }
+
+    fn set_watchpoints(&mut self, _w: Vec<Watchpoint>) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported("watchpoints"))
+    }
+
+    fn set_bus_monitor(&mut self, _range: Option<(u32, u32)>) {}
+
+    fn bus_records(&self) -> Vec<BusRecord> {
+        Vec::new()
+    }
+
+    fn clear_bus_records(&mut self) {}
+
+    fn peripherals(&self) -> Vec<DeviceView> {
+        Vec::new()
+    }
+
+    fn take_uart2(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    fn send_uart(&mut self, _port: UartId, _bytes: &[u8]) {}
+
+    fn take_key_events(&mut self) -> Vec<KeyEvent> {
+        Vec::new()
+    }
+
+    fn hardware(&self) -> HardwareView {
+        HardwareView {
+            backlight: self.backlight(),
+            charger_line: false,
+            battery_ok: false,
+            usb_attached: false,
+            power_hold: false,
+            deep_sleep: false,
+            rtc_seconds: 0,
+        }
+    }
+
+    fn set_hardware(&mut self, _change: HwChange) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported("hardware changes"))
+    }
+
+    fn export_ram(&self) -> Result<Vec<u8>, BackendError> {
+        Err(BackendError::Unsupported("exporting RAM"))
+    }
+
+    fn import_ram(&mut self, _bytes: &[u8]) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported("importing RAM"))
+    }
+
+    fn export_flash(&self, _path: &Path) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported("exporting flash"))
+    }
+
+    fn import_flash(&mut self, _path: &Path) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported("importing flash"))
     }
 }

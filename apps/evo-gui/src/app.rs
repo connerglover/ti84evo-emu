@@ -13,10 +13,8 @@ use egui::{
     ViewportCommand, WidgetInfo, WidgetType, pos2, vec2,
 };
 
-use crate::backend::{
-    BackendError, CLOCK_HZ, CpuView, DisasmLine, EmuBackend, Frame as LcdFrame, RunStatus,
-    UnmappedRow,
-};
+use crate::backend::placeholder::Placeholder;
+use crate::backend::{BackendError, CLOCK_HZ, EmuBackend, RunStatus};
 use crate::debug::{DEBUG_MIN_W, DEBUG_W, DebugPanel};
 use crate::input::{KeyAction, KeyLatch, KeyboardTracker, Keymap, Source, pc_key_label};
 use crate::keymap_window::KeymapWindow;
@@ -84,73 +82,6 @@ const PROVISION_POLL: Duration = Duration::from_millis(50);
 /// What the provisioning thread hands back: the backend, and how provisioning went.
 type ProvisionResult = (Box<dyn EmuBackend>, Result<(), BackendError>);
 
-/// The app's backend while the real one is away on the provisioning thread: no display, no
-/// time, nothing to change. Its name and state tag are the real backend's.
-struct Away {
-    name: String,
-    tag: String,
-}
-
-impl EmuBackend for Away {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn state_tag(&self) -> String {
-        self.tag.clone()
-    }
-    fn framebuffer(&mut self) -> Option<&LcdFrame> {
-        None
-    }
-    fn backlight(&self) -> f32 {
-        0.0
-    }
-    fn set_key(&mut self, _key: KeyId, _pressed: bool) {}
-    fn run_for(&mut self, _cycles: u64) -> RunStatus {
-        RunStatus::Idle
-    }
-    fn step(&mut self) -> RunStatus {
-        RunStatus::Idle
-    }
-    fn cycles(&self) -> u64 {
-        0
-    }
-    fn take_uart(&mut self) -> Vec<u8> {
-        Vec::new()
-    }
-    fn save_state(&self) -> Result<Vec<u8>, BackendError> {
-        Err(BackendError::Unsupported("saving while provisioning"))
-    }
-    fn load_state(&mut self, _bytes: &[u8]) -> Result<(), BackendError> {
-        Err(BackendError::Unsupported("loading while provisioning"))
-    }
-    fn reset(&mut self) {}
-    fn persist(&mut self) -> Result<(), BackendError> {
-        Ok(())
-    }
-    fn needs_provision(&self) -> bool {
-        false
-    }
-    fn provision(&mut self) -> Result<(), BackendError> {
-        Err(BackendError::Unsupported("provisioning twice at once"))
-    }
-    fn cpu(&self) -> CpuView {
-        CpuView::default()
-    }
-    fn peek(&self, _addr: u32, len: usize) -> Vec<Option<u8>> {
-        vec![None; len]
-    }
-    fn disasm(&self, _addr: u32, _count: usize) -> Vec<DisasmLine> {
-        Vec::new()
-    }
-    fn unmapped(&self) -> Vec<UnmappedRow> {
-        Vec::new()
-    }
-    fn breakpoints(&self) -> Vec<u32> {
-        Vec::new()
-    }
-    fn toggle_breakpoint(&mut self, _addr: u32) {}
-}
-
 /// Which backend `main` starts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Choice {
@@ -199,13 +130,20 @@ impl AppOptions {
 
 /// The header status line.
 ///
-/// A stop status (breakpoint, lockup, `BKPT`) is shown even while paused,
-/// since it is the reason for the pause; any other status shows `Paused`.
+/// A stop status (breakpoint, lockup, `BKPT`, watchpoint, goal) is shown even while
+/// paused, since it is the reason for the pause; any other status shows `Paused`.
 pub fn status_text(status: RunStatus, paused: bool, speed: Option<u32>) -> String {
     match status {
         RunStatus::Breakpoint(a) => format!("Breakpoint at 0x{a:08x}"),
         RunStatus::Lockup { pc } => format!("Lockup at 0x{pc:08x}"),
         RunStatus::Bkpt { pc, imm } => format!("BKPT #{imm} at 0x{pc:08x}"),
+        RunStatus::Watchpoint { addr, dir, pc, .. } => {
+            format!(
+                "Watchpoint ({}) at 0x{addr:08x}, pc 0x{pc:08x}",
+                dir.as_str()
+            )
+        }
+        RunStatus::Goal { pc } => format!("Stopped at 0x{pc:08x}"),
         _ if paused => "Paused".to_owned(),
         RunStatus::Running => match speed {
             Some(p) => format!("Running \u{b7} {p}%"),
@@ -239,7 +177,7 @@ fn pointer_edge(resp: &Response, was_down: bool) -> PointerEdge {
 /// The emulator application.
 pub struct EvoApp {
     backend: Box<dyn EmuBackend>,
-    /// The thread provisioning the real backend; `backend` is an [`Away`] meanwhile.
+    /// The thread provisioning the real backend; `backend` is a [`Placeholder`] meanwhile.
     provisioning: Option<JoinHandle<ProvisionResult>>,
     data_dir: PathBuf,
     paused: bool,
@@ -343,16 +281,16 @@ impl EvoApp {
         self.provisioning.is_some()
     }
 
-    /// Moves the backend to a worker thread that provisions it; an [`Away`] stands in.
+    /// Moves the backend to a worker thread that provisions it; a [`Placeholder`] stands in.
     fn start_provision(&mut self) {
         if self.provisioning.is_some() {
             return;
         }
         self.resync();
-        let away = Box::new(Away {
-            name: self.backend.name().to_owned(),
-            tag: self.backend.state_tag(),
-        });
+        let away = Box::new(Placeholder::new(
+            self.backend.name(),
+            &self.backend.state_tag(),
+        ));
         let mut backend = std::mem::replace(&mut self.backend, away);
         let spawned = std::thread::Builder::new()
             .name("evo-provision".to_owned())
