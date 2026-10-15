@@ -371,3 +371,39 @@ clears 16 KiB instead of 1 KiB. The boot to the Self-Test screen flushes 13 time
 |---|---|---|
 | `boot_to_self_test`, thread CPU time | 167.5 M cycles/s | 172.1 M cycles/s (awake cycles unchanged) |
 | `busy_loop` | — | unchanged (two blocks) |
+
+### Round 2 result
+
+Branch point 4b00b45 against the final state. Thread CPU time is best of five alternating runs
+of both builds in one session. Wall time is the in-repo bench (`bench.rs`), first and last run
+of this round, with other builds on the host.
+
+| Benchmark | 4b00b45 | Final |
+|---|---|---|
+| `busy_loop`, thread CPU time | 57.8 M cycles/s (37 %) | 67.8 M cycles/s (43 %) |
+| `busy_loop`, in-repo bench (wall) | 48.0 M cycles/s | 60.9 M cycles/s (39 %) |
+| `boot_to_self_test`, thread CPU time | 146.0 M cycles/s | 174.5 M cycles/s (112 %) |
+| `boot_to_self_test`, in-repo bench (wall) | 127.1 M cycles/s | 148.5 M cycles/s (95 %), 52.6 M awake |
+| `boot_to_self_test`, code-epoch changes | 15 090 | 0 |
+
+The boot reaches the same awake-cycle count (138 149 424), the same milestone cycles and the
+same M3 and M4 screen hashes. Difftest (`DIFFTEST_CASES=2000`), the `tools/testprogs`
+programs and every milestone test pass, including the new `batching_is_invisible`.
+
+The target (156 M cycles/s on busy code) is not reached; busy code runs at about 43 % of real
+time. The OS boot is faster than real time because of the WFI skipping.
+
+What was tried and dropped, all measured with alternating runs:
+- A batch loop in `Machine` around `Cpu::step`: 20 % slower (step 15).
+- Inlining the SysTick enable check: +2 % on `busy_loop`, −4 % on the boot.
+- An always-inlined `advance`: neutral to −4 %.
+- `#[repr(align(8))]` / `align(16)` on `Instr`, and handing out the decoded instruction by
+  reference from the cache: all neutral.
+
+The samples that collect where the fetched instruction is first used (about a quarter of
+`busy_loop`) are the serial chain of the interpreter: PC, cache slot, decoded entry, dispatch,
+execute, the next PC. None of the above shortened it. Getting busy code to real time needs a
+structural change that breaks that chain: decoded basic blocks walked by index (the next
+entry's load no longer waits for the previous instruction's PC write), with the PC
+materialized only at block exits, exceptions and device accesses. This is a larger project
+than the levers of this round.
