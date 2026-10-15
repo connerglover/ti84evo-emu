@@ -71,3 +71,14 @@ behaviour are identical.
 | `read16` flash / `read32` SRAM / `write32` SRAM | 14.1 / 11.2 / 11.5 ns | 1.3 / 1.2 / 1.3 ns |
 | `Cpu::step` / `Machine::step` | 70.6 / 84.4 ns | 44.8 / 57.9 ns |
 | `busy_loop` | 13.4 M cycles/s | 16.5 M cycles/s (11 %) |
+
+### 2. Release profile: one codegen unit, fat LTO
+
+The interpreter's hot path crosses three crates (`armv8m` step, `evo-hw` memory map,
+`evo-core` machine loop); whole-program optimization lets it inline across them. Release builds
+take longer to link.
+
+| | Before | After |
+|---|---|---|
+| `Cpu::step` / `Machine::step` | 44.8 / 57.9 ns | 36.6 / 54.1 ns |
+| `busy_loop` | 16.5 M cycles/s | 23.0 M cycles/s (15 %) |
