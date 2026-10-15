@@ -953,3 +953,35 @@ fn all_keys_type_expected_text() {
     println!("keys: screens checked");
     assert!(bad.is_empty(), "keys that misbehave:\n{}", bad.join("\n"));
 }
+
+/// The selected tile's colour on OS 7.1.0.4421: image 1 picks RGB565 0x035E for it
+/// (`movwne r0, #0x35e` at 0x004C_14E6; `lcdc.md` "Colour order"), decoded through
+/// `Machine::screen` with the firmware's CONTROL (BGR = 1).
+const SELECTION_BLUE: [u8; 3] = [0, 105, 247];
+
+/// The colour order end to end: on the app launcher (after the M4 Self-Test exit) the selected
+/// tile is blue, as on hardware, and nothing on the screen is that colour with red and blue
+/// swapped (the orange of the old decode).
+#[test]
+fn launcher_selection_is_blue() {
+    let Some(mut os) = Os::boot() else {
+        return;
+    };
+    for (at, key) in [(ms(2500), "enter"), (ms(3100), "0")] {
+        let stop = os.tap_at(at, key);
+        assert_eq!(stop, StopReason::CycleLimit, "UART0:\n{}", os.uart_text());
+    }
+    let stop = os.run_until(LAUNCHER_CYCLES - os.m.sched.now, |_| false);
+    assert_eq!(stop, StopReason::CycleLimit, "UART0:\n{}", os.uart_text());
+    let frame = os.m.screen().expect("the LCD is on");
+    let px = frame.rgb.as_chunks::<3>().0;
+    let [r, g, b] = SELECTION_BLUE;
+    let blue = px.iter().filter(|&&p| p == SELECTION_BLUE).count();
+    let swapped = px.iter().filter(|&&p| p == [b, g, r]).count();
+    println!("launcher: {blue} selection-blue pixels, {swapped} swapped");
+    assert!(
+        blue >= 1000,
+        "the selected tile is not blue ({blue} pixels)"
+    );
+    assert_eq!(swapped, 0, "red and blue are swapped");
+}

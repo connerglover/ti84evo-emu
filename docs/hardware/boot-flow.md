@@ -348,7 +348,8 @@ the Read-ID probe no longer times out.
   `Lcdc::frame` orientation (`lcdc.md`). No image is committed; the test compares a SHA-256 of
   the decoded RGB bytes.
 - **The colour order is not confirmed by M3.** The logo and spinner are grey and the battery
-  bars are green (RGB 8,255,16 as decoded); none of them tells R from B apart.
+  bars are green; none of them tells R from B apart. The OS launcher settled it (`lcdc.md`
+  "Colour order").
 - **Input for M4 (Task 24).** The charging animation suggests the BSP treats this power-on as
   a charger wake-up (off-mode charging) rather than an ON-key boot: a lead for the launch gate
   of §5 item 8. Holding the ON key from power-on for 1 s (`--keys "+on wait=1000 -on"`) shows

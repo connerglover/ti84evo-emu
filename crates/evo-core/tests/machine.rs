@@ -1128,7 +1128,7 @@ fn lcdc_vcomp_irq_and_screen() {
     assert_eq!(m.cpu.regs.r[4], 0, "no VComp before the first frame");
     let f: evo_core::Frame = m.screen().expect("LCD on");
     assert_eq!((f.width, f.height), (320, 240));
-    assert_eq!(&f.rgb[..3], &[0, 0, 255]);
+    assert_eq!(&f.rgb[..3], &[255, 0, 0], "BGR = 1: 0xF800 is red");
     m.run(1_000_000);
     assert_eq!(
         m.cpu.regs.r[4], 1,
