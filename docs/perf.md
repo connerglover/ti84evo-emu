@@ -345,3 +345,16 @@ batch.
 |---|---|---|
 | `busy_loop`, thread CPU time | 59.3 M cycles/s | 65.6 M cycles/s (42 %) |
 | `boot_to_self_test`, thread CPU time | 158.0 M cycles/s | 166.4 M cycles/s (107 %; awake cycles unchanged) |
+
+### 16. Timer reads without 128-bit division
+
+The OS polls the TIMER block's counters, and every read computed the elapsed ticks as
+`elapsed * hz / CPU_HZ` in `u128`, a call to `__udivti3` (1.6 % of the boot). The product fits in
+64 bits for 2^48 cycles after a channel's time base (weeks of guest time), so `ticks`, `cur`
+and `latch` now work in `u64` and fall back to the exact 128-bit form only past that.
+`count_is_exact_past_64_bit_products` pins the count on both sides of the boundary.
+
+| | Before | After |
+|---|---|---|
+| `boot_to_self_test`, thread CPU time | 166.4 M cycles/s | 168.6 M cycles/s (awake cycles unchanged) |
+| `busy_loop` | — | unchanged (no timer reads) |

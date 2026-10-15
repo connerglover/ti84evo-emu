@@ -69,9 +69,20 @@ impl Timer {
     }
 
     /// Whole ticks of channel `n` between `since` and `now` (0 if `now` is before `since`).
-    fn ticks(&self, n: usize, now: u64) -> u128 {
+    ///
+    /// The tick clocks are slower than the CPU, so the result is at most `now - since`. In
+    /// 64 bits while `elapsed * hz` fits (2^48 cycles, weeks of guest time), which spares
+    /// every counter read a 128-bit division; exact in 128 bits beyond.
+    fn ticks(&self, n: usize, now: u64) -> u64 {
         let elapsed = now.saturating_sub(self.regs.ch[n].since);
-        u128::from(elapsed) * u128::from(self.hz(n)) / u128::from(CPU_HZ)
+        let hz = self.hz(n);
+        match elapsed.checked_mul(hz) {
+            Some(p) => p / CPU_HZ,
+            None => {
+                let t = u128::from(elapsed) * u128::from(hz) / u128::from(CPU_HZ);
+                u64::try_from(t).unwrap_or(u64::MAX)
+            }
+        }
     }
 
     /// The count channel `n` shows at `now`.
@@ -81,13 +92,13 @@ impl Timer {
             return c.value;
         }
         let ticks = self.ticks(n, now);
-        let value = u128::from(c.value);
+        let value = u64::from(c.value);
         if ticks <= value {
             // `ticks <= value <= u32::MAX`.
             (value - ticks) as u32
         } else {
             // Underflow reloads from LOAD: the period after the first underflow is LOAD + 1.
-            let period = u128::from(c.load) + 1;
+            let period = u64::from(c.load) + 1;
             let into = ((ticks - value - 1) % period) as u32;
             c.load - into
         }
@@ -102,12 +113,20 @@ impl Timer {
         }
         let ticks = self.ticks(n, now);
         let value = self.cur(n, now);
-        let hz = u128::from(self.hz(n));
-        let used = (ticks * u128::from(CPU_HZ)).div_ceil(hz);
+        let hz = self.hz(n);
+        // The cycles those whole ticks took (`ticks * CPU_HZ <= elapsed * hz`, so 64 bits
+        // suffice whenever `ticks` was computed in 64 bits).
+        let used = match ticks.checked_mul(CPU_HZ) {
+            Some(p) => p.div_ceil(hz),
+            None => {
+                let u = (u128::from(ticks) * u128::from(CPU_HZ)).div_ceil(u128::from(hz));
+                u64::try_from(u).unwrap_or(u64::MAX)
+            }
+        };
         let c = &mut self.regs.ch[n];
         // `used <= now - since` because `ticks` was rounded down; clamp anyway.
         let room = now.saturating_sub(c.since);
-        c.since += u64::try_from(used).unwrap_or(u64::MAX).min(room);
+        c.since += used.min(room);
         c.value = value;
     }
 

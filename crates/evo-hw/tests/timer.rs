@@ -192,6 +192,35 @@ fn unmodeled_offsets_and_widths_logged() {
     assert_eq!(h.log.len(), 6);
 }
 
+/// The count is exact on both sides of the point where `elapsed * 32768` leaves 64 bits.
+#[test]
+fn count_is_exact_past_64_bit_products() {
+    let expect = |now: u64| {
+        let ticks = u128::from(now) * 32_768 / 156_000_000;
+        // From 0xFFFF_FFFF with LOAD 0xFFFF_FFFF: one period is 2^32 ticks.
+        (0xFFFF_FFFFu128 - ticks % (1 << 32)) as u32
+    };
+    let boundary = u64::MAX / 32_768;
+    for now in [
+        boundary - 1,
+        boundary,
+        boundary + 1,
+        boundary * 3,
+        u64::MAX / 2,
+    ] {
+        let mut h = DevHarness::new();
+        let mut t = running_ch0(&mut h, 0xFFFF_FFFF, 0xFFFF_FFFF);
+        h.now = now;
+        assert_eq!(h.read(&mut t, VALUE0, 4), expect(now), "at {now}");
+        // Latching (a CTRL write) keeps the count and carries the part tick.
+        h.write(&mut t, CTRL, 4, CH0_EN_32K);
+        assert_eq!(h.read(&mut t, VALUE0, 4), expect(now), "latched at {now}");
+        h.now = now + 4_761;
+        let next = expect(now + 4_761);
+        assert_eq!(h.read(&mut t, VALUE0, 4), next, "a tick after {now}");
+    }
+}
+
 #[test]
 fn no_overflow_at_u64_scale() {
     let mut h = DevHarness::new();
