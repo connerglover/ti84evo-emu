@@ -89,9 +89,14 @@ impl Default for Spif {
     }
 }
 
-/// The flash bytes, or an empty slice when the map has no flash buffer (unmapped: reads 0xFF,
-/// writes dropped; `Spif::start` warns).
-fn flash<'c>(ctx: &'c mut DevCtx<'_>) -> &'c mut [u8] {
+/// The flash bytes for a NOR operation that `changes` them, or an empty slice when the map has
+/// no flash buffer (unmapped: reads 0xFF, writes dropped; `Spif::start` warns). An operation
+/// that changes nothing gets an empty slice too: borrowing the buffer for writing tells the map
+/// it changed, which makes the CPU decode all cached code again.
+fn flash<'c>(ctx: &'c mut DevCtx<'_>, changes: bool) -> &'c mut [u8] {
+    if !changes {
+        return &mut [];
+    }
     ctx.buffer_mut(FLASH_BUFFER).unwrap_or(&mut [])
 }
 
@@ -146,7 +151,8 @@ impl Spif {
         if touches_array(op) && ctx.buffer(FLASH_BUFFER).is_none() {
             log::warn!("spif: op {op:#04x} without a flash buffer: reads 0xFF, writes dropped");
         }
-        let kind = self.nor.begin(op, addr, self.regs.len, flash(ctx));
+        let changes = self.nor.begin_changes_array(op);
+        let kind = self.nor.begin(op, addr, self.regs.len, flash(ctx, changes));
         self.kind = kind;
         // DONE means "transfer finished": at once unless data is still to be written.
         self.regs.done = kind != DataPhase::Write;
@@ -170,7 +176,8 @@ impl Spif {
             if self.left(DataPhase::Write) == 0 {
                 return;
             }
-            if self.nor.write_byte((v >> (8 * i)) as u8, flash(ctx)) {
+            let changes = self.nor.write_changes_array();
+            if self.nor.write_byte((v >> (8 * i)) as u8, flash(ctx, changes)) {
                 self.regs.done = true;
             }
         }

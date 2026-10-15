@@ -270,3 +270,21 @@ without updating the hints. They are `pub(crate)` now: the NVIC words change thr
 `Nvic::set_enabled` (new) / `set_pending` / `write`, the SAU through the CPU (`Cpu::ppb_write32`
 or a guest store), and `Sau::ctrl()` / `Sau::region(r)` read them. Compile-fail doc tests pin
 both. No throughput change (nothing outside the crate used them).
+
+### 13. SPIF commands that only read the flash leave cached code alone
+
+Starting any SPIF command borrowed the flash buffer for writing (`DevCtx::buffer_mut`), and
+every such borrow starts a new code epoch: the OS's flash reads through the SPIF FIFO threw away
+every decoded instruction. `NorFlash::begin_changes_array` (an erase with WEL set) and
+`NorFlash::write_changes_array` (program data with WEL set) now say when the array can change;
+only then does `Spif` borrow it for writing, and every other command gets an empty slice, which
+the NOR engine never touches for them.
+
+From here on, before/after rows come from alternating runs of the two builds (best of five
+each), because the host's load moves absolute numbers by ±15 % between sessions.
+
+| | Before | After |
+|---|---|---|
+| `boot_to_self_test`, code-epoch changes | 15 090 | 12 253 |
+| `boot_to_self_test`, thread CPU time | 139.4 M cycles/s | 141.0 M cycles/s (awake cycles unchanged) |
+| `busy_loop`, thread CPU time | 53.8 M cycles/s | 53.9 M cycles/s |

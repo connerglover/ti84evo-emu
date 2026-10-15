@@ -115,6 +115,23 @@ impl NorFlash {
         self.sr1 &= !WEL;
     }
 
+    /// Whether [`begin`](Self::begin) of `op` would change the flash array now: an erase with
+    /// the write-enable latch set. For any other command `begin` leaves `flash` alone (an
+    /// empty slice does), so the caller need not borrow the array for writing.
+    pub fn begin_changes_array(&self, op: u8) -> bool {
+        self.wel() && matches!(op, 0x20 | 0x52 | 0xD8 | 0xC7 | 0x60)
+    }
+
+    /// Whether the next [`write_byte`](Self::write_byte) would change the flash array: a page
+    /// program phase is open and the write-enable latch is set. Otherwise `write_byte` leaves
+    /// `flash` alone (an empty slice does).
+    pub fn write_changes_array(&self) -> bool {
+        self.wel()
+            && self
+                .phase
+                .is_some_and(|p| p.kind == DataPhase::Write && matches!(p.op, 0x02 | 0x32))
+    }
+
     /// Starts command `op` at `addr` with a data length of `len` bytes, aborting any open phase.
     /// Non-data commands (erase, WEL, unknown ops) take effect at once and return
     /// [`DataPhase::None`].
