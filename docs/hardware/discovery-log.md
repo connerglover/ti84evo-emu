@@ -35,6 +35,30 @@ otherwise. No TI code is reproduced beyond the short disassembly excerpts below.
   Arm's SSE-200-style secure infrastructure (SIE-200 MPCs, an SPCTRL-like block) plus
   third-party IP.
 
+## Corrections from Plan 2 research
+
+The Plan 2 research (the per-block docs in this folder) corrects these first guesses. The
+log below is kept as it was written.
+
+- **The SPI master uses 9-bit frames, not 16.** 3-wire SPI to the panel's ST7789V-class
+  driver IC, bit 8 = D/C, mode 3, 1 MHz (`spi-panel.md`). CTRL1 = 0x0008_0012.
+- **CRU +0x10 bit 30 is a chip-variant bit, not a status flag.** It selects the revision 9
+  vs 10 path; nothing waits on it (`security.md` §3).
+- **0x4010_5000 is the GPIO controller** (13 pins, IRQ 24), not a display or DMA helper
+  (`gpio.md`). Its configuration word (0x100B_7BC0) merely sits next to the LCDC's
+  (0x100B_7BC4); the secure `panel_on` does use GPIO pin 2 as the panel reset.
+- **The 0x00CF_0000 reads were an artifact of the 8 MiB flash.** They are a blank check of a
+  one-shot mailbox: with the space unmapped it read 0, looked "not blank", and the
+  `Restored Saved Data.` path ran. With 16 MiB of erased flash it reads 0xFF and nothing
+  happens (`spif-nor.md` §6.3).
+- **ITS/PS live at 0x0009_0000–0x000A_FFFF** (PS 0x0009_0000–0x000A_BFFF, ITS
+  0x000A_C000–0x000A_FFFF), below the secure slot, written through the SPIF and read
+  through the XIP window (`boot-flow.md` §2). The answer to `memory-map.md` Q2 at the end of
+  this log is superseded accordingly.
+- Also: 0x4010_4000 is the backlight PWM, whose reset is CRU +0x20 bit 4 (`lcdc.md`); flash
+  is 16 MiB and SRAM 1.5 MiB (`memory-map.md`); VTOR_NS is 0x0010_0400, the NS BSP's vector
+  table (`boot-flow.md` §2).
+
 ## Unmapped accesses (first boot)
 
 `evo-cli run "$EVO_OS_IMAGE" --max-cycles 50000000 --unmapped-out <file>`:
@@ -254,7 +278,7 @@ that block is clock, security and MPC control.
 To see what Plan 2 will meet next, the boot was pushed further in two ways:
 
 - GDB (`evo-cli run --gdb`) changed the BLK_CFG/BLK_MAX values in registers.
-- A scratch harness outside the repository added dumb register fakes to `Machine::bus`.
+- A throwaway emulator build with register fakes on `Machine::bus`.
 
 Neither is committed. In order, the boot met these blockers:
 
@@ -283,7 +307,7 @@ Neither is committed. In order, the boot met these blockers:
    Booting TF-M v2.1.1_co2_v1.00
    [Sec Thread] Secure image initializing!
    TF-M isolation level is:  0x00000001
-   Update / TRNG / Power / SCRATCH / Data / Boot / PTT Partition initializing
+   Update / TRNG / Power / ... / Data / Boot / PTT Partition initializing
    [INF][PS] Encryption alg: 0x5500100
    Creating an empty ITS flash layout.
    ```
@@ -376,6 +400,90 @@ What is known about the SoC:
 - SHA and TRNG.
 
 That points to a custom ASIC that licenses Arm's SSE-200 secure infrastructure.
+
+## Post-logo stall (Task 24)
+
+**Result: resolved.** OS image 1 is entered at 0x0044_BC90 at cycle 656,271,393 of a fresh
+power-on (`m4_image1_launches`). Five gates stood between the logo and the launch; four were
+emulator bugs or missing board facts, one is the unit's factory state.
+
+**Baseline.** With the Plan 2 devices the BSP no longer idles silently: by 253 M cycles it
+draws a charging animation (`boot-flow.md` "M3 notes") and never reaches 0x0015_2BA8
+("Validating OS...") or 0x0044_BC90 within 3,000 M cycles.
+
+**What the BSP waits on (Step 2).** The BSP's control logic is three table-driven state
+machines run by one engine (thread body 0x001664d0: wait on the machine's message queue,
+look up `transitions[state][event]`, call the new state's handler). Each machine is a struct
+in SRAM: name, event count, state count, the state table (flash), state and event name
+tables, its thread and queue, current state at +0x44, previous at +0x48.
+
+| machine | struct | states (index: name) |
+|---|---|---|
+| LAUNCH | 0x2001_02B8 | 0 Battery Check, 1 Initialize, 2 Battery Good, 3 Selftest, 4 OS, 5 OS Exit, 6 Low Battery, 7 Charging, 8 Waiting Install, ... |
+| POWER | 0x2001_0318 | 0 Off, 1 Check State, 2 Running, 3 Charging, 4 Run Update, 5 Charge Update, 6 Polling |
+| CHARGE | 0x2001_01B8 | USB charger states |
+
+The research note "LAUNCH thread 0x0015_1A55, TCB 0x2004_4DC0" was a misreading:
+0x2004_4DC0 is an RTX timer named "Animation" (750 ms period) whose callback 0x0015_1A54
+posts event 6 to the LAUNCH queue while the animation flag is set. The LAUNCH *thread*
+(entry 0x001664d1) was never stuck: it waits on its own queue (RTX state 0x83, waiting for
+a message) because the machine had settled in state 7, Charging.
+
+Event trace of the stall (LAUNCH events: 0 Initialize, 1 Selftest, 2 OS, 3 OS Missing,
+4 OS Exit, 5 Install, 6 Return, 7 Battery Critical, 8 Battery Charging, 9 Battery Good):
+LAUNCH 0 → 1 (BSP init), POWER "On" → Check State, POWER "Charge" → Charging, LAUNCH
+"Return" → Battery Check, LAUNCH "Battery Charging" → 7. The event comes from POWER's
+Check State handler (0x00152eb4).
+
+**The gates, in the order the boot meets them** (a throwaway emulator build with register
+fakes found each one; the fix is a model change with its own test):
+
+1. **GPIO pin 9 (charger status) read low** → "Battery Charging". Check State reads pin 9
+   (0x001147d4) and treats low as charger present. Fix: the board drives pin 9 high
+   (`gpio.md`). Experiment 3 of the plan.
+2. **GPIO pin 11 (battery comparator) read low** → "Battery Critical", state 6 Low Battery.
+   Check State sets a 3-bit threshold on pins 5/7/12 and samples pin 11 at each level
+   (0x00152f06..). Fix: the board drives pin 11 high (`gpio.md`). With 1 and 2 the machine
+   reaches Battery Good and then posts Selftest (gate 5) or OS.
+3. **Product ID.** In state OS the BSP calls secure service 0x4000_0107 type 0
+   (0x00114108), which validates image 1 like MCUboot (hash TLV 0x10, RSA-3072 key/signature
+   TLVs 0x01/0x23, security counter 0x50 against NV counter 3) plus a TI TLV 0xA0 = product
+   ID 1, compared with the hardware product ID taken from CRU +0x10[29:25]. Status 1 made
+   the BSP throw 0x13 (0x00105e44) → OS Exit → OS Missing → "Install OS & Apps". Fix: CRU
+   strap = 1 (`security.md`).
+4. **SHA-256 engine.** The image hash did not match: the model loaded the IV on CTRL bit 2
+   set, the firmware means "continue" (`crypto.md`). Fix in `evo-hw`.
+5. **Image placement.** With a valid image the service returned status 2: it walks image
+   1's protected TLVs 0xB1..0xB8 (payload addresses of images 2..9) and requires an MCUboot
+   header 0x40 bytes before each. `Layout::place` now places images 2.. at `ns_slot_base` +
+   their package distance from image 1 (`evo-image`).
+6. **Factory state (not a bug).** The BSP init (0x0015d488..0x0015d4a0) starts the
+   diagnostic app instead of the OS when ITS UID 0x1F61E867_8CE70001 ("boot to OS") is
+   missing or 0, or when UID ..0004 (diagnostic-menu request) is nonzero. A fresh emulated
+   unit has an empty ITS, so it boots into the Self-Test app; its menu item "0. Exit this
+   menu" launches the OS once (the next power-on returns to Self-Test). The firmware sets
+   UID ..0001 itself after an OS install (probably: reset reason 8 in the retained record at
+   0x2017_DDD0, 0x0014f786) or when all ten self-tests pass (0x00109520, which also writes
+   UID ..0004 = 0); the Engineering menu's "Self Test" item toggles it (case 8 of
+   0x0015dafc). `m4_image1_launches` uses the Exit item: ENTER at 2.5 s, 0 at 3.1 s.
+
+**Hypotheses of the plan, and what became of them.**
+
+| # | hypothesis | outcome |
+|---|---|---|
+| 1 | LCDC VComp, IRQ 14 runs once | refuted as the gate: the IRQ 14 handler (0x0010e2d0) runs 86 times in the first 300 M cycles (once per 16.7 ms frame from 78 M on), so the LCDC model already re-arms; the BSP was waiting for a battery state |
+| 2 | flash offset 0 MCUboot header for service 0x106 type 0xD | not needed: still returns -132 and the OS launches; open |
+| 3 | GPIO pins 9 and 11 high | **confirmed** (gates 1 and 2) |
+| 4 | ON key / keypad 2 s after the logo | refuted as the gate (`wait=2000 on` and a 1.5 s ON hold leave the machine in Charging); a keypad press is needed later, for the Self-Test menu (gate 6) |
+| 5 | USB Type-C attach | not tried: refuted indirectly, the launch needs no cable |
+| 6 | RTC busy/status bits | not needed |
+
+**Unmodelled accesses at the launch.** None new: `m4_image1_launches` logs no unmapped
+access in the 500 M cycles after the OS entry, and UART0 prints nothing after
+`Starting BSP 7.1.0.4413`. With correct digests the secure image's key-source reads moved
+inside the unmapped OTP page 0x1800_E000 (16 bytes at 0x1800_E03C and at 0x1800_E0F4), so
+the milestone tests now accept that whole 4 KiB page. By 7.9 s of guest time the screen shows the OS home screen (the
+"CALCULATOR" app grid).
 
 ## Plan 2 starting points
 

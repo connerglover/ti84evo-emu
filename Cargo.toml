@@ -18,3 +18,4 @@ eframe = { version = "0.36.2", features = ["persistence"] }
 egui = { version = "0.36.2", features = ["serde"] }
 egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu", "snapshot"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }

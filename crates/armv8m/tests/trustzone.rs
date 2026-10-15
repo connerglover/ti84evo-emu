@@ -1110,6 +1110,44 @@ fn reset_keeps_installed_idau() {
     assert_eq!(cpu.security_of(0x1000_0000), Attr::NonSecure, "IDAU kept");
 }
 
+#[test]
+fn restore_from_keeps_idau() {
+    // Makes everything Non-secure; `DefaultIdau` makes 0x1000_0000 Non-secure callable.
+    struct AllNs;
+    impl Idau for AllNs {
+        fn attr(&self, _addr: u32) -> Option<(Attr, Option<u8>)> {
+            Some((Attr::NonSecure, None))
+        }
+    }
+    const SAU_ALLNS: u32 = 1 << 1;
+    let (mut cpu, _bus) = tz();
+    cpu.set_idau(Box::new(AllNs));
+    cpu.ppb_write32(SAU_CTRL, SAU_ALLNS);
+    let before = (cpu.security_of(0x6000_0000), cpu.security_of(0x1000_0000));
+    assert_eq!(before, (Attr::NonSecure, Attr::NonSecure));
+
+    // A saved CPU (as a save state decodes it: with the default IDAU) whose SAU leaves the
+    // attribution to the IDAU, like the one above.
+    let mut saved = Cpu::new();
+    saved.ppb_write32(SAU_CTRL, SAU_ALLNS);
+    saved.regs.r[7] = 0x1234_5678;
+    assert_eq!(saved.security_of(0x1000_0000), Attr::NonSecureCallable);
+    cpu.restore_from(saved);
+    assert_eq!(cpu.regs.r[7], 0x1234_5678, "state replaced");
+    assert_eq!(
+        (cpu.security_of(0x6000_0000), cpu.security_of(0x1000_0000)),
+        before,
+        "IDAU kept"
+    );
+
+    // A fresh CPU state replaces the SAU too, but the IDAU stays.
+    cpu.restore_from(Cpu::new());
+    assert_eq!(cpu.ppb_read32(SAU_CTRL), 0);
+    cpu.ppb_write32(SAU_CTRL, SAU_ALLNS);
+    assert_eq!(cpu.security_of(0x6000_0000), Attr::NonSecure);
+    assert_eq!(cpu.security_of(0x1000_0000), Attr::NonSecure, "IDAU kept");
+}
+
 // ---- Review fix round 1 ----
 
 #[test]

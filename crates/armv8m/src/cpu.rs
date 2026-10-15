@@ -9,9 +9,9 @@ use crate::exception::{ENTRY_CYCLES, Fault, ReturnOutcome, SVCALL};
 use crate::exec::{self, Flow};
 use crate::instr::Instr;
 use crate::regs::{Registers, Sec};
-use crate::scs::Scs;
 use crate::scs::sau::{Attr, Idau, IdauHandle, SecAttr};
 use crate::scs::scb::CCR_STKOFHFNMIGN;
+use crate::scs::{PpbMiss, Scs};
 
 /// Outcome of one `Cpu::step`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +54,10 @@ pub struct Cpu {
     /// it into a STKOF UsageFault. Only meaningful within one instruction.
     #[serde(skip)]
     pub(crate) sp_violation: bool,
+    /// Guest data accesses to unimplemented internal PPB registers, drained by
+    /// `take_ppb_misses` (diagnostics only: not serialized).
+    #[serde(skip)]
+    pub(crate) ppb_misses: Vec<PpbMiss>,
     /// The SoC's attribution unit (configuration: kept across reset, not serialized).
     #[serde(skip)]
     idau: IdauHandle,
@@ -130,6 +134,7 @@ impl Cpu {
             scs: Scs::default(),
             lockup: None,
             sp_violation: false,
+            ppb_misses: Vec::new(),
             idau: IdauHandle::default(),
         }
     }
@@ -150,6 +155,15 @@ impl Cpu {
             self.regs.pc = pc & !1;
             self.regs.xpsr.t = pc & 1 != 0;
         }
+    }
+
+    /// Replace all processor state with `saved` (e.g. a `Cpu` decoded from a save state, which
+    /// carries the default IDAU), keeping the IDAU installed in `self`: the IDAU is the SoC's
+    /// configuration, not state.
+    pub fn restore_from(&mut self, saved: Cpu) {
+        let idau = std::mem::take(&mut self.idau);
+        *self = saved;
+        self.idau = idau;
     }
 
     /// Install the SoC's IDAU (default: `DefaultIdau`, address bit 28 set is Secure).

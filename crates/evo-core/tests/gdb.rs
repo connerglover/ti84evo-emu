@@ -421,13 +421,13 @@ fn oversized_or_wrapping_memory_access_is_refused() {
             assert_eq!(c.cmd(packet), "E01", "{packet}");
         }
         assert_eq!(
-            c.cmd("m30000000,4"),
+            c.cmd("m30001000,4"),
             "00000000",
             "a canonical read still works"
         );
         // GDB's own largest read (PacketSize / 2 bytes) and reads up to the top of memory
         // are served.
-        assert_eq!(c.cmd("m30000000,800"), "0".repeat(0x1000));
+        assert_eq!(c.cmd("m30001000,800"), "0".repeat(0x1000));
         assert_eq!(c.cmd("mfffffffe,2"), "0000");
         assert_eq!(
             c.cmd("Mfffffffe,2:0102").chars().next(),
@@ -564,7 +564,7 @@ fn memory_access_has_no_side_effects() {
         assert_eq!(c.cmd("Me000e014,4:63000000"), "OK", "PPB words");
         assert!(c.cmd("M50000000,4:00000000").starts_with('E'), "unmapped");
         assert!(
-            c.cmd("M201ffffe,4:01020304").starts_with('E'),
+            c.cmd("M2017fffe,4:01020304").starts_with('E'),
             "partly unmapped"
         );
         assert!(c.cmd("Me000e014,1:00").starts_with('E'), "PPB: words only");
@@ -577,7 +577,7 @@ fn memory_access_has_no_side_effects() {
     assert_eq!(m.bus.peek(0x3000_0100, 4), Some(0xDEAD_BEEF));
     assert_eq!(m.bus.peek(code, 2), Some(0xBF00));
     assert_eq!(
-        m.bus.peek(0x201F_FFFE, 2),
+        m.bus.peek(0x2017_FFFE, 2),
         Some(0),
         "a refused write writes nothing"
     );

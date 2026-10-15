@@ -17,5 +17,5 @@ pub use decode::{decode16, decode32};
 pub use disasm::disasm;
 pub use instr::Instr;
 pub use regs::{Banked, Registers, Sec, Xpsr};
-pub use scs::Scs;
 pub use scs::sau::{Attr, DefaultIdau, Idau};
+pub use scs::{PpbMiss, Scs};

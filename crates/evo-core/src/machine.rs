@@ -1,8 +1,19 @@
 //! The emulated TI-84 Evo: CPU, memory map and scheduler, booted from an OS bundle.
 //!
-//! The memory map is provisional (refined in Plan 2): 8 MiB of flash at `FLASH_NS` and
-//! `FLASH_S`, 2 MiB of SRAM at `SRAM_NS` and `SRAM_S`, and everything else unmapped and logged
-//! (see `docs/hardware/memory-map.md`).
+//! The memory map: 16 MiB of flash at `FLASH_NS` and `FLASH_S`, 1.5 MiB of SRAM at `SRAM_NS`
+//! and `SRAM_S`, the SoC's devices ([`evo_hw::soc::attach`]), and everything else unmapped and
+//! logged (see `docs/hardware/memory-map.md`). At power-on and on every system reset the
+//! machine writes the BL2 shared-data header ([`BL2_SHARED_HEADER`] at [`BL2_SHARED_DATA`]),
+//! as the boot ROM's BL2 stage does on the real calculator.
+//!
+//! # Devices
+//!
+//! The machine connects the devices to the CPU and the scheduler (`sync_bus`) after every CPU
+//! step and after every fired event: IRQ line levels go to the NVIC (a line still high after a
+//! system reset pends again), pulses pend once, event requests become
+//! [`EventKind::Peripheral`] events, and the CPU's unimplemented PPB accesses go to the
+//! unmapped log. Devices see `sched.now` as `ctx.now`. Host APIs reach a device only through
+//! `Machine::with_dev`, which does the same around the call.
 //!
 //! # Time
 //!
@@ -26,30 +37,46 @@
 //! The machine remembers the last [`RECENT_STEPS`] CPU steps (cycle count, security state and
 //! PC; three stores per step) and formats them only when asked
 //! ([`Machine::recent_trace`]), e.g. to show how the guest reached a lockup.
+//!
+//! # Save states
+//!
+//! [`Machine::save_state`] / [`Machine::load_state`] (in [`crate::state`]): CPU, scheduler,
+//! SRAM, devices and the unmapped log, tied to the bundle the machine booted. Flash and the
+//! NOR security registers are not in a save state; they persist in the flash file.
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
 use armv8m::decode::is_32bit;
 use armv8m::{Cpu, Sec, SleepKind, StepResult, decode16, decode32, disasm};
-use evo_hw::MemoryMap;
+use evo_hw::dev::spif::Spif;
+use evo_hw::nor::{NvState, SECREGS_LEN};
+use evo_hw::soc::{self, FLASH_BUFFER, SRAM_BUFFER};
+use evo_hw::{DevCtx, Device, MemoryMap, ResetKind, UnmappedAccess, UnmappedKind};
 use evo_image::{Bundle, ImageError, Layout};
 use serde::{Deserialize, Serialize};
 
-use crate::{EventKind, Scheduler};
+use crate::{EventKind, Scheduler, state};
 
-/// Size of the flash. It holds both OS images of `Layout::EVO_7_1`.
-pub const FLASH_SIZE: u32 = 8 << 20;
+pub use evo_hw::CPU_HZ;
+
+/// Size of the flash (erased to 0xFF). It holds both OS images of `Layout::EVO_7_1`.
+pub const FLASH_SIZE: u32 = 16 << 20;
 /// Non-secure alias of flash; flash offsets are addresses in this alias.
 pub const FLASH_NS: u32 = 0x0000_0000;
 /// Secure alias of flash.
 pub const FLASH_S: u32 = 0x1000_0000;
-/// Size of the SRAM.
-pub const SRAM_SIZE: u32 = 2 << 20;
+/// Size of the SRAM: 1.5 MiB = 3 x 512 KiB.
+pub const SRAM_SIZE: u32 = 0x0018_0000;
 /// Non-secure alias of SRAM.
 pub const SRAM_NS: u32 = 0x2000_0000;
 /// Secure alias of SRAM.
 pub const SRAM_S: u32 = 0x3000_0000;
+/// Where BL2 leaves its shared data for the secure image (start of Secure SRAM).
+pub const BL2_SHARED_DATA: u32 = 0x3000_0000;
+/// The shared-data header the machine writes at [`BL2_SHARED_DATA`]: u16 magic 0x2016, u16
+/// total length 4 (no entries).
+pub const BL2_SHARED_HEADER: u32 = 0x0004_2016;
 /// Erased NOR flash reads as all ones.
 const ERASED: u8 = 0xFF;
 /// CPU steps [`Machine::recent_trace`] remembers.
@@ -65,7 +92,7 @@ struct RecentStep {
 
 /// Ring buffer of the last [`RECENT_STEPS`] CPU steps.
 #[derive(Default)]
-struct RecentSteps {
+pub(crate) struct RecentSteps {
     /// Up to `RECENT_STEPS` entries; once full, `next` is the oldest.
     steps: Vec<RecentStep>,
     /// Where the next step is written once `steps` is full.
@@ -115,6 +142,13 @@ pub enum StopReason {
     Bkpt { pc: u32, imm: u8 },
 }
 
+/// GPIO inputs the board drives high at power-on (`docs/hardware/gpio.md`, "Pin roles"):
+/// pin 9, the charger status line (high = no charger or USB power; low makes the BSP show its
+/// charging animation instead of launching the OS), and pin 11, the battery comparator (high
+/// = the battery is above the threshold the BSP sets on pins 5/7/12; low reads as a critical
+/// battery). `Machine::set_gpio_input` changes them.
+pub const BOARD_INPUTS_HIGH: [u8; 2] = [9, 11];
+
 /// The whole emulated calculator.
 #[derive(Serialize, Deserialize)]
 pub struct Machine {
@@ -126,44 +160,70 @@ pub struct Machine {
     /// System resets performed (AIRCR.SYSRESETREQ) since boot.
     pub resets: u64,
     /// `VTOR_S` at boot, reloaded by every system reset.
-    boot_vtor: u32,
+    pub(crate) boot_vtor: u32,
     /// Set while the CPU sleeps, with what put it to sleep.
-    sleep: Option<SleepKind>,
+    pub(crate) sleep: Option<SleepKind>,
     /// The breakpoint the last `run` stopped at, which the next `run` steps over.
-    stopped_at: Option<u32>,
+    pub(crate) stopped_at: Option<u32>,
+    /// The device IRQ lines (`bus.irq_lines()`) last passed to the NVIC.
+    #[serde(default)]
+    pub(crate) applied_irqs: u64,
     /// Debugging aid, not machine state: not saved, and empty after a restore.
     #[serde(skip)]
-    recent: RecentSteps,
+    pub(crate) recent: RecentSteps,
+    /// Fingerprint of the OS this machine booted (`state::bundle_id`); a save state carries
+    /// it and loads only on a machine with the same one.
+    #[serde(default)]
+    pub(crate) bundle_id: [u8; 32],
 }
 
 impl Machine {
-    /// Build the memory map, program `b`'s images into flash per `layout` and reset the CPU
-    /// into the secure image: `VTOR_S` = Secure alias of image 0's slot plus its header size.
+    /// Build the memory map, program `b`'s images into an erased flash per `layout` and reset
+    /// the CPU into the secure image: `VTOR_S` = Secure alias of image 0's slot plus its header
+    /// size. Same as [`from_bundle_nv`](Self::from_bundle_nv) with no saved state.
     ///
     /// Images are placed before the map is built, so an image that does not fit in flash is an
     /// [`ImageError::DoesNotFit`], never a panic.
     pub fn from_bundle(b: &Bundle, layout: &Layout) -> Result<Self, ImageError> {
+        Self::from_bundle_nv(b, layout, None)
+    }
+
+    /// [`from_bundle`](Self::from_bundle), starting from `nv` (flash bytes and NOR security
+    /// registers, e.g. read from a flash file) instead of an erased part. The bundle's images
+    /// are placed over that flash, so in their slots they always win over the saved bytes;
+    /// everything outside the slots (e.g. ITS/PS at 0x0009_0000) is kept.
+    pub fn from_bundle_nv(
+        b: &Bundle,
+        layout: &Layout,
+        nv: Option<NvState>,
+    ) -> Result<Self, ImageError> {
         let pkg = &b.package;
         // `Package::parse` never yields an empty package, but its fields are public.
         let secure = pkg
             .images
             .first()
             .ok_or(ImageError::BadMagic { offset: 0 })?;
-        let mut flash = vec![ERASED; FLASH_SIZE as usize];
+        // An `NvState` always holds `NOR_SIZE` (= `FLASH_SIZE`) flash bytes.
+        let mut flash = nv.as_ref().map_or_else(
+            || vec![ERASED; FLASH_SIZE as usize],
+            |nv| nv.flash().to_vec(),
+        );
         layout.place(pkg, &mut flash, FLASH_NS)?;
-        // `place` succeeded, so the slot and its header lie inside the 8 MiB flash.
+        // `place` succeeded, so the slot and its header lie inside the 16 MiB flash.
         let vtor = FLASH_S | (layout.secure_slot_base + u32::from(secure.header_size));
         if vtor & 0x7F != 0 {
             log::warn!("vector table {vtor:#010x} is not 128-byte aligned; VTOR ignores bits 6:0");
         }
 
         let mut bus = MemoryMap::new();
-        bus.add_rom("flash", flash, &[FLASH_NS, FLASH_S]);
-        bus.add_ram("sram", SRAM_SIZE, &[SRAM_NS, SRAM_S]);
+        bus.add_rom(FLASH_BUFFER, flash, &[FLASH_NS, FLASH_S]);
+        bus.add_ram(SRAM_BUFFER, SRAM_SIZE, &[SRAM_NS, SRAM_S]);
+        soc::attach(&mut bus);
+        write_bl2_header(&mut bus);
         let mut cpu = Cpu::new();
         cpu.set_vtor(Sec::Secure, vtor);
         cpu.reset(&mut bus);
-        Ok(Self {
+        let mut m = Self {
             cpu,
             bus,
             sched: Scheduler::new(),
@@ -172,8 +232,97 @@ impl Machine {
             boot_vtor: vtor,
             sleep: None,
             stopped_at: None,
+            applied_irqs: 0,
             recent: RecentSteps::default(),
+            bundle_id: state::bundle_id(&pkg.bytes, layout.secure_slot_base, layout.ns_slot_base),
+        };
+        if let Some(nv) = &nv {
+            m.with_dev("spif", |s: &mut Spif, _| {
+                s.nor_mut().set_secregs(nv.secregs())
+            });
+        }
+        for pin in BOARD_INPUTS_HIGH {
+            m.set_gpio_input(pin, Some(true));
+        }
+        Ok(m)
+    }
+
+    /// The non-volatile state now, as a flash file stores it: the flash bytes and the SPIF NOR
+    /// part's security registers. Security registers the part does not hold (it has none
+    /// after a save-state restore until they are set again) read as erased.
+    pub fn nv_state(&self) -> NvState {
+        let mut flash = self
+            .bus
+            .region_bytes(FLASH_BUFFER)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default();
+        // The map always holds `FLASH_SIZE` bytes of flash; this only keeps `new` infallible.
+        flash.resize(FLASH_SIZE as usize, ERASED);
+        let secregs = self
+            .bus
+            .device::<Spif>("spif")
+            .map(|s| s.nor().secregs())
+            .filter(|r| r.len() == SECREGS_LEN)
+            .map_or_else(|| vec![ERASED; SECREGS_LEN], <[u8]>::to_vec);
+        NvState::new(flash, secregs).unwrap_or_else(|e| {
+            // Unreachable: both lengths are fixed above.
+            log::error!("nv_state: {e}");
+            NvState::erased()
         })
+    }
+
+    /// Run `f` on the device called `name`, if it is a `T`: the only way host APIs reach a
+    /// device. The device sees the current time, and whatever it changes (IRQ lines, pulses,
+    /// events) reaches the CPU and the scheduler before this returns.
+    pub(crate) fn with_dev<T: Device, R>(
+        &mut self,
+        name: &str,
+        f: impl FnOnce(&mut T, &mut DevCtx<'_>) -> R,
+    ) -> Option<R> {
+        self.bus.now = self.sched.now;
+        let r = self.bus.with_device(name, f);
+        self.sync_bus();
+        r
+    }
+
+    /// Pass what the devices and the CPU queued since the last call on: (1) IRQ line changes
+    /// to the NVIC, (2) pulses, (3) event requests to the scheduler, (4) the CPU's
+    /// unimplemented PPB accesses to the unmapped log.
+    fn sync_bus(&mut self) {
+        let lines = self.bus.irq_lines();
+        let mut changed = lines ^ self.applied_irqs;
+        while changed != 0 {
+            let bit = changed.trailing_zeros();
+            changed &= changed - 1;
+            // `bit < 64`, so it fits.
+            self.cpu.set_irq_level(bit as u16, lines & (1 << bit) != 0);
+        }
+        self.applied_irqs = lines;
+        for irq in self.bus.take_pulses() {
+            self.cpu.pulse_irq(irq);
+        }
+        for (id, at) in self.bus.take_event_requests() {
+            let kind = EventKind::Peripheral(id);
+            match at {
+                Some(at) => self.sched.schedule(at, kind),
+                None => self.sched.cancel(kind),
+            }
+        }
+        for miss in self.cpu.take_ppb_misses() {
+            let kind = if miss.write.is_some() {
+                UnmappedKind::Write
+            } else {
+                UnmappedKind::Read
+            };
+            self.bus.log.record(UnmappedAccess {
+                addr: miss.addr,
+                width: miss.width,
+                write: miss.write,
+                kind,
+                pc: self.bus.pc_hint,
+                secure: miss.secure,
+            });
+        }
     }
 
     /// True while the CPU sleeps in WFI/WFE, waiting for an exception (or, after WFE, an
@@ -304,7 +453,10 @@ impl Machine {
             secure: self.cpu.regs.sec == Sec::Secure,
         });
         self.bus.pc_hint = pc;
-        let stop = match self.cpu.step(&mut self.bus) {
+        self.bus.now = self.sched.now;
+        let result = self.cpu.step(&mut self.bus);
+        self.sync_bus();
+        let stop = match result {
             StepResult::Executed { cycles } => {
                 self.advance(u64::from(cycles));
                 None
@@ -370,22 +522,29 @@ impl Machine {
         true
     }
 
-    /// Advance time by `cycles` and fire every event that is due.
+    /// Advance time by `cycles` and fire every event that is due, passing what each one
+    /// changed on before the next ([`sync_bus`](Self::sync_bus)).
     fn advance(&mut self, cycles: u64) {
         self.sched.now = self.sched.now.saturating_add(cycles);
         while let Some(kind) = self.sched.pop_due() {
+            self.bus.now = self.sched.now;
             self.fire(kind);
+            self.sync_bus();
         }
     }
 
-    /// Deliver an event. No peripheral schedules events yet (Plan 2), so there is nothing to
-    /// deliver it to.
+    /// Deliver an event to its device.
     fn fire(&mut self, kind: EventKind) {
-        log::debug!("event {kind:?} at cycle {} has no handler", self.sched.now);
+        match kind {
+            EventKind::Peripheral(id) => self.bus.device_event(id),
+        }
     }
 
-    /// AIRCR.SYSRESETREQ: reset the CPU into the boot vector table again. Flash, SRAM and the
-    /// unmapped log are kept, pending events are dropped, and time keeps counting.
+    /// AIRCR.SYSRESETREQ: reset the CPU into the boot vector table again and every device
+    /// with [`ResetKind::System`]. Flash, SRAM (but for the BL2 header, written again) and the
+    /// unmapped log are kept, pending events are dropped (a device that keeps running asks for
+    /// its event again in `reset`), and time keeps counting. Device IRQ lines still high after
+    /// the reset pend again.
     fn system_reset(&mut self) {
         self.resets += 1;
         log::info!(
@@ -403,5 +562,18 @@ impl Machine {
         self.sched.now = now;
         self.sleep = None;
         self.stopped_at = None;
+        // `Cpu::reset` cleared the NVIC's levels: every line still high has to be applied
+        // again.
+        self.applied_irqs = 0;
+        self.bus.now = self.sched.now;
+        self.bus.reset_devices(ResetKind::System);
+        write_bl2_header(&mut self.bus);
+        self.sync_bus();
     }
+}
+
+/// Write the BL2 shared-data header into SRAM.
+fn write_bl2_header(bus: &mut MemoryMap) {
+    let written = bus.poke(BL2_SHARED_DATA, 4, BL2_SHARED_HEADER);
+    debug_assert!(written, "SRAM holds the BL2 shared data");
 }

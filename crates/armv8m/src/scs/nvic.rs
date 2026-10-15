@@ -1,6 +1,6 @@
 //! Nested Vectored Interrupt Controller state for the external interrupts (exceptions 16+).
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Number of external interrupt lines.
 pub const NUM_IRQS: usize = 480;
@@ -18,8 +18,22 @@ pub struct Nvic {
     pub level: [u32; WORDS],
     /// Interrupt Target Non-secure: 0 routes the IRQ to Secure state (the reset value).
     pub itns: [u32; WORDS],
-    /// Priority byte per IRQ (only the implemented top bits are stored).
+    /// Priority byte per IRQ (only the implemented top bits are stored). Always `NUM_IRQS`
+    /// long: the IPR registers index it directly, so decoding any other length fails.
+    #[serde(deserialize_with = "priority_bytes")]
     pub priority: Vec<u8>,
+}
+
+/// Decodes `Nvic::priority`, rejecting any length but `NUM_IRQS` (save states are untrusted).
+fn priority_bytes<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+    let v = Vec::<u8>::deserialize(d)?;
+    if v.len() != NUM_IRQS {
+        return Err(serde::de::Error::invalid_length(
+            v.len(),
+            &"one priority byte per IRQ (480)",
+        ));
+    }
+    Ok(v)
 }
 
 impl Default for Nvic {

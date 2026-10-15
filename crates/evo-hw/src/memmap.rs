@@ -10,21 +10,53 @@
 use armv8m::{Access, AccessKind, Bus, BusError};
 use serde::{Deserialize, Serialize};
 
-use crate::region::{self, Buffer, Device, Region, Target};
+use crate::device::{DevCtx, Device, ResetKind, StateError, mask};
+use crate::region::{self, Buffer, Region, Target};
 use crate::unmapped::{UnmappedAccess, UnmappedKind, UnmappedLog};
+
+/// One device in the map: the device, where it sits, and the IRQ lines it drives.
+struct Slot {
+    name: &'static str,
+    base: u32,
+    dev: Box<dyn Device>,
+    /// This device's IRQ lines; [`MemoryMap::irq_lines`] ORs every slot's.
+    irq_out: u64,
+}
+
+/// One device's part of a save state.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeviceState {
+    pub name: String,
+    pub irq_out: u64,
+    pub state: Vec<u8>,
+}
 
 /// Sorted table of RAM, ROM and device windows plus the log of accesses that hit none of them.
 ///
-/// The CPU intercepts the PPB (0xE000_0000..=0xE00F_FFFF) itself, so it never reaches this map.
+/// The CPU intercepts the internal PPB (0xE000_0000..=0xE003_FFFF) itself, so it never reaches
+/// this map. The external PPB (0xE004_0000..=0xE00F_FFFF) is reached over the system bus: data
+/// accesses there come here like any other address (and land in the unmapped log if no window
+/// covers them).
 ///
 /// # Serialization
 ///
 /// RAM/ROM contents, the window table, `pc_hint` and the log are serialized. Devices are not:
-/// they get their own state in Plan 2, and a map restored from a save state has to have its
+/// their state travels separately ([`MemoryMap::device_states`] /
+/// [`MemoryMap::load_device_states`]), and a map restored from a save state has to have its
 /// devices re-attached. Until then a restored device window behaves like unmapped space
 /// (reads 0, writes dropped and logged) rather than panicking.
+///
+/// # Devices
+///
+/// Each device gets a [`DevCtx`] on every call: `now`, its own IRQ lines (OR-ed across devices
+/// by [`MemoryMap::irq_lines`]), pulse and event requests (queued in order, drained by the
+/// `Machine` with [`MemoryMap::take_pulses`] / [`MemoryMap::take_event_requests`]), the RAM/ROM
+/// buffers and the unmapped log.
 #[derive(Default, Serialize, Deserialize)]
 pub struct MemoryMap {
+    /// Cycle count devices see as `ctx.now`; set from `sched.now` by Machine. Not saved state.
+    #[serde(skip)]
+    pub now: u64,
     /// Accesses to unmapped space, and writes to ROM.
     pub log: UnmappedLog,
     /// PC of the instruction being executed; the `Machine` sets this before each step so log
@@ -34,9 +66,15 @@ pub struct MemoryMap {
     regions: Vec<Region>,
     /// Backing bytes of every RAM and ROM; aliased windows share one entry.
     buffers: Vec<Buffer>,
-    // Plan 2: serialize device state and restore it into re-attached devices.
+    /// Devices in add order (index = device id). Re-attached, not deserialized.
     #[serde(skip)]
-    devices: Vec<Box<dyn Device>>,
+    slots: Vec<Slot>,
+    /// Edge IRQs requested by devices, in order.
+    #[serde(skip)]
+    pulses: Vec<u16>,
+    /// Event requests `(device id, Some(at) | None = cancel)`, in order.
+    #[serde(skip)]
+    events: Vec<(u16, Option<u64>)>,
 }
 
 /// Where an access lands relative to the window table.
@@ -47,15 +85,6 @@ enum Span {
     Unmapped,
     /// Crosses a window boundary, or is partly unmapped.
     Straddle,
-}
-
-/// All-ones mask for an access `width` in bytes.
-fn mask(width: u8) -> u32 {
-    match width {
-        1 => 0xFF,
-        2 => 0xFFFF,
-        _ => u32::MAX,
-    }
 }
 
 impl MemoryMap {
@@ -74,7 +103,7 @@ impl MemoryMap {
     }
 
     /// Add read-only memory holding `data`, visible at each address in `aliases`. Guest writes
-    /// are dropped and logged (QSPI programming is Plan 2); [`MemoryMap::poke`] can still patch it.
+    /// are dropped and logged (a flash controller device changes it through `DevCtx::buffer_mut`); [`MemoryMap::poke`] can still patch it.
     ///
     /// # Panics
     ///
@@ -102,14 +131,22 @@ impl MemoryMap {
         }
     }
 
-    /// Map `dev` over `base..base + size`. The device sees offsets relative to `base`.
+    /// Map `dev` over `base..base + size` and return its id (the add order, starting at 0). The
+    /// device sees offsets relative to `base`.
     ///
     /// # Panics
     ///
-    /// If the window would overlap another or run past 0xFFFF_FFFF (a static layout bug).
-    pub fn add_device(&mut self, name: &'static str, base: u32, size: u32, dev: Box<dyn Device>) {
-        let d = self.devices.len();
-        self.devices.push(dev);
+    /// If the window would overlap another or run past 0xFFFF_FFFF, or more than 65 536
+    /// devices are added (static layout bugs).
+    pub fn add_device(
+        &mut self,
+        name: &'static str,
+        base: u32,
+        size: u32,
+        dev: Box<dyn Device>,
+    ) -> u16 {
+        let d = self.slots.len();
+        let id = u16::try_from(d).expect("too many devices");
         let region = Region {
             name: name.to_owned(),
             base,
@@ -117,6 +154,151 @@ impl MemoryMap {
             target: Target::Device(d),
         };
         region::insert(&mut self.regions, region);
+        self.slots.push(Slot {
+            name,
+            base,
+            dev,
+            irq_out: 0,
+        });
+        id
+    }
+
+    // ---- device runtime ----
+
+    /// Run `f` on slot `id` with a context. `None` if there is no such slot.
+    fn call<R>(
+        &mut self,
+        id: usize,
+        secure: bool,
+        f: impl FnOnce(&mut dyn Device, &mut DevCtx<'_>) -> R,
+    ) -> Option<R> {
+        let slot = self.slots.get_mut(id)?;
+        // `id` fits: add_device checked every slot index.
+        let mut ctx = DevCtx::new(
+            self.now,
+            &mut slot.irq_out,
+            &mut self.pulses,
+            &mut self.events,
+            id as u16,
+            &mut self.buffers,
+            &mut self.log,
+            slot.base,
+            self.pc_hint,
+            secure,
+        );
+        Some(f(slot.dev.as_mut(), &mut ctx))
+    }
+
+    fn slot_id(&self, name: &str) -> Option<usize> {
+        self.slots.iter().position(|s| s.name == name)
+    }
+
+    /// The device called `name`, if it is a `T`.
+    pub fn device<T: Device>(&self, name: &str) -> Option<&T> {
+        let slot = &self.slots[self.slot_id(name)?];
+        (slot.dev.as_ref() as &dyn std::any::Any).downcast_ref::<T>()
+    }
+
+    /// Run `f` on the device called `name` with a (secure, host) context, if it is a `T`.
+    pub fn with_device<T: Device, R>(
+        &mut self,
+        name: &str,
+        f: impl FnOnce(&mut T, &mut DevCtx<'_>) -> R,
+    ) -> Option<R> {
+        let id = self.slot_id(name)?;
+        self.call(id, true, |dev, ctx| {
+            (dev as &mut dyn std::any::Any)
+                .downcast_mut::<T>()
+                .map(|t| f(t, ctx))
+        })?
+    }
+
+    /// Device `id`'s requested event is due: call its [`Device::event`] at `self.now`. An
+    /// unknown id is logged and ignored.
+    pub fn device_event(&mut self, id: u16) {
+        if self
+            .call(usize::from(id), true, |d, ctx| d.event(ctx))
+            .is_none()
+        {
+            log::warn!("device_event: no device {id}");
+        }
+    }
+
+    /// Reset every device, in add order.
+    pub fn reset_devices(&mut self, kind: ResetKind) {
+        for id in 0..self.slots.len() {
+            self.call(id, true, |d, ctx| d.reset(kind, ctx));
+        }
+    }
+
+    /// Level IRQ lines: the OR of every device's lines (bit n = line n).
+    pub fn irq_lines(&self) -> u64 {
+        self.slots.iter().fold(0, |acc, s| acc | s.irq_out)
+    }
+
+    /// Edge IRQs requested since the last call, in order.
+    pub fn take_pulses(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.pulses)
+    }
+
+    /// Event requests since the last call, in order: `(device id, Some(at))` to (re)schedule,
+    /// `(device id, None)` to cancel.
+    pub fn take_event_requests(&mut self) -> Vec<(u16, Option<u64>)> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Backing bytes of the RAM or ROM called `name` (the first one if names repeat).
+    pub fn buffer_mut(&mut self, name: &str) -> Option<&mut [u8]> {
+        self.buffers
+            .iter_mut()
+            .find(|b| b.name == name)
+            .map(|b| b.data.as_mut_slice())
+    }
+
+    /// Every device's state and IRQ lines, in add order.
+    pub fn device_states(&self) -> Vec<DeviceState> {
+        self.slots
+            .iter()
+            .map(|s| DeviceState {
+                name: s.name.to_owned(),
+                irq_out: s.irq_out,
+                state: s.dev.save(),
+            })
+            .collect()
+    }
+
+    /// Restore [`MemoryMap::device_states`]. The device names and their order must match this
+    /// map's, else [`StateError::Mismatch`]. All or nothing: on any error every device is left
+    /// as it was.
+    pub fn load_device_states(&mut self, states: &[DeviceState]) -> Result<(), StateError> {
+        let names = |it: &mut dyn Iterator<Item = &str>| it.collect::<Vec<_>>().join(", ");
+        if states.len() != self.slots.len()
+            || states
+                .iter()
+                .zip(&self.slots)
+                .any(|(st, s)| st.name != s.name)
+        {
+            return Err(StateError::Mismatch(format!(
+                "devices [{}] in the state, [{}] in this machine",
+                names(&mut states.iter().map(|s| s.name.as_str())),
+                names(&mut self.slots.iter().map(|s| s.name)),
+            )));
+        }
+        let backups: Vec<Vec<u8>> = self.slots.iter().map(|s| s.dev.save()).collect();
+        for (i, st) in states.iter().enumerate() {
+            if let Err(e) = self.slots[i].dev.load(&st.state) {
+                for (slot, backup) in self.slots[..i].iter_mut().zip(&backups) {
+                    if slot.dev.load(backup).is_err() {
+                        log::error!("device {}: could not restore its own state", slot.name);
+                    }
+                }
+                return Err(e);
+            }
+        }
+        for (slot, st) in self.slots.iter_mut().zip(states) {
+            slot.irq_out = st.irq_out;
+        }
+        Ok(())
     }
 
     /// Backing bytes of the RAM or ROM called `name` (the first one if names repeat).
@@ -231,7 +413,7 @@ impl MemoryMap {
 
     /// Read from inside one window. `None` means the window has nothing behind it (only
     /// possible in a corrupt or device-less restored state), which the caller treats as unmapped.
-    fn read_inside(&mut self, region: usize, off: u32, width: u8) -> Option<u32> {
+    fn read_inside(&mut self, region: usize, off: u32, width: u8, secure: bool) -> Option<u32> {
         match self.regions.get(region)?.target {
             Target::Ram(b) | Target::Rom(b) => {
                 let start = off as usize;
@@ -244,16 +426,15 @@ impl MemoryMap {
                 le[..bytes.len()].copy_from_slice(bytes);
                 Some(u32::from_le_bytes(le))
             }
-            Target::Device(d) => {
-                let dev = self.devices.get_mut(d)?;
-                Some(dev.read(off, width) & mask(width))
-            }
+            Target::Device(d) => self
+                .call(d, secure, |dev, ctx| dev.read(off, width, ctx))
+                .map(|v| v & mask(width)),
         }
     }
 
     /// Write inside one window. Returns whether the write took effect; ROM and windows with
     /// nothing behind them return `false` and the caller logs the dropped write.
-    fn write_inside(&mut self, region: usize, off: u32, width: u8, v: u32) -> bool {
+    fn write_inside(&mut self, region: usize, off: u32, width: u8, v: u32, secure: bool) -> bool {
         let Some(target) = self.regions.get(region).map(|r| r.target) else {
             return false;
         };
@@ -273,13 +454,11 @@ impl MemoryMap {
                 }
             }
             Target::Rom(_) => false,
-            Target::Device(d) => match self.devices.get_mut(d) {
-                Some(dev) => {
-                    dev.write(off, width, v & mask(width));
-                    true
-                }
-                None => false,
-            },
+            Target::Device(d) => self
+                .call(d, secure, |dev, ctx| {
+                    dev.write(off, width, v & mask(width), ctx)
+                })
+                .is_some(),
         }
     }
 
@@ -290,7 +469,7 @@ impl MemoryMap {
     fn read(&mut self, addr: u32, width: u8, kind: UnmappedKind, secure: bool) -> (u32, bool) {
         match self.span(addr, width) {
             Span::Inside { region, off } => {
-                if let Some(v) = self.read_inside(region, off, width) {
+                if let Some(v) = self.read_inside(region, off, width, secure) {
                     return (v, false);
                 }
                 self.log_access(addr, width, kind, None, secure);
@@ -344,7 +523,7 @@ impl MemoryMap {
     fn write(&mut self, addr: u32, width: u8, v: u32, secure: bool) {
         match self.span(addr, width) {
             Span::Inside { region, off } => {
-                if !self.write_inside(region, off, width, v) {
+                if !self.write_inside(region, off, width, v, secure) {
                     self.log_write(addr, width, v, secure);
                 }
             }

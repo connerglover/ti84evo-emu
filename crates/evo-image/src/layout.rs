@@ -27,10 +27,12 @@ impl Layout {
     };
 
     /// Program the package's images into `flash`, a slice that is mapped at
-    /// address `flash_base`: image 0 at `secure_slot_base` and image 1 at
-    /// `ns_slot_base`. Each is copied whole (header, payload and TLV areas).
-    /// A package with a single image places just that one. Images beyond the
-    /// first two are not placed (their role is not yet known).
+    /// address `flash_base`: image 0 at `secure_slot_base`, image 1 at
+    /// `ns_slot_base`, and each later image at `ns_slot_base` plus its package
+    /// distance from image 1 (the OS image's protected TLVs 0xB1..0xB8 give
+    /// those addresses; `docs/hardware/boot-flow.md` §3.3). Each is copied
+    /// whole (header, payload and TLV areas). A package with a single image
+    /// places just that one.
     ///
     /// An image that does not lie entirely inside the slice yields
     /// [`ImageError::DoesNotFit`]. Every image is checked before any is
@@ -41,11 +43,22 @@ impl Layout {
         flash: &mut [u8],
         flash_base: u32,
     ) -> Result<(), ImageError> {
-        let slots = [self.secure_slot_base, self.ns_slot_base];
+        // The slot address of image `index`; `None` when it cannot be expressed.
+        let image1_offset = pkg.images.get(1).map(|i| i.pkg_offset);
+        let slot = |index: usize, pkg_offset: usize| -> Option<u32> {
+            match index {
+                0 => Some(self.secure_slot_base),
+                1 => Some(self.ns_slot_base),
+                _ => {
+                    let delta = pkg_offset.checked_sub(image1_offset?)?;
+                    self.ns_slot_base.checked_add(u32::try_from(delta).ok()?)
+                }
+            }
+        };
 
         // (offset into `flash`, package bytes) for each image to place.
-        let mut jobs = Vec::with_capacity(slots.len());
-        for (index, (image, &addr)) in pkg.images.iter().zip(&slots).enumerate() {
+        let mut jobs = Vec::with_capacity(pkg.images.len());
+        for (index, image) in pkg.images.iter().enumerate() {
             // `Package` has public fields, so tolerate one whose images do not
             // match its bytes instead of indexing out of range.
             let end = image.end_with_tlvs(&pkg.bytes);
@@ -58,13 +71,14 @@ impl Layout {
                     have: pkg.bytes.len().saturating_sub(image.pkg_offset),
                 })?;
             let len = src.len();
+            let addr = slot(index, image.pkg_offset);
             let does_not_fit = || ImageError::DoesNotFit {
                 image: index,
-                addr,
+                addr: addr.unwrap_or(u32::MAX),
                 len,
             };
             let start = addr
-                .checked_sub(flash_base)
+                .and_then(|a| a.checked_sub(flash_base))
                 .and_then(|o| usize::try_from(o).ok())
                 .ok_or_else(does_not_fit)?;
             let end = start.checked_add(len).ok_or_else(does_not_fit)?;
@@ -120,6 +134,45 @@ mod tests {
                 .enumerate()
                 .all(|(i, &byte)| touched(i) || byte == FILL)
         );
+    }
+
+    #[test]
+    fn place_puts_later_images_after_image_1_as_in_the_package() {
+        // Images 2.. keep their package distance from image 1 (`boot-flow.md` §3.3: the OS
+        // image's protected TLVs 0xB1..0xB8 name their addresses that way).
+        let (a, b, c) = (
+            Img::filled(0x400, 0x300, 1),
+            Img::filled(0x200, 0x500, 2),
+            Img::filled(0x40, 0x100, 3),
+        );
+        let bytes = package(&[(0, &a), (0x2000, &b), (0x3100, &c)]);
+        let pkg = Package::parse(bytes).expect("parse");
+        let mut flash = vec![FILL; 0x20000];
+        layout().place(&pkg, &mut flash, FLASH_BASE).expect("place");
+
+        let c_full = c.full_bytes();
+        let c_at = 0x8000 + (0x3100 - 0x2000);
+        assert_eq!(&flash[c_at..c_at + c_full.len()], &c_full[..]);
+        let b_full = b.full_bytes();
+        assert_eq!(&flash[0x8000..0x8000 + b_full.len()], &b_full[..]);
+    }
+
+    #[test]
+    fn place_later_image_past_the_flash_does_not_fit() {
+        let (a, b, c) = (
+            Img::filled(0x400, 0x300, 1),
+            Img::filled(0x200, 0x500, 2),
+            Img::filled(0x40, 0x100, 3),
+        );
+        let bytes = package(&[(0, &a), (0x2000, &b), (0x3100, &c)]);
+        let pkg = Package::parse(bytes).expect("parse");
+        // Room for images 0 and 1 but not for image 2.
+        let mut flash = vec![FILL; 0x8000 + 0x1100 + 0x10];
+        assert!(matches!(
+            layout().place(&pkg, &mut flash, FLASH_BASE),
+            Err(ImageError::DoesNotFit { image: 2, .. })
+        ));
+        assert!(flash.iter().all(|&x| x == FILL));
     }
 
     #[test]
@@ -228,7 +281,7 @@ mod tests {
         let mut flash = vec![FILL; 8 << 20];
         Layout::EVO_7_1
             .place(pkg, &mut flash, 0)
-            .expect("both images fit an 8 MiB flash at offset 0");
+            .expect("all images fit an 8 MiB flash at offset 0");
 
         let word = |at: usize| u32::from_le_bytes(flash[at..at + 4].try_into().expect("4 bytes"));
         let layout = Layout::EVO_7_1;
@@ -246,6 +299,25 @@ mod tests {
             let len = image.end_with_tlvs(&pkg.bytes) - image.pkg_offset;
             assert!(flash[base..base + len] == pkg.bytes[image.pkg_offset..][..len]);
         }
+        // Images 2..9 sit at `ns_slot_base` plus their package distance from
+        // image 1 and together occupy the range `memory-map.md` lists, which
+        // ends below the mailbox at flash offset 0x00CF_0000.
+        assert_eq!(pkg.images.len(), 10, "images 0..9");
+        let image1 = pkg.images[1].pkg_offset;
+        let (mut lo, mut hi) = (usize::MAX, 0);
+        for image in &pkg.images[2..] {
+            let base = layout.ns_slot_base as usize + (image.pkg_offset - image1);
+            let len = image.end_with_tlvs(&pkg.bytes) - image.pkg_offset;
+            assert_eq!(
+                word(base),
+                0x96f3_b83d,
+                "slot {base:#x} starts with its header"
+            );
+            assert!(flash[base..base + len] == pkg.bytes[image.pkg_offset..][..len]);
+            (lo, hi) = (lo.min(base), hi.max(base + len));
+        }
+        assert_eq!((lo, hi), (0x0061_A6D8, 0x0067_495C), "{lo:#x}..{hi:#x}");
+        assert!(hi < 0x00CF_0000);
         // Image 0's reset vector is a Secure-alias Thumb address in its slot.
         let secure = &pkg.images[0];
         let vtor = layout.secure_slot_base as usize + usize::from(secure.header_size);
@@ -254,21 +326,5 @@ mod tests {
         let len = (secure.body.end - secure.pkg_offset) as u32;
         let slot = layout.secure_slot_base..layout.secure_slot_base + len;
         assert!(slot.contains(&(reset & !0x1000_0001)), "{reset:#x}");
-    }
-
-    #[test]
-    fn place_ignores_images_beyond_the_first_two() {
-        let a = Img::filled(0x400, 0x300, 1);
-        let b = Img::filled(0x200, 0x300, 2);
-        let c = Img::filled(0x40, 0x100, 3);
-        let pkg = Package::parse(package(&[(0, &a), (0x1000, &b), (0x2000, &c)])).expect("parse");
-        assert_eq!(pkg.images.len(), 3);
-        let mut flash = vec![FILL; 0x20000];
-        layout().place(&pkg, &mut flash, FLASH_BASE).expect("place");
-        let c_bytes = c.image_bytes();
-        assert!(
-            !flash.windows(c_bytes.len()).any(|w| w == &c_bytes[..]),
-            "third image must not be placed"
-        );
     }
 }

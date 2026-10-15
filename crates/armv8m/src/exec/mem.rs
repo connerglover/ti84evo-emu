@@ -5,8 +5,8 @@ use crate::bus::{Access, AccessKind, Bus, BusError};
 use crate::cpu::Cpu;
 use crate::exception::Fault;
 use crate::instr::{Instr, MemSize};
-use crate::scs::is_ppb;
 use crate::scs::scb::CCR_UNALIGN_TRP;
+use crate::scs::{is_eppb, is_ppb};
 
 /// Why a memory instruction failed.
 #[derive(Clone, Copy, Debug)]
@@ -46,6 +46,15 @@ fn attribute(cpu: &Cpu, addr: u32, acc: Access) -> Result<Access, MemFault> {
 }
 
 /// True if an unaligned access of `size` at `addr` traps (`CCR.UNALIGN_TRP`).
+/// Unprivileged accesses to the external PPB BusFault before they reach the `Bus`: the whole PPB
+/// is privileged-only. (`ppb_read`/`ppb_write` check this for the internal PPB.)
+fn eppb_check(addr: u32, acc: Access) -> Result<(), MemFault> {
+    if !acc.privileged && is_eppb(addr) {
+        return Err(MemFault::Bus(BusError::Decode, addr));
+    }
+    Ok(())
+}
+
 fn unaligned_trap(cpu: &Cpu, addr: u32, size: MemSize) -> bool {
     let mask = match size {
         MemSize::Byte => return false,
@@ -76,6 +85,7 @@ fn read_as(
             .ppb_read(addr, size, acc)
             .map_err(|e| MemFault::Bus(e, addr));
     }
+    eppb_check(addr, acc)?;
     let r = match size {
         MemSize::Byte => bus.read8(addr, attribute(cpu, addr, acc)?).map(u32::from),
         MemSize::Half if addr & 1 == 0 => {
@@ -88,6 +98,7 @@ fn read_as(
             let mut v = 0;
             for i in 0..n {
                 let a = addr.wrapping_add(i);
+                eppb_check(a, acc)?;
                 let acc = attribute(cpu, a, acc)?;
                 let b = bus.read8(a, acc).map_err(|e| MemFault::Bus(e, a))?;
                 v |= u32::from(b) << (8 * i);
@@ -125,6 +136,7 @@ fn write_as(
             .ppb_write(addr, v, size, acc)
             .map_err(|e| MemFault::Bus(e, addr));
     }
+    eppb_check(addr, acc)?;
     let r = match size {
         MemSize::Byte => bus.write8(addr, v as u8, attribute(cpu, addr, acc)?),
         MemSize::Half if addr & 1 == 0 => bus.write16(addr, v as u16, attribute(cpu, addr, acc)?),
@@ -133,6 +145,7 @@ fn write_as(
             let n = if size == MemSize::Half { 2 } else { 4 };
             for i in 0..n {
                 let a = addr.wrapping_add(i);
+                eppb_check(a, acc)?;
                 let acc = attribute(cpu, a, acc)?;
                 bus.write8(a, (v >> (8 * i)) as u8, acc)
                     .map_err(|e| MemFault::Bus(e, a))?;

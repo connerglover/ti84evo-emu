@@ -1,6 +1,14 @@
 //! System Control Space: the memory-mapped NVIC, SCB, SysTick, MPU and SAU registers, and the
-//! rest of the Private Peripheral Bus (PPB, `0xE000_0000..=0xE00F_FFFF`), which the CPU handles
-//! itself before the `Bus`.
+//! rest of the internal Private Peripheral Bus (PPB, `0xE000_0000..=0xE003_FFFF`), which the CPU
+//! handles itself before the `Bus`. The external PPB (EPPB, `0xE004_0000..=0xE00F_FFFF`) is
+//! reached over the system bus, so privileged data accesses there go to the `Bus` like any other
+//! address. Unprivileged data accesses to any part of the PPB, the EPPB included, BusFault and
+//! never reach the `Bus`.
+//!
+//! Guest data accesses to internal PPB registers this core does not implement read as zero and
+//! ignore writes; each one is recorded as a `PpbMiss` for the host to collect with
+//! `Cpu::take_ppb_misses`. Host accesses (`ppb_read32`, `ppb_peek32`, `ppb_write32`) record
+//! nothing.
 //!
 //! Every access goes through a security *view* (`Sec`): software sees the copy of the banked
 //! registers for its own security state, and Secure software reaches the Non-secure view through
@@ -32,7 +40,24 @@ pub const PRIORITY_BITS: u32 = 3;
 pub const PRIORITY_MASK: u8 = !(0xFF >> PRIORITY_BITS);
 
 pub const PPB_START: u32 = 0xE000_0000;
-pub const PPB_END: u32 = 0xE00F_FFFF;
+/// Last address of the internal PPB; `0xE004_0000..` (the external PPB) goes to the `Bus`.
+pub const INTERNAL_PPB_END: u32 = 0xE003_FFFF;
+/// Last address of the external PPB, and of the whole PPB.
+pub const EPPB_END: u32 = 0xE00F_FFFF;
+
+/// A guest data access to an internal PPB register this core does not implement: the read
+/// returned zero or the write was ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PpbMiss {
+    /// The address accessed (before any Non-secure alias translation).
+    pub addr: u32,
+    /// Access width in bytes.
+    pub width: u8,
+    /// The value written, or `None` for a read.
+    pub write: Option<u32>,
+    /// True when the access came from Secure state.
+    pub secure: bool,
+}
 
 /// Non-secure alias of `0xE000_0000..=0xE000_FFFF`, accessible from Secure state only.
 const NS_ALIAS_START: u32 = 0xE002_0000;
@@ -93,9 +118,15 @@ pub struct Scs {
     pub cppwr: u32,
 }
 
-/// True for addresses the CPU handles itself instead of the `Bus`.
+/// True for addresses the CPU handles itself instead of the `Bus`: the internal PPB only.
 pub fn is_ppb(addr: u32) -> bool {
-    (PPB_START..=PPB_END).contains(&addr)
+    (PPB_START..=INTERNAL_PPB_END).contains(&addr)
+}
+
+/// True for the external PPB (`0xE004_0000..=0xE00F_FFFF`). Data accesses there go to the `Bus`,
+/// but, like the rest of the PPB, only privileged ones.
+pub fn is_eppb(addr: u32) -> bool {
+    (INTERNAL_PPB_END + 1..=EPPB_END).contains(&addr)
 }
 
 /// The register word and security view that an access from security state `from` to PPB word
@@ -145,7 +176,10 @@ impl Cpu {
             return Ok(0);
         };
         let shift = 8 * (addr & 3);
-        let v = self.scs_read(word, view);
+        let Some(v) = self.scs_read(word, view) else {
+            self.ppb_miss(addr, n, None);
+            return Ok(0);
+        };
         Ok(if n == 4 {
             v
         } else {
@@ -173,29 +207,59 @@ impl Cpu {
         let Some((word, view)) = view else {
             return Ok(());
         };
-        if n == 4 {
-            self.scs_write(word, v, u32::MAX, view);
+        let done = if n == 4 {
+            self.scs_write(word, v, u32::MAX, view)
         } else if byte_accessible(word) {
             let shift = 8 * (addr & 3);
             let lanes = ((1u32 << (8 * n)) - 1) << shift;
-            self.scs_write(word, (v << shift) & lanes, lanes, view);
+            self.scs_write(word, (v << shift) & lanes, lanes, view)
         } else {
-            log::warn!("PPB: {n}-byte write of {v:#x} to {addr:#010x} ignored (word access only)");
+            false
+        };
+        if !done {
+            self.ppb_miss(addr, n, Some(v));
         }
         Ok(())
+    }
+
+    /// Record a guest data access to an unimplemented internal PPB register (or a sub-word
+    /// write to a word-only one).
+    fn ppb_miss(&mut self, addr: u32, n: u32, write: Option<u32>) {
+        let secure = self.regs.sec == Sec::Secure;
+        log::debug!(
+            "PPB: {n}-byte {} {addr:#010x} not implemented ({}, pc {:#010x})",
+            write.map_or("read of".to_string(), |v| format!("write of {v:#x} to")),
+            if secure { "Secure" } else { "Non-secure" },
+            self.regs.pc
+        );
+        self.ppb_misses.push(PpbMiss {
+            addr,
+            width: n as u8,
+            write,
+            secure,
+        });
+    }
+
+    /// Drain the guest data accesses to unimplemented internal PPB registers recorded since
+    /// the last call, oldest first. Host accesses are never recorded.
+    pub fn take_ppb_misses(&mut self) -> Vec<PpbMiss> {
+        std::mem::take(&mut self.ppb_misses)
     }
 
     /// Host (debugger/test) read of a PPB word: privileged, no fault, in the current security
     /// state's view; the Non-secure alias (`0xE002_xxxx`) always reads the Non-secure view.
     pub fn ppb_read32(&mut self, addr: u32) -> u32 {
         let (word, view) = host_view(addr, self.regs.sec);
-        self.scs_read(word, view)
+        self.scs_read(word, view).unwrap_or_else(|| {
+            log::debug!("PPB: host read of unimplemented register {word:#010x} ({view:?} view)");
+            0
+        })
     }
 
     /// Side-effect-free host read for a debugger: what `ppb_read32` would return for the word
     /// containing `addr` if the CPU were in security state `sec`, except that reading
-    /// `SYST_CSR` leaves COUNTFLAG set. `None` outside the PPB and for registers that are not
-    /// implemented (which `ppb_read32` reads as zero, with a warning; this logs nothing).
+    /// `SYST_CSR` leaves COUNTFLAG set. `None` outside the internal PPB and for registers that
+    /// are not implemented (which `ppb_read32` reads as zero; this logs nothing).
     pub fn ppb_peek32(&self, addr: u32, sec: Sec) -> Option<u32> {
         if !is_ppb(addr) {
             return None;
@@ -211,7 +275,11 @@ impl Cpu {
     /// Host (debugger/test) write of a PPB word, with the views of `ppb_read32`.
     pub fn ppb_write32(&mut self, addr: u32, v: u32) {
         let (word, view) = host_view(addr, self.regs.sec);
-        self.scs_write(word, v, u32::MAX, view);
+        if !self.scs_write(word, v, u32::MAX, view) {
+            log::debug!(
+                "PPB: host write of {v:#x} to unimplemented register {word:#010x} ({view:?} view)"
+            );
+        }
     }
 
     /// Consume a latched `AIRCR.SYSRESETREQ` (the machine resets the system when it sees one).
@@ -226,39 +294,23 @@ impl Cpu {
         *self.scs.scb.init_vtor.get_mut(sec) = v;
     }
 
-    /// Read the PPB word at `word` in view `view`; unimplemented registers read as zero with a
-    /// warning.
-    fn scs_read(&mut self, word: u32, view: Sec) -> u32 {
+    /// Read the PPB word at `word` in view `view`; `None` for an unimplemented register.
+    fn scs_read(&mut self, word: u32, view: Sec) -> Option<u32> {
         // The one read with a side effect: reading SYST_CSR clears COUNTFLAG.
         if word == SYSTICK {
-            return self.scs.systick.get_mut(view).read(0);
+            return Some(self.scs.systick.get_mut(view).read(0));
         }
-        let v = if (SCS_START..=SCS_END).contains(&word) {
+        if (SCS_START..=SCS_END).contains(&word) {
             self.scs_reg_peek(word, view)
         } else {
             None
-        };
-        v.unwrap_or_else(|| {
-            log::warn!(
-                "PPB: read of unimplemented register {word:#010x} ({view:?} view, pc {:#010x})",
-                self.regs.pc
-            );
-            0
-        })
+        }
     }
 
     /// Write the PPB word at `word` in view `view`; `v` is already masked to the byte `lanes`
-    /// being written.
-    fn scs_write(&mut self, word: u32, v: u32, lanes: u32, view: Sec) {
-        let done =
-            (SCS_START..=SCS_END).contains(&word) && self.scs_reg_write(word, v, lanes, view);
-        if !done {
-            log::warn!(
-                "PPB: write of {v:#x} to unimplemented register {word:#010x} ({view:?} view, \
-                 pc {:#010x})",
-                self.regs.pc
-            );
-        }
+    /// being written. False when the register is not implemented (the write is ignored).
+    fn scs_write(&mut self, word: u32, v: u32, lanes: u32, view: Sec) -> bool {
+        (SCS_START..=SCS_END).contains(&word) && self.scs_reg_write(word, v, lanes, view)
     }
 
     /// True when view `view` reaches the non-banked BusFault/NMI state: always from Secure,

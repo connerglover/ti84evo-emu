@@ -3,15 +3,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A memory-mapped peripheral. Offsets are relative to the region base; `width` is the access
-/// size in bytes (1, 2 or 4) and is never wider than the bytes left in the region.
-///
-/// `Send` so a whole `Machine` can move to another thread (emulation thread vs UI).
-pub trait Device: Send {
-    fn read(&mut self, off: u32, width: u8) -> u32;
-    fn write(&mut self, off: u32, width: u8, v: u32);
-}
-
 /// Backing storage that RAM and ROM windows point into. One buffer can sit behind several
 /// windows (aliases), so the bytes live here once and windows hold an index.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -20,7 +11,7 @@ pub(crate) struct Buffer {
     pub data: Vec<u8>,
 }
 
-/// What a window refers to. Indices are into `MemoryMap::buffers` / `MemoryMap::devices`.
+/// What a window refers to. Indices are into `MemoryMap::buffers` / `MemoryMap::slots`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Target {
     Ram(usize),

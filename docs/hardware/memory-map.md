@@ -2,8 +2,21 @@
 
 Status: flash placement of OS images 0 and 1 for OS 7.1 (bundle
 `7.1.0.4421`), established by `evo-cli inspect --score-bases` and hard-coded
-as `evo_image::Layout::EVO_7_1`. Everything else here is provisional and is
+as `evo_image::Layout::EVO_7_1`. The memory sizes and the peripheral table
+come from the Plan 2 research (the per-block docs in this folder); the rest is
 refined by the discovery loop (spec §5.3).
+
+## Memory
+
+| region | NS alias | S alias | size | notes |
+|---|---|---|---|---|
+| Flash (QSPI NOR, XIP) | `0x0000_0000..0x00FF_FFFF` | `0x1000_0000..0x10FF_FFFF` | **16 MiB**, erased 0xFF | the flash MPC covers 16 MiB (`security.md` §1) and the SPIF probe always selects the 16M part (`spif-nor.md` §6.1) |
+| SRAM | `0x2000_0000..0x2017_FFFF` | `0x3000_0000..0x3017_FFFF` | **1.5 MiB** = 3 × 512 KiB banks (`0x..00_0000`, `0x..08_0000`, `0x..10_0000`) | one SRAM MPC per bank (`security.md` §1) |
+| BL2 shared data | | `0x3000_0000` | one word, `0x0004_2016` | written by the emulator at power-on and on every system reset (`boot-flow.md` §4) |
+
+Flash areas the firmware uses besides the image slots: PS at `0x0009_0000..0x000A_BFFF`,
+ITS at `0x000A_C000..0x000A_FFFF` (`boot-flow.md` §2), and a one-shot mailbox at
+`0x00CF_0000` that is read and left alone while it is blank (`spif-nor.md` §6.3).
 
 ## Address conventions
 
@@ -15,10 +28,15 @@ refined by the discovery loop (spec §5.3).
 - The secure image runs from the S alias. Boot sets
   `VTOR_S = 0x1000_0000 | (secure_slot_base + header size of image 0)`
   = `0x1000_0000 | (0x000B_0000 + 0x400)` = **`0x100B_0400`**.
-- SRAM, as the images use it (provisional): the secure initial SP is
-  `0x3000_07F8` and the secure reset handler sets `MSPLIM = 0x3000_0000`
-  (S alias at `0x3000_0000`); image 1's first word is `0x2009_3000` (NS
-  alias at `0x2000_0000`).
+- SRAM, as the images use it: the secure initial SP is `0x3000_07F8` and the
+  secure reset handler sets `MSPLIM = 0x3000_0000` (S alias at
+  `0x3000_0000`); the BSP's initial SP is `0x2004_6D20`; image 1's first word
+  is `0x2009_3000` (NS alias at `0x2000_0000`).
+- Peripherals: the S alias of an NS peripheral address `p` is
+  `p | 0x1000_0000` (0x4xxx_xxxx NS, 0x5xxx_xxxx S). The firmware uses the NS
+  alias for the blocks SAU region 3 makes Non-secure, even from secure code.
+- BSP code addresses are NS (`0x001x_xxxx`); the same bytes sit at the S alias
+  `0x101x_xxxx`, which some evidence addresses use (`boot-flow.md`).
 
 ## Result
 
@@ -27,8 +45,13 @@ refined by the discovery loop (spec §5.3).
 | 0 | Secure | `0x0000_0000` | `0x400` | `0x000D_AEB8` | `0x000D_B4F3` | **`0x000B_0000`** | S alias `0x100B_0000` | `0x0018_B4F3` |
 | 1 | Non-secure | `0x0010_0000` | `0x200` | `0x0029_3678` | `0x0029_3A99` | **`0x0038_0000`** | NS alias `0x0038_0000` | `0x0061_3A99` |
 
-Images 2–9 (header `0x40`) are not placed yet; their roles and addresses are
-open (see below).
+Images 2–9 (header `0x40`) are placed at `ns_slot_base` (`0x0038_0000`) plus
+their package distance from image 1: flash offset = pkg offset − `0x10_0000` +
+`0x38_0000`. The OS image's protected TLVs 0xB1..0xB8 give the payload
+addresses of images 2..9, and the BSP's image-validation service requires an
+MCUboot header `0x40` bytes before each (`boot-flow.md` §3.3). For the 7.1
+bundle (package offsets `0x0039_A6D8..0x003F_495C`) they occupy
+`0x0061_A6D8..0x0067_495C`. Their roles are still open (see below).
 
 The package layout is not the flash layout. Image 1 sits at package offset
 `0x10_0000` but flash offset `0x38_0000`.
@@ -205,14 +228,19 @@ literal. The instructions from `0044bc9e` on belong to the next routine.
 ## Flash coverage
 
 - `Layout::place` copies header, payload and TLVs. Flash must therefore cover
-  offsets up to **`0x0061_3A99`** (header and payload alone end at
-  `0x0061_3878`). An 8 MiB flash at offset 0 holds both images.
-  `real_bundle_fits_8_mib_flash_with_evo_7_1` checks this.
-- Occupied: `0x000B_0000..0x0018_B4F3` (image 0) and
-  `0x0038_0000..0x0061_3A99` (image 1).
-- Unknown: `0x0000_0000..0x000B_0000` (704 KiB),
-  `0x0018_B4F3..0x0038_0000` (about 1.96 MiB) and everything above
-  `0x0061_3A99`.
+  offsets up to **`0x0067_495C`** (the end of image 9 with its TLVs). All ten
+  images fit in the first 8 MiB, below the mailbox at `0x00CF_0000`
+  (`real_bundle_fits_8_mib_flash_with_evo_7_1` checks this, including the
+  range of images 2..9); the flash itself is 16 MiB.
+- Occupied: `0x000B_0000..0x0018_B4F3` (image 0),
+  `0x0038_0000..0x0061_3A99` (image 1) and `0x0061_A6D8..0x0067_495C`
+  (images 2..9, at their package distance from image 1).
+- Used at run time: PS/ITS at `0x0009_0000..0x000A_FFFF` and the mailbox at
+  `0x00CF_0000` (see "Memory").
+- Unknown: the rest of `0x0000_0000..0x000B_0000`,
+  `0x0018_B4F3..0x0038_0000` (about 1.96 MiB), the gap
+  `0x0061_3A99..0x0061_A6D8` (between the package's images 1 and 2) and
+  everything above `0x0067_495C` except the mailbox.
 
 ## Open questions
 
@@ -221,25 +249,108 @@ literal. The instructions from `0044bc9e` on belong to the next routine.
    emulator replaces BL2 (spec §5.1). Until the OS reads this range, it is
    left as erased flash.
 2. **What lives in `0x0018_B4F3..0x0038_0000`?** Image 0 uses the constant
-   `0x0018_F2C0` 118 times, which is just past its own end. Candidates are a
-   secondary slot, TF-M ITS/PS storage, or a data area. Watch for reads there
-   in Task 17.
+   `0x0018_F2C0` 118 times, which is just past its own end.
+   **Answer (Plan 2 research):** not TF-M storage. ITS/PS live at
+   `0x0009_0000..0x000A_FFFF`, below the secure slot, and the research runs
+   through the BSP idle loop saw no erase, program or blank check in this gap.
+   It is left as erased flash. What `0x0018_F2C0` names is still open.
 3. **Where do images 2–9 go, and what are they?** The package does not say
-   and this scorer was not run on them. Their headers are `0x40` and none is
-   placed by `Layout::place`.
+   and this scorer was not run on them. Their headers are `0x40`.
+   **Answer (addresses, Task 24):** at `ns_slot_base` plus their package
+   distance from image 1, `0x0061_A6D8..0x0067_495C` for the 7.1 bundle. The
+   OS image's protected TLVs 0xB1..0xB8 give their payload addresses, and the
+   BSP's validation of image 1 requires an MCUboot header `0x40` bytes before
+   each (`boot-flow.md` §3.3). `Layout::place` places them there. What the
+   images are (their roles) is still open.
 4. **Does image 0 contain a part that runs Non-secure?** Its S-alias string
    references sit in its first `0x23000` bytes. Its NS-alias references sit
    in slot+`0x5A000..0xD6000`, and the strings they name include USB-stack
    identifiers. Either the upper part of image 0 runs NS, or secure code reads that
-   data through the NS alias. The SAU/IDAU configuration seen at boot
-   (Task 17) should settle this.
-5. **Where is image 1's NS vector table?** Secure firmware presumably writes
-   `VTOR_NS` before handing over. Record the value in Task 17.
+   data through the NS alias.
+   **Answer:** yes. SAU region 0 makes flash `0x0010_0000..0x00FF_FFFF`
+   Non-secure, and image 0 from slot+`0x50000` on (NS `0x0010_0000..0x0018_B4F3`)
+   is the **NS BSP**: RTOS, MCCI USB stack, drivers and factory tests. Secure
+   boot hands off to it, not to image 1 (`boot-flow.md` §2).
+5. **Where is image 1's NS vector table?**
+   **Answer:** image 1 has none of its own. Secure firmware writes
+   `VTOR_NS = 0x0010_0400`, the BSP's vector table (SP `0x2004_6D20`, reset
+   `0x0011_6D51`). The BSP later calls image 1's reset word (`0x0044_BC91`)
+   with `blx` from `0x0015_2716`, in the same NS state, without changing
+   VTOR (`boot-flow.md` §3.4).
 6. **How big is the physical flash?** Image 0 holds strings naming 4M, 8M and
    16M parts (QSPI device identification), so the size is detected at run
-   time. 8 MiB is the working assumption; it covers both images.
+   time.
+   **Answer: 16 MiB.** The flash MPC covers `0x0000_0000..0x00FF_FFFF`, and
+   the SPIF probe forces the capacity code to 24, so the driver always uses
+   the 16M geometry (`spif-nor.md` §6.1). With 8 MiB the mailbox at
+   `0x00CF_0000` reads 0 and triggers a spurious erase.
 7. The search assumed 4 KiB-aligned slots (`step 0x1000`) inside the first
    8 MiB. Both winners are 64 KiB-aligned, and nothing in the range competes.
+
+## Peripherals
+
+The devices `evo_hw::soc::attach` registers, in its order. Each window is mapped at the
+address the firmware uses (the S alias for 0x5xxx_xxxx blocks, the NS alias otherwise). IRQ
+lines are level-sensitive; "stub" means both vector tables point that IRQ at the fatal
+"unexpected interrupt" routine, so the model never asserts it. "Accesses seen" lists the
+offsets the firmware touches in the research runs (boot through the BSP idle loop, with
+register fakes); a count is the number of accesses that run's unmapped log attributed to a
+block nothing modelled yet. "BSP" marks blocks only the NS BSP touches.
+
+| name | base | size | IRQ | doc | accesses seen |
+|---|---|---|---|---|---|
+| `mpc_sram0` | `0x5020_4000` | `0x1000` | 7 (stub) | `security.md` §1 | CTRL, BLK_MAX, BLK_CFG, BLK_IDX, BLK_LUT, INT_EN |
+| `mpc_sram1` | `0x5020_5000` | `0x1000` | 7 (stub) | `security.md` §1 | as `mpc_sram0` |
+| `mpc_sram2` | `0x5020_6000` | `0x1000` | 7 (stub) | `security.md` §1 | as `mpc_sram0` |
+| `mpc_flash` | `0x5020_8000` | `0x1000` | 7 (stub) | `security.md` §1 | as `mpc_sram0`; BLK_CFG/BLK_MAX are the reads behind the first-boot reset loop (`discovery-log.md`) |
+| `cru` | `0x5020_0000` | `0x1000` | none (21, 25 stubs) | `security.md` §3 | +00, +04, +10, +14, +18, +1C, +20, +4C, +50, +FC at boot; +08, +0C, +60, +70, +94 at run time |
+| `spctrl` | `0x5020_1000` | `0x1000` | 8 (stub) | `security.md` §2 | +10, +14, +24, +28, +60, +64, +70, +74, +80 at boot; +C0, +D4 at run time |
+| `ledpat` | `0x5020_2B00` | `0x100` | none | `security.md` §6 | +00..+10, 6 writes per boot |
+| `icache` | `0x5000_5000` | `0x1000` | 10 (stub) | `spif-nor.md` §7 | +04 (RMW `\|= 0x1D`, 1 + 118 per boot) |
+| `timer` | `0x4010_1000` | `0x1000` | 1–3 (never enabled) | `timer.md` | +00, +04, +10, +14, +30, +34, +38 |
+| `uart0` | `0x4010_6000` | `0x1000` | 17 (stub) | `uart.md` | +00, +04, +08, +0C, +14 |
+| `uart2` | `0x4010_B000` | `0x1000` | 27 | `uart.md` | +00..+14 when the link transport opens it (not on a normal boot) |
+| `spi` | `0x4010_7000` | `0x1000` | 19 or 20 (stubs) | `spi-panel.md` | +00, +04, +08, +0C, +18, +1C, +64 |
+| `spif` | `0x5000_1000` | `0x1000` | 22 (stub) | `spif-nor.md` | +00..+0C, +10, +18, +20, +24, +30, +34, +54, +100 |
+| `trng` | `0x5010_A000` | `0x1000` | 26 (stub) | `crypto.md` | +100..+138 |
+| `sha` | `0x5000_2000` | `0x1000` | 23 (stub) | `crypto.md` | +00, +10..+4C, +60..+7C |
+| `usb` | `0x4000_3000` | `0x1000` | 16 | `usb.md` | +000, +88, +C4, +E0, +E4, +100.., +1A0..+1BC, +32C.. (BSP) |
+| `usbtc` | `0x4010_C000` | `0x1000` | 28 | `usb.md` | +00..+2F (byte/halfword), +1C, +84, +1A4; 34 accesses (BSP) |
+| `gpio` | `0x4010_5000` | `0x1000` | 24 | `gpio.md` | +00, +04, +08, +10, +18, +20, +30, +34, +38, +3C; 29 accesses |
+| `lcdc` | `0x4000_4000` | `0x1000` | 14 | `lcdc.md` | +00..+1C, +28; 25 accesses |
+| `pwm` | `0x4010_4000` | `0x1000` | none | `lcdc.md` | +00, +04; 4 accesses |
+| `keypad` | `0x4010_3000` | `0x1000` | 13 (ON key: 0) | `keypad.md` | +00..+0C; 6 accesses (BSP) |
+| `rtc` | `0x4010_2000` | `0x1000` | 15 | `rtc.md` | +20, +40; 6 accesses (BSP) |
+
+Accesses outside these windows that stay unmodelled on purpose:
+
+- **PPB `0xE004_3018`** (`|= 2`, once per boot): a vendor register in the external PPB,
+  RAZ/WI (`security.md` §4). The CPU passes it to the bus so it shows in the unmapped log.
+- **`0x1800_E000..`** (byte and word reads from `0x1800_E064` up, 20 in the research run):
+  the unprovisioned key source; it reads 0 (`security.md` §2, +0xC0).
+
+## Device runtime decisions
+
+The research found eight gaps that every block shares. Each is decided once, in the device
+runtime (`crates/evo-hw/src/device.rs`, Plan 2 Tasks 3–4) or the CLI:
+
+- **X1, time.** A device sees the cycle count as `DevCtx::now` (`MemoryMap::now`, set from
+  `Scheduler::now` by `Machine`), and asks for a callback with `DevCtx::schedule_at`
+  (Task 3).
+- **X2, clock rate.** `evo_hw::CPU_HZ = 156_000_000`; one `Scheduler::now` unit is one CPU
+  cycle. Devices derive every rate from it (Task 3).
+- **X3, IRQ output.** A device drives its lines with `DevCtx::set_irq` (level-sensitive);
+  `Machine` folds the lines into the NVIC after every step and event. The only edge source
+  is the ON key, `DevCtx::pulse_irq` (Tasks 3–4).
+- **X4/X5, shared flash.** The flash bytes stay a `MemoryMap` buffer named `"flash"`; the
+  SPIF changes them through `DevCtx::buffer_mut("flash")`, so XIP reads see every erase and
+  program at once (no `Rc<RefCell>`, no locking) (Task 3).
+- **X6, flash size.** 16 MiB, erased to 0xFF, at both aliases (Task 4).
+- **X7, resets.** `Device::reset(ResetKind)` with `PowerOn` and `System`; each device's doc
+  says what survives a System reset, and `Machine` rewrites the BL2 header on every reset
+  (Tasks 3–4).
+- **X8, persistence.** The flash bytes and the NOR security registers persist in a flash
+  file, `evo-cli run --flash-file` (Task 13); save states do not carry them.
 
 ## Reproduce
 

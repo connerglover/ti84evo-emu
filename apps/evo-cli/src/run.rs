@@ -8,7 +8,9 @@ use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use evo_core::{Machine, StopReason};
+use evo_core::{
+    CPU_HZ, Frame, KeyAction, Machine, NvError, NvState, StopReason, UartPort, parse_key_script,
+};
 use evo_image::{Bundle, Layout};
 
 /// What `evo-cli run` was asked to do.
@@ -20,10 +22,111 @@ pub struct RunArgs {
     pub breaks: Vec<u32>,
     pub unmapped_out: Option<PathBuf>,
     pub gdb: Option<u16>,
+    /// Stream UART0 TX to stdout.
+    pub uart: bool,
+    /// Bytes to feed into UART0 RX at cycle 0.
+    pub uart_in: Option<PathBuf>,
+    /// The flash file: read at the start (missing: an erased part), written back at the end.
+    pub flash_file: Option<PathBuf>,
+    /// A save state to restore after booting (and reading the flash file).
+    pub load_state: Option<PathBuf>,
+    /// Where to write a save state when the run ends.
+    pub save_state: Option<PathBuf>,
+    /// Where to write the screenshot PNG.
+    pub screenshot: Option<PathBuf>,
+    /// Cycles from the start of the run at which to take the screenshot; `None`: at the stop.
+    pub after: Option<u64>,
+    /// Key presses and releases, in script order (times never decrease).
+    pub keys: Vec<KeyAction>,
+}
+
+/// A parsed `--keys` script (a newtype: clap would read a bare `Vec` as repeated values).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyScript(pub Vec<KeyAction>);
+
+/// `--keys SCRIPT`: the `evo_core::keys` grammar.
+pub fn parse_keys(s: &str) -> Result<KeyScript, String> {
+    parse_key_script(s)
+        .map(KeyScript)
+        .map_err(|e| e.to_string())
+}
+
+/// The cycle at which an action `at_ms` milliseconds after `start` fires:
+/// `start + at_ms * CPU_HZ / 1000`, saturating.
+fn action_cycle(start: u64, at_ms: u64) -> u64 {
+    let offset = u128::from(at_ms) * u128::from(CPU_HZ) / 1000;
+    start.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX))
+}
+
+/// The key script laid out in cycles, consumed as the run reaches each action.
+struct KeyTimeline {
+    /// (cycle, action), in script order.
+    actions: Vec<(u64, KeyAction)>,
+    next: usize,
+}
+
+impl KeyTimeline {
+    fn new(actions: &[KeyAction], start: u64) -> Self {
+        KeyTimeline {
+            actions: actions
+                .iter()
+                .map(|a| (action_cycle(start, a.at_ms), *a))
+                .collect(),
+            next: 0,
+        }
+    }
+
+    /// The cycle of the next action not yet applied.
+    fn next_at(&self) -> Option<u64> {
+        self.actions.get(self.next).map(|&(at, _)| at)
+    }
+
+    /// Apply every action due at or before the machine's current time.
+    fn apply_due(&mut self, m: &mut Machine) {
+        while let Some(&(at, a)) = self.actions.get(self.next) {
+            if at > m.sched.now {
+                break;
+            }
+            m.set_key(a.key, a.pressed);
+            self.next += 1;
+        }
+    }
 }
 
 /// Exit status for a lockup (0 is a normal stop, 1 a host-side error).
 const EXIT_LOCKUP: u8 = 2;
+
+/// The run goes in slices of at most this many cycles (10 ms of guest time); the UARTs are
+/// drained after each.
+pub const UART_SLICE: u64 = 1_560_000;
+
+/// What the guest sent on the UARTs so far.
+#[derive(Default)]
+struct UartSink {
+    /// Print UART0 bytes (`--uart`); otherwise they are discarded.
+    print: bool,
+    /// Bytes seen on UART2, the link port; reported on stderr at the end.
+    uart2: u64,
+}
+
+impl UartSink {
+    /// Drain both UARTs; UART0 goes to `out` if printing.
+    fn drain(&mut self, m: &mut Machine, out: &mut impl Write) -> io::Result<()> {
+        let tx = m.take_uart_tx(UartPort::Uart0);
+        self.uart2 += m.take_uart_tx(UartPort::Uart2).len() as u64;
+        if self.print && !tx.is_empty() {
+            out.write_all(&tx)?;
+        }
+        Ok(())
+    }
+
+    /// `uart2: N bytes` on stderr if there was traffic on UART2.
+    fn report(&self) {
+        if self.uart2 > 0 {
+            eprintln!("uart2: {} bytes", self.uart2);
+        }
+    }
+}
 
 pub fn main(args: RunArgs) -> ExitCode {
     let bundle = match Bundle::open(&args.bundle) {
@@ -33,47 +136,208 @@ pub fn main(args: RunArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut machine = match Machine::from_bundle(&bundle, &Layout::EVO_7_1) {
+    // Every input is read before the machine exists: an input error never touches the flash
+    // file.
+    let nv = match args.flash_file.as_deref().map(read_flash_file) {
+        Some(Ok(nv)) => nv,
+        Some(Err(())) => return ExitCode::FAILURE,
+        None => None,
+    };
+    let uart_in = match &args.uart_in {
+        Some(path) => match fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                eprintln!("evo-cli: {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let state = match &args.load_state {
+        Some(path) => match fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                eprintln!("evo-cli: {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let mut machine = match Machine::from_bundle_nv(&bundle, &Layout::EVO_7_1, nv) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("evo-cli: {}: {e}", args.bundle.display());
             return ExitCode::FAILURE;
         }
     };
+    // A state that does not fit is an input error too: reported before the run, with the flash
+    // file untouched.
+    if let (Some(path), Some(bytes)) = (&args.load_state, &state)
+        && let Err(e) = machine.load_state(bytes)
+    {
+        eprintln!("evo-cli: {}: {e}", path.display());
+        return ExitCode::FAILURE;
+    }
+    if let Some(bytes) = &uart_in {
+        machine.inject_uart_rx(UartPort::Uart0, bytes);
+    }
+    let code = run_machine(&mut machine, &args);
+    if machine.take_power_off() {
+        eprintln!("power: off (GPIO pin 1 released)");
+    }
+    let code = match &args.save_state {
+        Some(path) => match write_state(path, &machine.save_state()) {
+            Ok(()) => code,
+            Err(e) => {
+                eprintln!("evo-cli: {}: {e}", path.display());
+                ExitCode::FAILURE
+            }
+        },
+        None => code,
+    };
+    // However the run ended (stop, lockup, GDB session end, a trace cut short, an output
+    // error), the flash goes back to the file.
+    match &args.flash_file {
+        Some(path) => match machine.nv_state().write_file(path) {
+            Ok(()) => code,
+            Err(e) => {
+                eprintln!("evo-cli: {}: {e}", path.display());
+                ExitCode::FAILURE
+            }
+        },
+        None => code,
+    }
+}
+
+/// `--save-state PATH`: write `bytes` through a temporary file next to `path`, so a failed write
+/// never leaves a half-written state under the final name.
+fn write_state(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let res = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// `--flash-file PATH`: the saved state, `None` (start erased) if there is no file yet. An
+/// unreadable or invalid file is reported and is `Err`; the file is not touched.
+fn read_flash_file(path: &Path) -> Result<Option<NvState>, ()> {
+    match NvState::read_file(path) {
+        Ok(nv) => Ok(Some(nv)),
+        Err(NvError::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => {
+            eprintln!("evo-cli: {}: {e}", path.display());
+            Err(())
+        }
+    }
+}
+
+/// Run the booted machine as `args` asks, report, and return the exit status.
+fn run_machine(machine: &mut Machine, args: &RunArgs) -> ExitCode {
     // Breakpoints compare against the PC, whose bit 0 is always clear.
     machine
         .breakpoints
         .extend(args.breaks.iter().map(|a| a & !1));
+    let mut uarts = UartSink {
+        print: args.uart,
+        ..UartSink::default()
+    };
     if let Some(port) = args.gdb {
-        return gdb(&mut machine, port, args.unmapped_out.as_deref());
+        return gdb(machine, port, args.unmapped_out.as_deref(), &mut uarts);
     }
 
     // Written as the run goes, in buffered blocks: a trace can be gigabytes.
     let mut out = BufWriter::new(io::stdout().lock());
-    // The first stdout error. A trace stops the run at the first one (e.g. `| head` closed
-    // the pipe): nothing more can be printed. The unmapped log is still written.
+    // The first stdout error. It stops the run at the end of the slice, or at once while
+    // tracing (e.g. `| head` closed the pipe): nothing more can be printed. The unmapped log is
+    // still written.
     let mut stdout_err: Option<io::Error> = None;
-    let stop = if args.trace || args.trace_range.is_some() {
-        let range = args.trace_range.clone().unwrap_or(0..u32::MAX);
-        machine.run_with(args.max_cycles, |m| {
-            if range.contains(&m.cpu.regs.pc) {
-                stdout_err = writeln!(out, "{}", m.trace_line()).err();
+    let tracing = args.trace || args.trace_range.is_some();
+    let range = args.trace_range.clone().unwrap_or(0..u32::MAX);
+    let start = machine.sched.now;
+    let end = start.saturating_add(args.max_cycles);
+    let mut keys = KeyTimeline::new(&args.keys, start);
+    // `--after N`: the cycle to take the screenshot at; `None` once taken (or never asked).
+    let mut shot_at = args
+        .screenshot
+        .as_ref()
+        .and(args.after)
+        .map(|n| start.saturating_add(n));
+    let mut shot: Option<Option<Frame>> = None;
+    let stop = loop {
+        keys.apply_due(machine);
+        if shot_at.is_some_and(|at| machine.sched.now >= at) {
+            shot = Some(machine.screen());
+            shot_at = None;
+        }
+        // A slice ends at the budget, after UART_SLICE, at the next key action and at --after.
+        let now = machine.sched.now;
+        let limit = [Some(end), keys.next_at(), shot_at]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(end);
+        let slice = limit.saturating_sub(now).min(UART_SLICE);
+        let stop = if tracing {
+            machine.run_with(slice, |m| {
+                if range.contains(&m.cpu.regs.pc) {
+                    stdout_err = writeln!(out, "{}", m.trace_line()).err();
+                }
+                match stdout_err {
+                    Some(_) => ControlFlow::Break(()),
+                    None => ControlFlow::Continue(()),
+                }
+            })
+        } else {
+            machine.run(slice)
+        };
+        if stdout_err.is_none() {
+            stdout_err = uarts.drain(machine, &mut out).err();
+        }
+        if stdout_err.is_some() {
+            break stop;
+        }
+        // Asleep with nothing scheduled, but a key press is still to come within the budget:
+        // nothing can happen before it, so time moves straight there (no event is due and
+        // SysTick is not counting, or the machine would not have reported `Idle`).
+        if stop == StopReason::Idle {
+            match keys.next_at() {
+                Some(at) if at <= end => {
+                    machine.sched.now = machine.sched.now.max(at);
+                    continue;
+                }
+                _ => break stop,
             }
-            match stdout_err {
-                Some(_) => ControlFlow::Break(()),
-                None => ControlFlow::Continue(()),
-            }
-        })
-    } else {
-        machine.run(args.max_cycles)
+        }
+        if stop != StopReason::CycleLimit || machine.sched.now >= end {
+            break stop;
+        }
     };
+    if args.screenshot.is_some() && shot.is_none() {
+        // Reported only when the run stopped short of --after (not when it reached it at the end).
+        if let Some(at) = shot_at.filter(|&at| machine.sched.now < at) {
+            eprintln!(
+                "screenshot: the run stopped at cycle {} before --after (cycle {at}); taken there",
+                machine.sched.now
+            );
+        }
+        shot = Some(machine.screen());
+    }
     if stdout_err.is_none() {
-        stdout_err = summary(&mut out, &machine, stop)
+        stdout_err = summary(&mut out, machine, stop)
             .and_then(|()| out.flush())
             .err();
     }
+    uarts.report();
 
-    if !write_unmapped(args.unmapped_out.as_deref(), &machine) {
+    let mut failed = false;
+    if let (Some(path), Some(frame)) = (&args.screenshot, shot) {
+        failed |= !write_screenshot(path, frame.as_ref());
+    }
+    if !write_unmapped(args.unmapped_out.as_deref(), machine) || failed {
         return ExitCode::FAILURE;
     }
     match stdout_err {
@@ -87,7 +351,13 @@ pub fn main(args: RunArgs) -> ExitCode {
 }
 
 /// `--gdb PORT`: serve one GDB client on localhost, then report where it left the machine.
-fn gdb(machine: &mut Machine, port: u16, unmapped_out: Option<&Path>) -> ExitCode {
+/// UART output the guest produced during the session is printed (with `--uart`) when it ends.
+fn gdb(
+    machine: &mut Machine,
+    port: u16,
+    unmapped_out: Option<&Path>,
+    uarts: &mut UartSink,
+) -> ExitCode {
     // Loopback only: whoever connects controls the machine.
     let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
         Ok(l) => l,
@@ -111,13 +381,18 @@ fn gdb(machine: &mut Machine, port: u16, unmapped_out: Option<&Path>) -> ExitCod
     }
 
     let mut out = io::stdout().lock();
-    let printed = writeln!(
-        out,
-        "gdb: session ended pc=0x{:08x} cycles={}",
-        machine.cpu.regs.pc, machine.sched.now
-    )
-    .and_then(|()| notes(&mut out, machine, false))
-    .and_then(|()| out.flush());
+    let printed = uarts
+        .drain(machine, &mut out)
+        .and_then(|()| {
+            writeln!(
+                out,
+                "gdb: session ended pc=0x{:08x} cycles={}",
+                machine.cpu.regs.pc, machine.sched.now
+            )
+        })
+        .and_then(|()| notes(&mut out, machine, false))
+        .and_then(|()| out.flush());
+    uarts.report();
     if !write_unmapped(unmapped_out, machine) {
         return ExitCode::FAILURE;
     }
@@ -128,6 +403,32 @@ fn gdb(machine: &mut Machine, port: u16, unmapped_out: Option<&Path>) -> ExitCod
         }
         _ => ExitCode::SUCCESS,
     }
+}
+
+/// `--screenshot PATH`: write `frame` as an RGB8 PNG; with no frame (the LCD is off) say so and
+/// write nothing. False (reported) if the file cannot be written.
+fn write_screenshot(path: &Path, frame: Option<&Frame>) -> bool {
+    let Some(frame) = frame else {
+        eprintln!("screenshot: display is off");
+        return true;
+    };
+    match encode_png(path, frame) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("evo-cli: {}: {e}", path.display());
+            false
+        }
+    }
+}
+
+fn encode_png(path: &Path, frame: &Frame) -> Result<(), png::EncodingError> {
+    let file = io::BufWriter::new(fs::File::create(path)?);
+    let mut encoder = png::Encoder::new(file, frame.width, frame.height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(&frame.rgb)?;
+    writer.finish()
 }
 
 /// Write the unmapped-access log to `path`, if given; false (reported) if that fails.
@@ -254,6 +555,11 @@ mod tests {
         assert!(parse_range("0x20..0x10").is_err());
         assert!(parse_range("0x10").is_err());
         assert!(parse_range("0x10..").is_err());
+    }
+
+    #[test]
+    fn uart_slice_is_10_ms() {
+        assert_eq!(UART_SLICE, evo_core::CPU_HZ / 100);
     }
 
     #[test]
