@@ -1,0 +1,46 @@
+name: release
+
+# Builds the Windows executables (evo-gui.exe, evo-cli.exe).
+# - Every push to main and every manual run: uploads a zip as a workflow artifact.
+# - Pushing a tag like v0.1.0: also publishes the zip on a GitHub Release.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked -p evo-gui -p evo-cli
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = if ($env:GITHUB_REF_TYPE -eq 'tag') { "ti84evo-emu-$env:GITHUB_REF_NAME-windows-x64" } else { "ti84evo-emu-$($env:GITHUB_SHA.Substring(0,7))-windows-x64" }
+          New-Item -ItemType Directory -Force dist/$name | Out-Null
+          Copy-Item target/release/evo-gui.exe, target/release/evo-cli.exe, LICENSE, README.md dist/$name/
+          Compress-Archive -Path dist/$name/* -DestinationPath dist/$name.zip
+          "ZIP_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: dist/${{ env.ZIP_NAME }}.zip
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ env.ZIP_NAME }}.zip
+          generate_release_notes: true

@@ -1,5 +1,8 @@
 //! The `evo-gui` binary: opens the emulator window.
 
+// Release builds on Windows are GUI apps: no console window next to the emulator.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
