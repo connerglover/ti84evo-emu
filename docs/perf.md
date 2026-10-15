@@ -260,3 +260,13 @@ The cache is not state, so a clone now starts empty and fills its own.
 |---|---|---|
 | `Cpu::clone` | 4 063 ns | 99 ns |
 | `Machine::save_state` | 11.3 ms | 11.4 ms (dominated by SRAM) |
+
+### 12. The registers behind the hint caches are private to `armv8m`
+
+`Nvic::enabled` / `Nvic::pending` (behind the "nothing pending" hint of step 4) and the SAU
+configuration `Sau::ctrl` / `rnr` / `rbar` / `rlar` with `Sau::write` (behind the attribution
+and instruction caches of steps 5 and 9) were public, so code outside the crate could change them
+without updating the hints. They are `pub(crate)` now: the NVIC words change through
+`Nvic::set_enabled` (new) / `set_pending` / `write`, the SAU through the CPU (`Cpu::ppb_write32`
+or a guest store), and `Sau::ctrl()` / `Sau::region(r)` read them. Compile-fail doc tests pin
+both. No throughput change (nothing outside the crate used them).

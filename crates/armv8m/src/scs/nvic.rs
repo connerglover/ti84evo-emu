@@ -9,10 +9,20 @@ pub const WORDS: usize = NUM_IRQS / 32;
 /// End of the priority registers, as an offset from `NVIC_ISER0`.
 const IPR_END: u32 = 0x300 + NUM_IRQS as u32;
 
+/// NVIC state.
+///
+/// `enabled` and `pending` back the "nothing pending" hint (`quiet`), so outside this crate they
+/// are read and changed only through methods (`is_enabled`, `set_enabled`, `is_pending`,
+/// `set_pending`, `write`):
+///
+/// ```compile_fail
+/// let mut nvic = armv8m::scs::nvic::Nvic::default();
+/// nvic.pending[0] = 1;
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Nvic {
-    pub enabled: [u32; WORDS],
-    pub pending: [u32; WORDS],
+    pub(crate) enabled: [u32; WORDS],
+    pub(crate) pending: [u32; WORDS],
     pub active: [u32; WORDS],
     /// Current level of each (level-sensitive) input line.
     pub level: [u32; WORDS],
@@ -124,6 +134,11 @@ impl Nvic {
         get(&self.enabled, irq)
     }
 
+    pub fn set_enabled(&mut self, irq: usize, v: bool) {
+        self.quiet = Quiet(false);
+        put(&mut self.enabled, irq, v);
+    }
+
     pub fn is_pending(&self, irq: usize) -> bool {
         get(&self.pending, irq)
     }
@@ -230,5 +245,22 @@ impl Nvic {
             _ => return None,
         }
         Some(newly_pending)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_enabled_ends_the_quiet_hint() {
+        let mut n = Nvic::default();
+        n.set_pending(5, true);
+        assert!(n.none_live(), "pending but disabled");
+        n.set_enabled(5, true);
+        assert!(n.is_enabled(5));
+        assert!(!n.none_live(), "pending and enabled");
+        n.set_enabled(5, false);
+        assert!(n.none_live());
     }
 }

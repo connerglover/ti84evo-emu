@@ -120,16 +120,27 @@ pub(crate) struct SecAttr {
 }
 
 /// SAU registers (`0xE000_EDD0..=0xE000_EDE8`, Secure only) and the SecureFault status.
+///
+/// The CPU caches attributions (and decoded instructions with them), so every change to the
+/// SAU configuration has to go through the CPU, which empties those caches:
+/// `Cpu::ppb_write32` (or a guest store) to the SAU registers. Outside this crate the
+/// configuration is read-only ([`read`](Self::read), [`ctrl`](Self::ctrl),
+/// [`region`](Self::region)):
+///
+/// ```compile_fail
+/// let mut cpu = armv8m::Cpu::new();
+/// cpu.scs.sau.ctrl = 1;
+/// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sau {
     /// `SAU_CTRL`: ENABLE, ALLNS.
-    pub ctrl: u32,
+    pub(crate) ctrl: u32,
     /// `SAU_RNR`: selected region.
-    pub rnr: u32,
+    pub(crate) rnr: u32,
     /// `SAU_RBAR`: BADDR[31:5].
-    pub rbar: [u32; REGIONS],
+    pub(crate) rbar: [u32; REGIONS],
     /// `SAU_RLAR`: LADDR[31:5], NSC, ENABLE.
-    pub rlar: [u32; REGIONS],
+    pub(crate) rlar: [u32; REGIONS],
     /// `SFSR` (write-one-to-clear).
     pub sfsr: u32,
     /// `SFAR`, valid while `SFSR.SFARVALID` is set.
@@ -140,6 +151,16 @@ impl Sau {
     fn selected(&self) -> Option<usize> {
         let r = self.rnr as usize;
         (r < REGIONS).then_some(r)
+    }
+
+    /// `SAU_CTRL`.
+    pub fn ctrl(&self) -> u32 {
+        self.ctrl
+    }
+
+    /// Region `r`'s `(SAU_RBAR, SAU_RLAR)`; `None` past the last region.
+    pub fn region(&self, r: usize) -> Option<(u32, u32)> {
+        Some((*self.rbar.get(r)?, *self.rlar.get(r)?))
     }
 
     /// Read the register at offset `off` from `SAU_CTRL` (0xE000_EDD0); `None` if unimplemented.
@@ -157,8 +178,8 @@ impl Sau {
     }
 
     /// Write the register at offset `off`; returns false if unimplemented. Region writes with
-    /// `SAU_RNR` out of range are ignored.
-    pub fn write(&mut self, off: u32, v: u32) -> bool {
+    /// `SAU_RNR` out of range are ignored. The caller empties the CPU's attribution caches.
+    pub(crate) fn write(&mut self, off: u32, v: u32) -> bool {
         match off {
             0x00 => self.ctrl = v & (CTRL_ENABLE | CTRL_ALLNS),
             0x04 => {}
