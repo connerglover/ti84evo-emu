@@ -339,9 +339,9 @@ counts are recorded here as each one passes.
 | milestone | what it shows | cycle |
 |---|---|---|
 | M1 | `Booting TF-M v2.1.1` on UART0 (steps 1–3) | 81,955,780 (first UART0 byte, without a SPIF model: the 100 ms Read-ID timeout and the SPI-device delays come first; Task 10) |
-| M2 | secure boot completes; NS hand-off at 0x0011_6D50; `Starting BSP` on UART0 | hand-off 70,784,675 (first boot, 0 resets; 70,282,729 on the second power-on from the saved NV state); `Starting BSP` by 80,784,676 (the test checks UART0 every 10 M cycles, so this is an upper bound); Task 16 |
+| M2 | secure boot completes; NS hand-off at 0x0011_6D50; `Starting BSP` on UART0 | hand-off 70,784,677 (first boot, 0 resets; 70,282,731 on the second power-on from the saved NV state); `Starting BSP` by 80,784,677 (the test checks UART0 every 10 M cycles, so this is an upper bound); Task 16 |
 | M3 | the boot logo on the emulated screen | 90,000,000 (the TI logo alone is on the screen from about 80 M to 100 M; Task 23, "M3 notes") |
-| M4 | OS image 1 entered at 0x0044_BC90 | 656,271,393 (fresh unit: ENTER at 2.5 s and 0 at 3.1 s in the Self-Test app; Task 24, "M4 notes") |
+| M4 | OS image 1 entered at 0x0044_BC90; the OS home screen at 1,400 M | 656,271,401 (fresh unit: ENTER at 2.5 s and 0 at 3.1 s in the Self-Test app; Task 24, "M4 notes"; 656,271,393 in Task 24) |
 | provisioned | image 1 entered with no key input after `provision` (§3.5) | 299,930,397 (power-on 2: 299,944,694 from a flash file; power-on 3: 299,868,494 from the flash power-on 2 re-saved; fix wave Task 3) |
 
 The M1 banner now arrives by cycle 70,000,001 (same 10 M-cycle granularity): with the SPIF
@@ -374,17 +374,19 @@ the Read-ID probe no longer times out.
 - **What the screen shows, in order** (screenshots every few M cycles with
   `evo-cli run --screenshot`): the secure splash (the TI logo) from about 70 M; the BSP
   redraws the same logo with `Starting BSP` (a different frame hash, the same picture) and
-  it stays alone on the screen up to about 100 M; by 105 M a grey busy spinner is drawn above
-  it; by 130 M a battery icon with a green bar replaces the spinner, and the logo is then
-  cleared. From about 180 M the screen shows only the battery icon, whose bars fill one by one
-  (one step every 100 M to 150 M cycles) and start again: a **charging animation**, still
-  running at 3,000 M.
+  it stays alone on the screen up to about 100 M; by 110 M a grey busy spinner is drawn above
+  it. On a fresh unit the BSP then starts the Self-Test app (§3.3): by 130 M its unit-info
+  screen (the model name, the BL1/BL2/BSP versions, the product number, the unit ID and a
+  QR code, drawn last) replaces the logo, and from about 150 M it stays there until a key is
+  pressed (fix wave Task 5 re-check). In Task 23, before the M4 fixes, the BSP showed a
+  charging animation (a battery icon whose bars fill one by one) instead; that no longer
+  happens.
 - **The pinned frame.** `m3_boot_logo` hashes the frame at 90,000,000 (the middle of the
   logo-only window; the window bounds are not exact). The `m3_find_settled_logo` search
   (50 M slices from the `Starting BSP` cycle, three equal frames in a row) never sees the
-  logo-only frame: its first slice ends at about 130 M, and it stops on a charging-animation
-  step (three bars) that happens to last three slices. That frame is not a settled image, so
-  it was not used.
+  logo-only frame: its first slice ends at about 130 M, and it now settles on the Self-Test
+  unit-info screen at 180,784,677 (in Task 23 it stopped on a step of the charging animation).
+  That screen is not the boot logo, so it is not the pinned frame.
 - **Approval.** The frame at 90 M was checked by eye by the Task 23 implementer (Claude), not
   by the user: the Texas Instruments wordmark with its logo, horizontally centred in the lower
   third of a black screen, upright, reads left to right, not mirrored. This confirms the
@@ -393,10 +395,10 @@ the Read-ID probe no longer times out.
 - **The colour order is not confirmed by M3.** The logo and spinner are grey and the battery
   bars are green; none of them tells R from B apart. The OS launcher settled it (`lcdc.md`
   "Colour order").
-- **Input for M4 (Task 24).** The charging animation suggests the BSP treats this power-on as
-  a charger wake-up (off-mode charging) rather than an ON-key boot: a lead for the launch gate
-  of §5 item 8. Holding the ON key from power-on for 1 s (`--keys "+on wait=1000 -on"`) shows
-  the same animation at 400 M. Not investigated further here.
+- **Input for M4 (Task 24), resolved.** The charging animation came with the board inputs
+  undriven: since the M4 fixes (GPIO pins 9/11, the charger status among them, driven high as
+  the board does, `gpio.md`) the BSP boots to the Self-Test app instead, and M4 leaves it
+  through its menu ("M4 notes").
 - **Checks at 90 M:** the backlight PWM brightness is above 0; no SRAM access past 1.5 MiB;
   no fatal stub IRQ line; no unmapped access outside `KNOWN_UNMODELLED`; a second boot gives
   the same frame hash.
@@ -407,7 +409,8 @@ the Read-ID probe no longer times out.
   GPIO pins 9/11 driven high by the board (`gpio.md`), CRU +0x10 strap = 1 (`security.md`),
   SHA CTRL bit 2 = continue (`crypto.md`), images 2..9 placed after image 1
   (`evo_image::Layout::place`). Then the Self-Test menu's "0. Exit this menu" (§3.3).
-- **Launch cycle:** 656,271,393 (budget 1,000 M in `m4_image1_launches`); 0 system resets.
+- **Launch cycle:** 656,271,401 (656,271,393 in Task 24; budget 1,000 M in
+  `m4_image1_launches`); 0 system resets.
 - **BSP → OS service table:** r0 = 0x0018_2024 at the entry; the OS stores it at
   0x2009_B100 (checked by the test after 500 M more cycles). OS-to-BSP calls go through
   `[[0x2009_B100] + n*4]` (stub 0x0044bc9e).
@@ -415,6 +418,11 @@ the Read-ID probe no longer times out.
   shows the OS home screen (an app grid titled "CALCULATOR") by about 7.9 s of guest time.
   The OS reaches hardware through the BSP, so the next work (keypad input, RTC, Plan 3)
   follows the BSP's drivers.
+- **The OS runs (fix wave Task 5).** `m4_image1_launches` also hashes the screen at
+  1,400,000,000 cycles (about 9 s): the OS home screen, the app launcher titled "CALCULATOR"
+  with its first app selected, checked by eye by the Task 5 implementer (Claude). The frame is
+  written to `m4-home.png` in the test's scratch directory (`CARGO_TARGET_TMPDIR`) for that
+  check; only its SHA-256 is committed.
 - **Key source.** With correct SHA-256 digests the secure image reads the unmapped OTP page
   at 0x1800_E03C and 0x1800_E0F4 (16 bytes each, reads 0); the milestone tests accept the
   whole 4 KiB page 0x1800_E000..0x1800_EFFF.

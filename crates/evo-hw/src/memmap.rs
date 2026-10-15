@@ -7,6 +7,8 @@
 //! `BusError::Decode` so the CPU raises IBUSERR instead of executing zeros (`movs r0, r0`)
 //! forever. Data accesses never fault in Plan 1.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use armv8m::{Access, AccessKind, Bus, BusError};
 use serde::{Deserialize, Serialize};
 
@@ -75,7 +77,58 @@ pub struct MemoryMap {
     /// Event requests `(device id, Some(at) | None = cancel)`, in order.
     #[serde(skip)]
     events: Vec<(u16, Option<u64>)>,
+    /// The fast path: one entry per 64 KiB page of the address space ([`Page`]), filled in as
+    /// RAM and ROM windows are added (windows are never removed, and a device can never share
+    /// a page with a whole-page window). Not serialized: a deserialized map has an empty table
+    /// and takes the general path for every access, with the same results.
+    #[serde(skip)]
+    pages: Vec<Page>,
+    /// Set whenever a device ran (or had its state replaced), which is the only way IRQ
+    /// lines, pulses and event requests change; cleared by [`MemoryMap::take_device_activity`].
+    #[serde(skip)]
+    device_activity: bool,
+    /// [`Bus::code_epoch`]: replaced by a fresh value whenever bytes the CPU may have cached as
+    /// code can have changed (a write to a code page, `buffer_mut`, `poke`, a device writing a
+    /// buffer). Fresh per map, so a CPU moved to another map never mistakes its old entries.
+    #[serde(skip)]
+    code_epoch: Epoch,
+    /// Per buffer, per 64 KiB page of the buffer: whether [`Bus::cache_code`] accepted code
+    /// in it, so writes to it must change `code_epoch`. Grown on demand.
+    #[serde(skip)]
+    code_pages: Vec<Vec<bool>>,
+    /// Index of the window the last general-path access hit (a hint; any value is safe).
+    #[serde(skip)]
+    last_region: usize,
+    /// The OR of every slot's `irq_out`, updated whenever one changes.
+    #[serde(skip)]
+    irq_lines: u64,
 }
+
+/// Source of [`MemoryMap::code_epoch`] values, unique within the process.
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// A [`Bus::code_epoch`] value; `default` takes a fresh one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Epoch(u64);
+
+impl Default for Epoch {
+    fn default() -> Self {
+        Epoch(NEXT_EPOCH.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// log2 of the page size of [`MemoryMap::pages`].
+const PAGE_BITS: u32 = 16;
+const PAGE_SIZE: u32 = 1 << PAGE_BITS;
+/// [`Page`] flag: the page is ROM (reads only; writes take the general path, which logs them).
+const PAGE_ROM: u32 = 1 << 16;
+
+/// A page wholly inside one RAM or ROM window: bits 0..16 are the page's index within the
+/// buffer, bit 16 is [`PAGE_ROM`], bits 24..32 hold the buffer index plus one. 0 for every
+/// other page (devices, unmapped space, partly covered pages, buffers past index 254), which
+/// take the general path.
+#[derive(Clone, Copy, Default)]
+struct Page(u32);
 
 /// Where an access lands relative to the window table.
 enum Span {
@@ -128,6 +181,104 @@ impl MemoryMap {
                 target,
             };
             region::insert(&mut self.regions, region);
+            self.map_pages(base, size, b, rom);
+        }
+    }
+
+    /// Enter the whole pages of a new RAM/ROM window (at `base`, `size` bytes, buffer `b`) in
+    /// the page table. Partly covered pages stay on the general path.
+    fn map_pages(&mut self, base: u32, size: u32, b: usize, rom: bool) {
+        let Some(tag) = u32::try_from(b + 1).ok().filter(|&t| t <= 0xFF) else {
+            return;
+        };
+        if !base.is_multiple_of(PAGE_SIZE) {
+            return;
+        }
+        if self.pages.is_empty() {
+            self.pages = vec![Page::default(); 1 << (32 - PAGE_BITS)];
+        }
+        let first = (base >> PAGE_BITS) as usize;
+        let rom = if rom { PAGE_ROM } else { 0 };
+        for i in 0..(size >> PAGE_BITS) {
+            self.pages[first + i as usize] = Page(tag << 24 | rom | i);
+        }
+    }
+
+    /// The bytes of a RAM/ROM access of `width` bytes at `addr` that lies inside one whole
+    /// page of the page table (and, for `write`, not in ROM); `None` sends it down the
+    /// general path.
+    #[inline]
+    fn page_bytes(&mut self, addr: u32, width: u32, write: bool) -> Option<&mut [u8]> {
+        let page = self.pages.get((addr >> PAGE_BITS) as usize)?.0;
+        let in_page = addr & (PAGE_SIZE - 1);
+        if page == 0 || in_page + width > PAGE_SIZE || (write && page & PAGE_ROM != 0) {
+            return None;
+        }
+        let b = ((page >> 24) as usize).checked_sub(1)?;
+        let buf_page = (page & 0xFFFF) as usize;
+        if write {
+            self.note_write(b, buf_page);
+        }
+        let buf = self.buffers.get_mut(b)?;
+        let start = (buf_page << PAGE_BITS) | in_page as usize;
+        buf.data.get_mut(start..start + width as usize)
+    }
+
+    /// A write is about to change page `buf_page` of buffer `b`: if the CPU may have cached
+    /// code from it, change the code epoch.
+    #[inline]
+    fn note_write(&mut self, b: usize, buf_page: usize) {
+        let code = self
+            .code_pages
+            .get(b)
+            .and_then(|pages| pages.get(buf_page))
+            .copied()
+            .unwrap_or(false);
+        if code {
+            self.code_changed();
+        }
+    }
+
+    /// Bytes the CPU may have cached as code can have changed.
+    fn code_changed(&mut self) {
+        self.code_epoch = Epoch::default();
+    }
+
+    /// Mark the page holding `addr` as code for [`Bus::cache_code`], if it is a whole RAM/ROM
+    /// page; `false` otherwise.
+    fn mark_code(&mut self, addr: u32) -> bool {
+        let Some(&Page(page)) = self.pages.get((addr >> PAGE_BITS) as usize) else {
+            return false;
+        };
+        let Some(b) = ((page >> 24) as usize).checked_sub(1) else {
+            return false;
+        };
+        let buf_page = (page & 0xFFFF) as usize;
+        if self.code_pages.len() <= b {
+            self.code_pages.resize(b + 1, Vec::new());
+        }
+        let pages = &mut self.code_pages[b];
+        if pages.len() <= buf_page {
+            pages.resize(buf_page + 1, false);
+        }
+        pages[buf_page] = true;
+        true
+    }
+
+    #[inline]
+    fn fast_read<const N: usize>(&mut self, addr: u32) -> Option<[u8; N]> {
+        let bytes = self.page_bytes(addr, N as u32, false)?;
+        <[u8; N]>::try_from(&*bytes).ok()
+    }
+
+    #[inline]
+    fn fast_write(&mut self, addr: u32, v: &[u8]) -> bool {
+        match self.page_bytes(addr, v.len() as u32, true) {
+            Some(dst) => {
+                dst.copy_from_slice(v);
+                true
+            }
+            None => false,
         }
     }
 
@@ -173,6 +324,8 @@ impl MemoryMap {
         f: impl FnOnce(&mut dyn Device, &mut DevCtx<'_>) -> R,
     ) -> Option<R> {
         let slot = self.slots.get_mut(id)?;
+        self.device_activity = true;
+        let old_irq = slot.irq_out;
         // `id` fits: add_device checked every slot index.
         let mut ctx = DevCtx::new(
             self.now,
@@ -186,7 +339,15 @@ impl MemoryMap {
             self.pc_hint,
             secure,
         );
-        Some(f(slot.dev.as_mut(), &mut ctx))
+        let r = f(slot.dev.as_mut(), &mut ctx);
+        let written = ctx.buffers_written();
+        if slot.irq_out != old_irq {
+            self.update_irq_lines();
+        }
+        if written {
+            self.code_changed();
+        }
+        Some(r)
     }
 
     fn slot_id(&self, name: &str) -> Option<usize> {
@@ -233,7 +394,18 @@ impl MemoryMap {
 
     /// Level IRQ lines: the OR of every device's lines (bit n = line n).
     pub fn irq_lines(&self) -> u64 {
-        self.slots.iter().fold(0, |acc, s| acc | s.irq_out)
+        self.irq_lines
+    }
+
+    /// Recompute [`irq_lines`](Self::irq_lines) after a device's lines changed.
+    fn update_irq_lines(&mut self) {
+        self.irq_lines = self.slots.iter().fold(0, |acc, s| acc | s.irq_out);
+    }
+
+    /// Whether any device ran or had its state loaded since the last call: until one does,
+    /// [`irq_lines`](Self::irq_lines), pulses and event requests cannot have changed.
+    pub fn take_device_activity(&mut self) -> bool {
+        std::mem::take(&mut self.device_activity)
     }
 
     /// Edge IRQs requested since the last call, in order.
@@ -249,6 +421,7 @@ impl MemoryMap {
 
     /// Backing bytes of the RAM or ROM called `name` (the first one if names repeat).
     pub fn buffer_mut(&mut self, name: &str) -> Option<&mut [u8]> {
+        self.code_changed();
         self.buffers
             .iter_mut()
             .find(|b| b.name == name)
@@ -295,9 +468,11 @@ impl MemoryMap {
                 return Err(e);
             }
         }
+        self.device_activity = true;
         for (slot, st) in self.slots.iter_mut().zip(states) {
             slot.irq_out = st.irq_out;
         }
+        self.update_irq_lines();
         Ok(())
     }
 
@@ -341,6 +516,7 @@ impl MemoryMap {
                 *slot = b;
             }
         }
+        self.code_changed();
         true
     }
 
@@ -392,8 +568,15 @@ impl MemoryMap {
     }
 
     /// Classify an access of `width` bytes at `addr` (addresses wrap at 2^32, like the CPU's).
-    fn span(&self, addr: u32, width: u8) -> Span {
-        if let Some(i) = region::find(&self.regions, addr) {
+    fn span(&mut self, addr: u32, width: u8) -> Span {
+        // Device polling hits the same window again and again: try the last one first.
+        let last = self
+            .regions
+            .get(self.last_region)
+            .filter(|r| r.base <= addr && u64::from(addr) < r.end())
+            .map(|_| self.last_region);
+        if let Some(i) = last.or_else(|| region::find(&self.regions, addr)) {
+            self.last_region = i;
             let r = &self.regions[i];
             let off = addr - r.base;
             return if u64::from(off) + u64::from(width) <= u64::from(r.size) {
@@ -441,6 +624,8 @@ impl MemoryMap {
         match target {
             Target::Ram(b) => {
                 let start = off as usize;
+                self.note_write(b, start >> PAGE_BITS);
+                self.note_write(b, (start + usize::from(width) - 1) >> PAGE_BITS);
                 let dst = self
                     .buffers
                     .get_mut(b)
@@ -537,26 +722,60 @@ impl MemoryMap {
     }
 }
 
+/// Every access first tries the page table (whole RAM/ROM pages: a plain copy, nothing to log),
+/// then the general path.
 impl Bus for MemoryMap {
+    #[inline]
     fn read8(&mut self, addr: u32, a: Access) -> Result<u8, BusError> {
+        if let Some([b]) = self.fast_read(addr) {
+            return Ok(b);
+        }
         Ok(self.bus_read(addr, 1, a)? as u8)
     }
+    #[inline]
     fn read16(&mut self, addr: u32, a: Access) -> Result<u16, BusError> {
+        if let Some(b) = self.fast_read(addr) {
+            return Ok(u16::from_le_bytes(b));
+        }
         Ok(self.bus_read(addr, 2, a)? as u16)
     }
+    #[inline]
     fn read32(&mut self, addr: u32, a: Access) -> Result<u32, BusError> {
+        if let Some(b) = self.fast_read(addr) {
+            return Ok(u32::from_le_bytes(b));
+        }
         self.bus_read(addr, 4, a)
     }
+    #[inline]
     fn write8(&mut self, addr: u32, v: u8, a: Access) -> Result<(), BusError> {
-        self.write(addr, 1, u32::from(v), a.secure);
+        if !self.fast_write(addr, &[v]) {
+            self.write(addr, 1, u32::from(v), a.secure);
+        }
         Ok(())
     }
+    #[inline]
     fn write16(&mut self, addr: u32, v: u16, a: Access) -> Result<(), BusError> {
-        self.write(addr, 2, u32::from(v), a.secure);
+        if !self.fast_write(addr, &v.to_le_bytes()) {
+            self.write(addr, 2, u32::from(v), a.secure);
+        }
         Ok(())
     }
+    #[inline]
     fn write32(&mut self, addr: u32, v: u32, a: Access) -> Result<(), BusError> {
-        self.write(addr, 4, v, a.secure);
+        if !self.fast_write(addr, &v.to_le_bytes()) {
+            self.write(addr, 4, v, a.secure);
+        }
         Ok(())
+    }
+    fn code_epoch(&self) -> u64 {
+        self.code_epoch.0
+    }
+    /// Code in whole RAM/ROM pages (the page table) can be cached; writes to those pages,
+    /// `buffer_mut`, `poke` and devices writing buffers change the epoch.
+    fn cache_code(&mut self, addr: u32, len: u32) -> bool {
+        let Some(last) = addr.checked_add(len.saturating_sub(1)) else {
+            return false;
+        };
+        self.mark_code(addr) && self.mark_code(last)
     }
 }

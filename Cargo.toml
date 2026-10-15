@@ -19,3 +19,12 @@ egui = { version = "0.36.2", features = ["serde"] }
 egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu", "snapshot"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+
+# Save states hash the 16 MiB flash (`Machine::nv_fingerprint`); unoptimized SHA-256 would make
+# every save and load in a debug test take about a second.
+[profile.dev.package.sha2]
+opt-level = 3

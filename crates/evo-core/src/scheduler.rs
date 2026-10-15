@@ -24,6 +24,9 @@ pub struct Scheduler {
     heap: BinaryHeap<Reverse<(u64, u64, EventKind)>>,
     live: HashMap<EventKind, u64>,
     next_seq: u64,
+    /// No event is due before this cycle: the top of the heap, kept by `settle` (0, "look",
+    /// until the first mutation). Lets `pop_due` answer without touching the heap.
+    due_hint: u64,
 }
 
 impl Scheduler {
@@ -59,6 +62,9 @@ impl Scheduler {
 
     /// Removes and returns the earliest event with `at <= now`.
     pub fn pop_due(&mut self) -> Option<EventKind> {
+        if self.now < self.due_hint {
+            return None;
+        }
         let &Reverse((at, _, kind)) = self.heap.peek()?;
         if at > self.now {
             return None;
@@ -89,6 +95,7 @@ impl Scheduler {
             self.heap
                 .retain(|&Reverse((_, seq, kind))| Self::is_live(live, seq, kind));
         }
+        self.due_hint = self.heap.peek().map_or(u64::MAX, |Reverse((at, _, _))| *at);
     }
 }
 
@@ -157,6 +164,8 @@ impl From<SchedulerState> for Scheduler {
             heap,
             live,
             next_seq,
+            // Look at the heap on the first `pop_due`.
+            due_hint: 0,
         }
     }
 }

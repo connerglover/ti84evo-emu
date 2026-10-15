@@ -46,6 +46,9 @@ pub enum Attr {
 /// with the SAU, most secure wins: with the SAU disabled and `ALLNS` clear everything is Secure
 /// anyway, with `ALLNS` set the IDAU decides. An `Exempt` result and region numbers apply
 /// whether or not the SAU is enabled.
+///
+/// The answer must be the same for every address of an aligned 32-byte block (the ARMv8-M
+/// attribution granule) and must not change over time: the core caches it per block.
 pub trait Idau: Send + Sync {
     /// Attribution of `addr` and the number of the IDAU region holding it (reported by `TT` as
     /// IREGION). `None` means the IDAU does not cover `addr`: it imposes nothing and the SAU

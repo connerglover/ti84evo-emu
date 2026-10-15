@@ -56,6 +56,8 @@ const SWRESET: u8 = 0x01;
 const RDDID: u8 = 0x04;
 const RDDST: u8 = 0x09;
 const RDDPM: u8 = 0x0A;
+const RDDMADCTL: u8 = 0x0B;
+const RDDCOLMOD: u8 = 0x0C;
 const SLPIN: u8 = 0x10;
 const SLPOUT: u8 = 0x11;
 const DISPOFF: u8 = 0x28;
@@ -187,7 +189,9 @@ impl St7789 {
                 let pm = (u8::from(!self.sleeping) << 4) | (u8::from(self.display_on) << 2);
                 self.load_read(false, &[pm]);
             }
-            0x0B..=0x0F => self.load_read(false, &[0]),
+            RDDMADCTL => self.load_read(false, &[self.madctl]),
+            RDDCOLMOD => self.load_read(false, &[self.colmod]),
+            0x0D..=0x0F => self.load_read(false, &[0]),
             RDID1..=RDID3 => {
                 let b = self.id[usize::from(c - RDID1)];
                 self.load_read(false, &[b]);

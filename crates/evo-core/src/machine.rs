@@ -41,8 +41,9 @@
 //! # Save states
 //!
 //! [`Machine::save_state`] / [`Machine::load_state`] (in [`crate::state`]): CPU, scheduler,
-//! SRAM, devices and the unmapped log, tied to the bundle the machine booted. Flash and the
-//! NOR security registers are not in a save state; they persist in the flash file.
+//! SRAM, devices and the unmapped log, tied to the bundle the machine booted and to the flash
+//! it had (its fingerprint, [`Machine::nv_fingerprint`]). Flash and the NOR security registers
+//! are not in a save state; they persist in the flash file.
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -78,7 +79,7 @@ pub const BL2_SHARED_DATA: u32 = 0x3000_0000;
 /// total length 4 (no entries).
 pub const BL2_SHARED_HEADER: u32 = 0x0004_2016;
 /// Erased NOR flash reads as all ones.
-const ERASED: u8 = 0xFF;
+pub(crate) const ERASED: u8 = 0xFF;
 /// CPU steps [`Machine::recent_trace`] remembers.
 pub const RECENT_STEPS: usize = 64;
 
@@ -90,28 +91,34 @@ struct RecentStep {
     secure: bool,
 }
 
-/// Ring buffer of the last [`RECENT_STEPS`] CPU steps.
-#[derive(Default)]
+/// Ring buffer of the last [`RECENT_STEPS`] CPU steps (a power of two).
 pub(crate) struct RecentSteps {
-    /// Up to `RECENT_STEPS` entries; once full, `next` is the oldest.
-    steps: Vec<RecentStep>,
-    /// Where the next step is written once `steps` is full.
-    next: usize,
+    steps: [RecentStep; RECENT_STEPS],
+    /// Steps pushed so far; the next one goes to `pushed % RECENT_STEPS`.
+    pushed: u64,
+}
+
+impl Default for RecentSteps {
+    fn default() -> Self {
+        Self {
+            steps: [RecentStep::default(); RECENT_STEPS],
+            pushed: 0,
+        }
+    }
 }
 
 impl RecentSteps {
+    #[inline]
     fn push(&mut self, step: RecentStep) {
-        if self.steps.len() < RECENT_STEPS {
-            self.steps.push(step);
-        } else {
-            self.steps[self.next] = step;
-            self.next = (self.next + 1) % RECENT_STEPS;
-        }
+        self.steps[self.pushed as usize % RECENT_STEPS] = step;
+        self.pushed += 1;
     }
 
     /// Oldest first.
     fn iter(&self) -> impl Iterator<Item = &RecentStep> {
-        let (newer, older) = self.steps.split_at(self.next);
+        let filled = self.pushed.min(RECENT_STEPS as u64) as usize;
+        let next = self.pushed as usize % RECENT_STEPS;
+        let (newer, older) = self.steps[..filled.max(next)].split_at(next);
         older.iter().chain(newer)
     }
 }
@@ -175,6 +182,10 @@ pub struct Machine {
     /// it and loads only on a machine with the same one.
     #[serde(default)]
     pub(crate) bundle_id: [u8; 32],
+    /// Cycles of CPU steps (instructions and exception entries) since power-on: `sched.now`
+    /// without the time skipped while asleep. Statistics only: not saved.
+    #[serde(skip)]
+    pub(crate) awake_cycles: u64,
 }
 
 impl Machine {
@@ -262,6 +273,7 @@ impl Machine {
             applied_irqs: 0,
             recent: RecentSteps::default(),
             bundle_id,
+            awake_cycles: 0,
         };
         if let Some(secregs) = secregs {
             m.with_dev("spif", |s: &mut Spif, _| s.nor_mut().set_secregs(secregs));
@@ -273,8 +285,10 @@ impl Machine {
     }
 
     /// The non-volatile state now, as a flash file stores it: the flash bytes and the SPIF NOR
-    /// part's security registers. Security registers the part does not hold (it has none
-    /// after a save-state restore until they are set again) read as erased.
+    /// part's security registers. A save-state restore keeps the registers the part holds
+    /// (they are not in a save state; `Spif::load` keeps the current ones), so after
+    /// [`load_state`](Self::load_state) this is the same as before it. (Were the part to hold no
+    /// registers, they would read as erased; the SoC's part always holds them.)
     pub fn nv_state(&self) -> NvState {
         let mut flash = self
             .bus
@@ -313,7 +327,40 @@ impl Machine {
     /// Pass what the devices and the CPU queued since the last call on: (1) IRQ line changes
     /// to the NVIC, (2) pulses, (3) event requests to the scheduler, (4) the CPU's
     /// unimplemented PPB accesses to the unmapped log.
+    #[inline]
     fn sync_bus(&mut self) {
+        if self.bus.take_device_activity() {
+            self.sync_devices();
+        }
+        if self.cpu.has_ppb_misses() {
+            self.drain_ppb_misses();
+        }
+    }
+
+    /// Step (4) of [`sync_bus`](Self::sync_bus).
+    #[cold]
+    #[inline(never)]
+    fn drain_ppb_misses(&mut self) {
+        for miss in self.cpu.take_ppb_misses() {
+            let kind = if miss.write.is_some() {
+                UnmappedKind::Write
+            } else {
+                UnmappedKind::Read
+            };
+            self.bus.log.record(UnmappedAccess {
+                addr: miss.addr,
+                width: miss.width,
+                write: miss.write,
+                kind,
+                pc: self.bus.pc_hint,
+                secure: miss.secure,
+            });
+        }
+    }
+
+    /// Steps (1) to (3) of [`sync_bus`](Self::sync_bus), needed only after a device ran.
+    #[inline(never)]
+    fn sync_devices(&mut self) {
         let lines = self.bus.irq_lines();
         let mut changed = lines ^ self.applied_irqs;
         while changed != 0 {
@@ -333,21 +380,6 @@ impl Machine {
                 None => self.sched.cancel(kind),
             }
         }
-        for miss in self.cpu.take_ppb_misses() {
-            let kind = if miss.write.is_some() {
-                UnmappedKind::Write
-            } else {
-                UnmappedKind::Read
-            };
-            self.bus.log.record(UnmappedAccess {
-                addr: miss.addr,
-                width: miss.width,
-                write: miss.write,
-                kind,
-                pc: self.bus.pc_hint,
-                secure: miss.secure,
-            });
-        }
     }
 
     /// True while the CPU sleeps in WFI/WFE, waiting for an exception (or, after WFE, an
@@ -360,6 +392,13 @@ impl Machine {
     /// the WFI/WFE, whether or not anything is pending. Does nothing while awake.
     pub fn wake(&mut self) {
         self.sleep = None;
+    }
+
+    /// Cycles this machine spent executing (instructions and exception entries) since power-on:
+    /// time it advanced minus the time skipped while asleep. Statistics only: not in a save
+    /// state, and a restore keeps the count going.
+    pub fn awake_cycles(&self) -> u64 {
+        self.awake_cycles
     }
 
     /// Run for up to `max_cycles` cycles from now.
@@ -393,7 +432,7 @@ impl Machine {
             }
             let pc = self.cpu.regs.pc;
             let resumed = self.stopped_at.take() == Some(pc);
-            if self.breakpoints.contains(&pc) && !resumed {
+            if !resumed && !self.breakpoints.is_empty() && self.breakpoints.contains(&pc) {
                 self.stopped_at = Some(pc);
                 return StopReason::Breakpoint(pc);
             }
@@ -483,11 +522,13 @@ impl Machine {
         self.sync_bus();
         let stop = match result {
             StepResult::Executed { cycles } => {
+                self.awake_cycles += u64::from(cycles);
                 self.advance(u64::from(cycles));
                 None
             }
             StepResult::Sleep(kind) => {
                 // The step does not report its cycles; WFI/WFE cost 1.
+                self.awake_cycles += 1;
                 self.advance(1);
                 self.sleep = Some(kind);
                 self.wake_if_due();
@@ -504,6 +545,7 @@ impl Machine {
 
     /// While asleep: wake if a wake-up is due, else advance time to the next wake-up time (at
     /// most to `end`). `Some(Idle)` if nothing will ever wake the CPU.
+    #[inline(never)]
     fn idle(&mut self, end: u64) -> Option<StopReason> {
         if self.wake_if_due() {
             return None;
@@ -534,6 +576,7 @@ impl Machine {
 
     /// Wake the sleeping CPU if an exception is pending or, for WFE, the event register is set
     /// (consuming it). Returns whether it woke.
+    #[inline(never)]
     fn wake_if_due(&mut self) -> bool {
         let Some(kind) = self.sleep else {
             return false;
@@ -570,6 +613,8 @@ impl Machine {
     /// unmapped log are kept, pending events are dropped (a device that keeps running asks for
     /// its event again in `reset`), and time keeps counting. Device IRQ lines still high after
     /// the reset pend again.
+    #[cold]
+    #[inline(never)]
     fn system_reset(&mut self) {
         self.resets += 1;
         log::info!(

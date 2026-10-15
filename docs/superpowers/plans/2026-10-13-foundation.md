@@ -15,7 +15,7 @@
 ## Global Constraints
 
 - No TI code, images, artwork or dumps are committed. Tests needing the OS read the path from env `EVO_OS_IMAGE` and are `#[ignore]`-free but early-return with a printed skip when it is unset.
-- RE material path (`C:\Users\conner\Documents\ti84evo-re\`) never appears in committed code; only in local env vars.
+- The path of the user's RE folder never appears in committed code; only in local env vars.
 - Library crates never panic on guest behavior or user input; host errors are `thiserror` enums. Guest misbehavior becomes an architectural fault.
 - Unmapped accesses never panic: reads return 0, writes are dropped, both are logged.
 - Unimplemented instructions raise UsageFault UNDEFINSTR (or NOCP for coprocessor space) and are logged with PC — never silently skipped.

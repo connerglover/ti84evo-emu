@@ -356,6 +356,54 @@ fn primask_masks_irq() {
     assert_eq!(frame(&cpu, &bus)[6], 0x106, "return address after cpsie");
 }
 
+/// An instruction that makes an IRQ pend and enabled through the NVIC is followed by the
+/// exception entry in the same step, whether it pends it (STIR) or enables an IRQ that was
+/// already pending (ISER).
+#[test]
+fn ppb_store_that_makes_an_irq_live_is_taken_in_the_same_step() {
+    const STR_R1_R0: u16 = 0x6001;
+    let (mut cpu, mut bus) = cpu_with_code(&[STR_R1_R0, B_SELF]);
+    handler(&mut bus, 16 + 5, 0x200, &[B_SELF]);
+    enable_irqs(&mut cpu, 1 << 5);
+    cpu.regs.r[0] = STIR;
+    cpu.regs.r[1] = 5;
+    executed(cpu.step(&mut bus));
+    assert_eq!(ipsr(&cpu), 21, "STIR");
+    assert_eq!(frame(&cpu, &bus)[6], 0x102);
+
+    let (mut cpu, mut bus) = cpu_with_code(&[NOP, STR_R1_R0, B_SELF]);
+    handler(&mut bus, 16 + 5, 0x200, &[B_SELF]);
+    cpu.pulse_irq(5);
+    executed(cpu.step(&mut bus));
+    assert_eq!(ipsr(&cpu), 0, "pending but disabled");
+    cpu.regs.r[0] = NVIC_ISER0;
+    cpu.regs.r[1] = 1 << 5;
+    executed(cpu.step(&mut bus));
+    assert_eq!(ipsr(&cpu), 21, "ISER");
+    assert_eq!(frame(&cpu, &bus)[6], 0x104);
+}
+
+/// Steps with nothing pending (which let the core skip its pending scan) do not hide an IRQ
+/// pended afterwards, whichever way it is pended.
+#[test]
+fn irq_pended_after_quiet_steps_is_taken() {
+    let (mut cpu, mut bus) = cpu_with_code(&[NOP, NOP, NOP, NOP, B_SELF]);
+    handler(&mut bus, 16 + 3, 0x200, &[BX_LR]);
+    enable_irqs(&mut cpu, 1 << 3);
+    run2(&mut cpu, &mut bus);
+    assert_eq!(ipsr(&cpu), 0);
+    cpu.set_irq_level(3, true);
+    executed(cpu.step(&mut bus));
+    assert_eq!(ipsr(&cpu), 19, "level IRQ");
+    cpu.set_irq_level(3, false);
+    executed(cpu.step(&mut bus)); // bx lr: return
+    assert_eq!(ipsr(&cpu), 0);
+    executed(cpu.step(&mut bus));
+    cpu.ppb_write32(NVIC_ISPR0, 1 << 3);
+    executed(cpu.step(&mut bus));
+    assert_eq!(ipsr(&cpu), 19, "ISPR write");
+}
+
 #[test]
 fn disabled_irq_stays_pending() {
     let (mut cpu, mut bus) = cpu_with_code(&[NOP, NOP, B_SELF]);

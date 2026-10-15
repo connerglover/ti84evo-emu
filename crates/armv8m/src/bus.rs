@@ -36,4 +36,23 @@ pub trait Bus {
     fn write8(&mut self, addr: u32, v: u8, a: Access) -> Result<(), BusError>;
     fn write16(&mut self, addr: u32, v: u16, a: Access) -> Result<(), BusError>;
     fn write32(&mut self, addr: u32, v: u32, a: Access) -> Result<(), BusError>;
+
+    /// Instruction-cache support: a value that changes whenever any bytes accepted by
+    /// [`cache_code`](Bus::cache_code) may have changed. The core keeps a decoded instruction
+    /// only while this value stays the same. Values must never repeat for different contents,
+    /// even across bus instances. The default bus never accepts code for caching.
+    fn code_epoch(&self) -> u64 {
+        0
+    }
+
+    /// Instruction-cache support: whether the `len` instruction bytes just fetched at `addr`
+    /// may be reused, without fetching them again, until [`code_epoch`](Bus::code_epoch)
+    /// changes. A bus that says yes must return the same bytes for any later fetch of them,
+    /// whatever its `Access` attributes, with no side effects (no logging, no device), and
+    /// must change `code_epoch` on any write to them. The default is no: every fetch goes to
+    /// the bus.
+    fn cache_code(&mut self, addr: u32, len: u32) -> bool {
+        let _ = (addr, len);
+        false
+    }
 }

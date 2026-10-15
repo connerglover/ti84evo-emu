@@ -196,6 +196,7 @@ impl Cpu {
         size: MemSize,
         acc: Access,
     ) -> Result<(), BusError> {
+        self.pend_check = true;
         let n = size_bytes(size);
         let view = ppb_view(addr & !3, self.regs.sec);
         let user_stir = view.is_some_and(|(word, sec)| {
@@ -244,6 +245,11 @@ impl Cpu {
     /// the last call, oldest first. Host accesses are never recorded.
     pub fn take_ppb_misses(&mut self) -> Vec<PpbMiss> {
         std::mem::take(&mut self.ppb_misses)
+    }
+
+    /// Whether `take_ppb_misses` has anything to return.
+    pub fn has_ppb_misses(&self) -> bool {
+        !self.ppb_misses.is_empty()
     }
 
     /// Host (debugger/test) read of a PPB word: privileged, no fault, in the current security
@@ -458,7 +464,10 @@ impl Cpu {
                 }
             }
             MPU..=MPU_END => return self.scs.mpu.get_mut(view).write(word - MPU, v),
-            SAU..=SAU_END if secure => return self.scs.sau.write(word - SAU, v),
+            SAU..=SAU_END if secure => {
+                self.flush_attr_cache();
+                return self.scs.sau.write(word - SAU, v);
+            }
             SAU..=SAU_END => {}
             STIR => {
                 // Non-secure software can only pend interrupts that target Non-secure state.
@@ -639,6 +648,7 @@ impl Cpu {
     pub fn tick_systick(&mut self, cycles: u32) {
         for sec in [Sec::Secure, Sec::NonSecure] {
             if self.scs.systick.get_mut(sec).tick(cycles) {
+                self.pend_check = true;
                 self.set_exc_pending(SYSTICK_EXC, sec, true);
             }
         }

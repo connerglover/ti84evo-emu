@@ -675,3 +675,167 @@ fn deserialized_map_without_devices_logs_instead_of_panicking() {
     assert_eq!(back.log.len(), 2);
     assert_eq!(back.peek(0x4000_0000, 4), None);
 }
+
+// ---- large windows (whole 64 KiB pages, which the map serves through its page table) ----
+
+fn write_acc() -> Access {
+    Access {
+        kind: AccessKind::Write,
+        secure: S,
+        privileged: true,
+    }
+}
+
+#[test]
+fn page_sized_ram_and_rom_behave_like_any_window() {
+    let mut m = MemoryMap::new();
+    // RAM of one and a half pages, then a gap; ROM of two pages right after a device.
+    m.add_ram("ram", 0x1_8000, &[0x2000_0000, 0x3000_0000]);
+    m.add_rom(
+        "rom",
+        (0..0x2_0000u32).map(|i| i as u8).collect(),
+        &[0x0001_0000],
+    );
+    m.pc_hint = 0x42;
+
+    // Across the page boundary inside the RAM, through both aliases.
+    m.write32(0x2000_FFFE, 0x1122_3344, write_acc()).unwrap();
+    assert_eq!(m.read32(0x3000_FFFE, acc(S)), Ok(0x1122_3344));
+    assert_eq!(m.read16(0x3001_0000, acc(NS)), Ok(0x1122));
+    // The last word of the half page is RAM, the next byte is not.
+    m.write32(0x2001_7FFC, 0xAABB_CCDD, write_acc()).unwrap();
+    assert_eq!(m.read32(0x2001_7FFC, fetch(S)), Ok(0xAABB_CCDD));
+    assert_eq!(m.read32(0x2001_7FFE, acc(S)), Ok(0xAABB));
+    assert_eq!(m.read8(0x2001_8000, fetch(S)), Err(BusError::Decode));
+    assert_eq!(m.log.len(), 3, "two unmapped bytes and the fetch");
+
+    // ROM reads, across its page boundary too; writes are dropped and logged.
+    assert_eq!(m.read32(0x0001_0004, fetch(S)), Ok(0x0706_0504));
+    assert_eq!(m.read32(0x0001_FFFE, acc(S)), Ok(0x0100_FFFE));
+    m.write16(0x0001_0000, 0xBEEF, write_acc()).unwrap();
+    assert_eq!(m.read16(0x0001_0000, acc(S)), Ok(0x0100));
+    assert_eq!(m.log.len(), 4);
+    // A flash controller changes ROM through its buffer; reads see the new bytes.
+    m.buffer_mut("rom").unwrap()[0x1_0000] = 0x5A;
+    assert_eq!(m.read8(0x0002_0000, acc(S)), Ok(0x5A));
+    assert_eq!(m.peek(0x0002_0000, 1), Some(0x5A));
+}
+
+#[test]
+fn page_table_follows_windows_added_later() {
+    let mut m = MemoryMap::new();
+    assert_eq!(m.read32(0x2000_0000, acc(S)), Ok(0));
+    m.add_ram("ram", 0x1_0000, &[0x2000_0000]);
+    m.write32(0x2000_0000, 7, write_acc()).unwrap();
+    assert_eq!(m.read32(0x2000_0000, acc(S)), Ok(7));
+    assert_eq!(m.log.len(), 1, "only the read before the RAM existed");
+}
+
+#[test]
+fn device_activity_reports_device_calls_only() {
+    let mut m = MemoryMap::new();
+    m.add_ram("ram", 0x1_0000, &[0x2000_0000]);
+    m.add_device(
+        "probe",
+        0x4000_0000,
+        0x10,
+        Box::new(Probe {
+            seen: Seen::default(),
+        }),
+    );
+    assert!(!m.take_device_activity(), "adding windows runs no device");
+    m.write32(0x2000_0000, 1, write_acc()).unwrap();
+    m.read32(0x5000_0000, acc(S)).unwrap();
+    assert!(!m.take_device_activity(), "RAM and unmapped accesses");
+    m.read32(0x4000_0000, acc(S)).unwrap();
+    assert!(m.take_device_activity());
+    assert!(!m.take_device_activity(), "taking it clears it");
+    m.device_event(0);
+    assert!(m.take_device_activity());
+    let states = m.device_states();
+    m.load_device_states(&states).unwrap();
+    assert!(m.take_device_activity());
+}
+
+// ---- instruction-cache support (`Bus::cache_code` / `Bus::code_epoch`) ----
+
+/// Programs byte 0 of the "rom" buffer with whatever is written to it, like a flash controller.
+struct Programmer;
+
+impl Device for Programmer {
+    fn read(&mut self, _off: u32, _width: u8, _ctx: &mut DevCtx<'_>) -> u32 {
+        0
+    }
+    fn write(&mut self, _off: u32, _width: u8, v: u32, ctx: &mut DevCtx<'_>) {
+        if let Some(rom) = ctx.buffer_mut("rom") {
+            rom[0] = v as u8;
+        }
+    }
+    fn reset(&mut self, _kind: ResetKind, _ctx: &mut DevCtx<'_>) {}
+    fn save(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    fn load(&mut self, _state: &[u8]) -> Result<(), StateError> {
+        Ok(())
+    }
+}
+
+fn code_map() -> MemoryMap {
+    let mut m = MemoryMap::new();
+    m.add_rom("rom", vec![0; 0x2_0000], &[0x0000_0000, 0x1000_0000]);
+    m.add_ram("ram", 0x2_0000, &[0x2000_0000, 0x3000_0000]);
+    m.add_ram("small", 0x100, &[0x2800_0000]);
+    m.add_device("prog", 0x4000_0000, 0x10, Box::new(Programmer));
+    m
+}
+
+#[test]
+fn only_whole_ram_and_rom_pages_cache_code() {
+    let mut m = code_map();
+    assert!(m.cache_code(0x1000_0100, 4));
+    assert!(m.cache_code(0x3000_FFFE, 4), "across two whole pages");
+    assert!(!m.cache_code(0x2800_0000, 2), "partly covered page");
+    assert!(!m.cache_code(0x4000_0000, 2), "device");
+    assert!(!m.cache_code(0x5000_0000, 2), "unmapped");
+    assert!(!m.cache_code(0x0001_FFFE, 4), "runs off the ROM");
+    assert!(!m.cache_code(0xFFFF_FFFE, 4), "wraps");
+    assert_eq!(m.log.len(), 0, "nothing is accessed or logged");
+}
+
+#[test]
+fn code_epoch_changes_when_cached_code_can_change() {
+    let mut m = code_map();
+    let other = code_map();
+    assert_ne!(m.code_epoch(), other.code_epoch(), "unique per map");
+    let e0 = m.code_epoch();
+    // Accesses before anything is cached as code, and reads, change nothing.
+    m.write32(0x2000_0000, 1, write_acc()).unwrap();
+    m.read32(0x1000_0000, fetch(S)).unwrap();
+    assert_eq!(m.code_epoch(), e0);
+
+    assert!(m.cache_code(0x3000_0100, 2));
+    m.write32(0x2001_0000, 1, write_acc()).unwrap();
+    assert_eq!(m.code_epoch(), e0, "a write to another page");
+    m.write8(0x2000_FFFF, 1, write_acc()).unwrap();
+    let e1 = m.code_epoch();
+    assert_ne!(e1, e0, "a write to the code page through the other alias");
+    m.write16(0x2000_0010, 1, write_acc()).unwrap();
+    assert_ne!(m.code_epoch(), e1, "every write to it");
+
+    // ROM: guest writes are dropped (no change), a flash controller's are not.
+    assert!(m.cache_code(0x0000_0000, 2));
+    let e2 = m.code_epoch();
+    m.write8(0x0000_0000, 7, write_acc()).unwrap();
+    assert_eq!(m.code_epoch(), e2, "dropped ROM write");
+    m.write8(0x4000_0000, 0x5A, write_acc()).unwrap();
+    assert_eq!(m.read8(0x1000_0000, fetch(S)), Ok(0x5A));
+    let e3 = m.code_epoch();
+    assert_ne!(e3, e2, "device wrote a buffer");
+
+    // Host access to the bytes.
+    assert!(m.poke(0x1000_0004, 4, 0));
+    let e4 = m.code_epoch();
+    assert_ne!(e4, e3, "poke");
+    m.buffer_mut("ram").unwrap()[0] = 1;
+    assert_ne!(m.code_epoch(), e4, "buffer_mut");
+}

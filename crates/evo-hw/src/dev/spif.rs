@@ -143,7 +143,7 @@ impl Spif {
             2 => self.regs.addr & 0xFFFF,
             _ => self.regs.addr & 0xFF_FFFF,
         };
-        if touches_array(op) && ctx.buffer_mut(FLASH_BUFFER).is_none() {
+        if touches_array(op) && ctx.buffer(FLASH_BUFFER).is_none() {
             log::warn!("spif: op {op:#04x} without a flash buffer: reads 0xFF, writes dropped");
         }
         let kind = self.nor.begin(op, addr, self.regs.len, flash(ctx));
@@ -159,7 +159,7 @@ impl Spif {
             if self.left(DataPhase::Read) == 0 {
                 break;
             }
-            let b = self.nor.read_byte(flash(ctx));
+            let b = self.nor.read_byte(ctx.buffer(FLASH_BUFFER).unwrap_or(&[]));
             v |= u32::from(b) << (8 * i);
         }
         v

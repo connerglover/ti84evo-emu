@@ -262,3 +262,48 @@ fn state_roundtrip() {
     assert_eq!(u.divisor(), 13);
     assert_eq!(u.take_tx(), b"Q");
 }
+
+/// A postcard-encoded UART state: registers 0 except DLL = 13, FIFOs enabled, then `rx` bytes
+/// in the RX FIFO, `host_rx` in the host queue and `tx` transmitted (each a varint length and
+/// the bytes).
+fn raw_state(rx: usize, host_rx: usize, tx: usize) -> Vec<u8> {
+    let mut s = vec![0, 0, 0, 0, 13, 0, 1];
+    for n in [rx, host_rx, tx] {
+        let mut len = n;
+        while len >= 0x80 {
+            s.push((len as u8) | 0x80);
+            len >>= 7;
+        }
+        s.push(len as u8);
+        s.extend(std::iter::repeat_n(0x41, n));
+    }
+    s
+}
+
+#[test]
+fn load_rejects_broken_fifo_invariants() {
+    let mut u = Uart16550::new(UART2_IRQ);
+    // The encoding itself is right: these load.
+    u.load(&raw_state(16, 5, 3))
+        .expect("full FIFO with queued host bytes");
+    u.load(&raw_state(4, 0, UART_TX_CAP))
+        .expect("partly filled FIFO");
+    assert_eq!(u.divisor(), 13);
+
+    let mut h = DevHarness::new();
+    let mut good = Uart16550::new(UART2_IRQ);
+    init(&mut h, &mut good);
+    h.write(&mut good, SCR, 4, 0x42);
+    for (what, st) in [
+        ("RX FIFO over 16 bytes", raw_state(17, 0, 0)),
+        (
+            "host bytes queued while the FIFO has room",
+            raw_state(15, 1, 0),
+        ),
+        ("TX over its cap", raw_state(0, 0, UART_TX_CAP + 1)),
+    ] {
+        assert!(good.load(&st).is_err(), "{what}: accepted");
+        assert_eq!(h.read(&mut good, SCR, 4), 0x42, "{what}: device changed");
+        assert_eq!(good.divisor(), 13, "{what}: device changed");
+    }
+}

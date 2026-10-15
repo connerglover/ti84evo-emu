@@ -7,7 +7,7 @@
 use crate::bus::{Access, AccessKind, Bus};
 use crate::cpu::Cpu;
 use crate::regs::{Sec, Xpsr};
-use crate::scs::nvic::irqs;
+use crate::scs::nvic::{self, irqs};
 use crate::scs::sau::{
     SFSR_AUVIOL, SFSR_INVEP, SFSR_INVER, SFSR_INVIS, SFSR_INVTRAN, SFSR_SFARVALID,
 };
@@ -353,12 +353,17 @@ impl Cpu {
     }
 
     /// The pending exception that preempts the current execution priority, if any.
+    #[inline(never)]
     pub(crate) fn preemptable_pending(&self) -> Option<(u16, Sec)> {
+        // Fast rejection, run before and after every instruction: `highest_pending` only
+        // considers pending system exceptions and IRQs that are both pending and enabled.
         let scb = &self.scs.scb;
-        if scb.pending.s == 0
-            && scb.pending.ns == 0
-            && self.scs.nvic.pending.iter().all(|&w| w == 0)
-        {
+        let n = &self.scs.nvic;
+        let mut live = 0;
+        for w in 0..nvic::WORDS {
+            live |= n.pending[w] & n.enabled[w];
+        }
+        if scb.pending.s | scb.pending.ns == 0 && live == 0 {
             return None;
         }
         let (num, sec) = self.highest_pending()?;
@@ -420,6 +425,8 @@ impl Cpu {
 
     /// Raise a synchronous fault: record its status and pend its exception (escalated as
     /// needed). Returns false when the processor must lock up.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn raise_fault(&mut self, fault: Fault) -> bool {
         log::debug!(
             "fault {fault:?} at pc {:#010x} ({:?})",
@@ -433,6 +440,7 @@ impl Cpu {
     /// Pend synchronous exception `num` for `sec`. A configurable exception that is disabled or
     /// cannot preempt the current execution priority escalates to HardFault (HFSR.FORCED).
     /// Returns false when HardFault cannot preempt either: the processor must lock up.
+    #[inline(never)]
     pub(crate) fn raise_sync(&mut self, num: u16, sec: Sec) -> bool {
         let exec = self.execution_priority();
         let mut target = num;
@@ -458,6 +466,8 @@ impl Cpu {
     /// at the priority of `entering` if that is the exception whose entry failed (an NMI whose
     /// vector or stacking failed locks up at -2). Execution stops, and nothing is stacked, until
     /// reset or a pending exception of strictly higher priority than that (NMI from -1).
+    #[cold]
+    #[inline(never)]
     pub(crate) fn enter_lockup(&mut self, entering: Option<(u16, Sec)>) {
         let mut priority = self.execution_priority().min(-1);
         if let Some((num, sec)) = entering {
@@ -488,7 +498,7 @@ impl Cpu {
     /// Write one word of a stack frame that belongs to security state `sec`. The access has
     /// the frame's security; a Non-secure frame reaching Secure memory is a SecureFault AUVIOL.
     pub(crate) fn stack_write(
-        &self,
+        &mut self,
         bus: &mut impl Bus,
         addr: u32,
         v: u32,
@@ -506,7 +516,7 @@ impl Cpu {
 
     /// Read one word of a stack frame that belongs to security state `sec` (see `stack_write`).
     fn stack_read(
-        &self,
+        &mut self,
         bus: &mut impl Bus,
         addr: u32,
         sec: Sec,
@@ -523,9 +533,21 @@ impl Cpu {
 
     // ---- Entry ----
 
+    /// No system exception is pending and no IRQ is both pending and enabled: there is nothing
+    /// `highest_pending` could find.
+    #[inline]
+    pub(crate) fn nothing_pending(&mut self) -> bool {
+        let scb = &self.scs.scb;
+        scb.pending.s | scb.pending.ns == 0 && self.scs.nvic.none_live()
+    }
+
     /// Take the highest-priority pending exception if it preempts the current execution
     /// priority. Returns true if an exception entry was performed (or it locked up trying).
     pub(crate) fn take_pending(&mut self, bus: &mut impl Bus) -> bool {
+        // The common case, before and after every instruction: nothing is pending at all.
+        if self.nothing_pending() {
+            return false;
+        }
         let Some((num, sec)) = self.preemptable_pending() else {
             return false;
         };
@@ -534,6 +556,7 @@ impl Cpu {
     }
 
     /// `ExceptionEntry`: stack the current context and enter the handler of `num`.
+    #[inline(never)]
     fn exception_entry(&mut self, bus: &mut impl Bus, num: u16, sec: Sec) {
         let (num, sec) = match self.push_stack(bus) {
             None => (num, sec),
@@ -761,6 +784,7 @@ impl Cpu {
     // ---- Return ----
 
     /// `ExceptionReturn`: a BX/POP/LDR of an EXC_RETURN value in Handler mode.
+    #[inline(never)]
     pub(crate) fn exception_return(
         &mut self,
         bus: &mut impl Bus,
@@ -924,6 +948,7 @@ impl Cpu {
     /// `FunctionReturn`: a branch to FNC_RETURN ends a Non-secure function called with BLXNS.
     /// The return address and partial xPSR are popped from the Secure stack of the current mode
     /// and execution continues there in Secure state. On a fault nothing changes.
+    #[inline(never)]
     pub(crate) fn function_return(&mut self, bus: &mut impl Bus) -> Result<(), Fault> {
         let handler = self.regs.handler_mode();
         let use_psp = !handler && self.regs.control.s & 0b10 != 0;

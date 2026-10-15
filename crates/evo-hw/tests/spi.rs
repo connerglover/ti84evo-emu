@@ -341,3 +341,17 @@ fn soc_attaches_spi() {
     assert_eq!(got, [0x000, 0x085, 0x10A, 0x148]);
     assert!(map.log.is_empty());
 }
+
+/// RDDMADCTL (0x0B) and RDDCOLMOD (0x0C) read back MADCTL and COLMOD: one byte, no dummy bit.
+#[test]
+fn rddmadctl_rddcolmod_read_back() {
+    let (mut h, mut s) = enabled();
+    send(&mut h, &mut s, &[0x00B, 0x000, 0x00C, 0x000]);
+    assert_eq!(pop(&mut h, &mut s, 4), [0, 0, 0, 0x66 << 1], "reset values");
+    send(&mut h, &mut s, &[0x036, 0x160, 0x03A, 0x155]);
+    send(&mut h, &mut s, &[0x00B, 0x000, 0x00C, 0x000]);
+    assert_eq!(
+        pop(&mut h, &mut s, 8),
+        [0, 0, 0, 0, 0, 0x60 << 1, 0, 0x55 << 1]
+    );
+}

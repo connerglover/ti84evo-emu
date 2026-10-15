@@ -1260,3 +1260,134 @@ fn tt_mpu_fields_need_privilege() {
         (1 << 8) | SRVALID | TT_R | TT_RW | TT_NSR | TT_NSRW
     );
 }
+
+/// The core caches attribution per 32-byte block; reprogramming the SAU (or installing an
+/// IDAU) must take effect at once for data accesses and fetches alike.
+#[test]
+fn sau_changes_apply_to_cached_attribution() {
+    let (mut cpu, mut bus) = tz();
+    // NS: ldr r1, [r0] (twice) at 0x100.
+    bus.code(0x100, &[LDR_R1_R0, LDR_R1_R0, B_SELF]);
+    bus.put(0x2000_0010, 0x1234_5678);
+    enter_ns(&mut cpu, 0x100);
+    cpu.regs.r[0] = 0x2000_0010;
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.regs.r[1], 0x1234_5678);
+    assert!(!bus.last_access(0x2000_0010).secure);
+
+    // Secure software disables region 1 (NS RAM): 0x2000_0010 is now Secure, and the next
+    // Non-secure load of it is a SecureFault AUVIOL.
+    cpu.regs.sec = Sec::Secure;
+    cpu.ppb_write32(SAU_RNR, 1);
+    cpu.ppb_write32(SAU_RLAR, 0);
+    cpu.regs.sec = Sec::NonSecure;
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.regs.sec, Sec::Secure, "SecureFault taken");
+    assert_eq!(cpu.ppb_read32(SFSR) & AUVIOL, AUVIOL);
+    assert_eq!(cpu.ppb_read32(SFAR), 0x2000_0010);
+
+    // Fetches: Secure code at 0x1000_0100 runs (with ALLNS the default IDAU keeps it NSC);
+    // once an IDAU makes everything Non-secure, the next fetch is an INVTRAN SecureFault.
+    let (mut cpu, mut bus) = tz();
+    bus.code(0x1000_0100, &[NOP, NOP, B_SELF]);
+    cpu.ppb_write32(SAU_CTRL, 0b10);
+    step(&mut cpu, &mut bus);
+    struct AllNs;
+    impl Idau for AllNs {
+        fn attr(&self, _addr: u32) -> Option<(Attr, Option<u8>)> {
+            Some((Attr::NonSecure, None))
+        }
+    }
+    cpu.set_idau(Box::new(AllNs));
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.ppb_read32(SFSR) & INVTRAN, INVTRAN);
+}
+
+/// `TzBus` that lets the core cache decoded code: every write starts a new code epoch.
+struct CachingBus {
+    inner: TzBus,
+    epoch: u64,
+}
+
+impl CachingBus {
+    fn new(inner: TzBus) -> Self {
+        Self { inner, epoch: 1 }
+    }
+}
+
+impl Bus for CachingBus {
+    fn read8(&mut self, addr: u32, a: Access) -> Result<u8, BusError> {
+        self.inner.read8(addr, a)
+    }
+    fn read16(&mut self, addr: u32, a: Access) -> Result<u16, BusError> {
+        self.inner.read16(addr, a)
+    }
+    fn read32(&mut self, addr: u32, a: Access) -> Result<u32, BusError> {
+        self.inner.read32(addr, a)
+    }
+    fn write8(&mut self, addr: u32, v: u8, a: Access) -> Result<(), BusError> {
+        self.epoch += 1;
+        self.inner.write8(addr, v, a)
+    }
+    fn write16(&mut self, addr: u32, v: u16, a: Access) -> Result<(), BusError> {
+        self.epoch += 1;
+        self.inner.write16(addr, v, a)
+    }
+    fn write32(&mut self, addr: u32, v: u32, a: Access) -> Result<(), BusError> {
+        self.epoch += 1;
+        self.inner.write32(addr, v, a)
+    }
+    fn code_epoch(&self) -> u64 {
+        self.epoch
+    }
+    fn cache_code(&mut self, _addr: u32, _len: u32) -> bool {
+        true
+    }
+}
+
+/// Code the core has cached is fetched again with the attribution of the moment: a changed
+/// SAU or IDAU applies to the very next fetch of the same instruction.
+#[test]
+fn attribution_changes_apply_to_cached_code() {
+    // Non-secure `b .` in NS code; then Secure software makes that memory Secure.
+    let (mut cpu, bus) = tz();
+    let mut bus = CachingBus::new(bus);
+    bus.inner.code(0x100, &[B_SELF]);
+    enter_ns(&mut cpu, 0x100);
+    let r = cpu.step(&mut bus);
+    assert!(matches!(r, StepResult::Executed { .. }), "{r:?}");
+    let reads = bus.inner.log.len();
+    let r = cpu.step(&mut bus);
+    assert!(matches!(r, StepResult::Executed { .. }), "{r:?}");
+    assert_eq!(
+        bus.inner.log.len(),
+        reads,
+        "the second pass is not fetched from the bus"
+    );
+    cpu.regs.sec = Sec::Secure;
+    cpu.ppb_write32(SAU_RNR, 0);
+    cpu.ppb_write32(SAU_RLAR, 0);
+    cpu.regs.sec = Sec::NonSecure;
+    let _ = cpu.step(&mut bus);
+    assert_eq!(cpu.regs.sec, Sec::Secure, "SecureFault taken");
+    assert_eq!(cpu.ppb_read32(SFSR) & INVEP, INVEP);
+
+    // Secure `b .` (NSC under ALLNS with the default IDAU); then an IDAU makes it Non-secure.
+    let (mut cpu, bus) = tz();
+    let mut bus = CachingBus::new(bus);
+    bus.inner.code(0x1000_0100, &[B_SELF]);
+    cpu.ppb_write32(SAU_CTRL, 0b10);
+    for _ in 0..2 {
+        let r = cpu.step(&mut bus);
+        assert!(matches!(r, StepResult::Executed { .. }), "{r:?}");
+    }
+    struct AllNs;
+    impl Idau for AllNs {
+        fn attr(&self, _addr: u32) -> Option<(Attr, Option<u8>)> {
+            Some((Attr::NonSecure, None))
+        }
+    }
+    cpu.set_idau(Box::new(AllNs));
+    let _ = cpu.step(&mut bus);
+    assert_eq!(cpu.ppb_read32(SFSR) & INVTRAN, INVTRAN);
+}

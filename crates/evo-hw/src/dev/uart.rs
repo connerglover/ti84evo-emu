@@ -231,6 +231,17 @@ impl Device for Uart16550 {
     }
 
     fn load(&mut self, state: &[u8]) -> Result<(), StateError> {
-        load_serde(&mut self.regs, state)
+        let mut regs = self.regs.clone();
+        load_serde(&mut regs, state)?;
+        // The invariants `refill` and `write` keep: the FIFO holds at most RX_FIFO bytes, host
+        // bytes wait only while it is full, TX holds at most UART_TX_CAP bytes.
+        if regs.rx.len() > RX_FIFO
+            || (!regs.host_rx.is_empty() && regs.rx.len() < RX_FIFO)
+            || regs.tx.len() > UART_TX_CAP
+        {
+            return Err(StateError::Mismatch("UART state out of range".into()));
+        }
+        self.regs = regs;
+        Ok(())
     }
 }

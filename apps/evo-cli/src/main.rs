@@ -39,6 +39,10 @@ enum Command {
     /// Prints `stop: <reason> pc=<hex> cycles=<n>` at the end. Exit status: 0 when the
     /// cycle budget runs out, the guest sleeps with nothing left to wake it (idle), or a
     /// breakpoint or guest BKPT is reached; 2 on CPU lockup; 1 on errors.
+    ///
+    /// Ctrl-C stops a headless run within one 10 ms slice (`stop: interrupted`, exit status
+    /// 130) and still writes --save-state, --flash-file, --screenshot and --unmapped-out; a
+    /// second Ctrl-C quits at once without writing them. Under --gdb, Ctrl-C ends the process.
     Run {
         /// Path to the .84b2 bundle.
         bundle: PathBuf,
@@ -84,7 +88,8 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         flash_file: Option<PathBuf>,
         /// Restore the machine from a save state written by --save-state, after booting the
-        /// bundle (and reading --flash-file). The state must come from the same bundle; an
+        /// bundle (and reading --flash-file). The state must come from the same bundle and the
+        /// same flash: the flash file as the run that saved the state wrote it back. A corrupt,
         /// invalid or mismatched state is an error (exit 1) before the run starts, and the flash
         /// file is not touched. The --max-cycles budget counts from the restored cycle.
         #[arg(long, value_name = "FILE")]

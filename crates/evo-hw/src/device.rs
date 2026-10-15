@@ -72,6 +72,9 @@ pub struct DevCtx<'a> {
     pc: u32,
     /// Security of the access (host calls use secure).
     secure: bool,
+    /// Set by [`DevCtx::buffer_mut`]: the map then assumes the buffer changed (cached code
+    /// in it is stale).
+    buffers_written: bool,
 }
 
 impl<'a> DevCtx<'a> {
@@ -99,11 +102,17 @@ impl<'a> DevCtx<'a> {
             base,
             pc,
             secure,
+            buffers_written: false,
         }
     }
 }
 
 impl DevCtx<'_> {
+    /// Whether [`buffer_mut`](Self::buffer_mut) was called on this context.
+    pub(crate) fn buffers_written(&self) -> bool {
+        self.buffers_written
+    }
+
     /// Drive level-sensitive IRQ line `irq` (`irq < 64`; anything else is logged and ignored).
     pub fn set_irq(&mut self, irq: u16, asserted: bool) {
         if irq >= IRQ_LINES {
@@ -139,8 +148,19 @@ impl DevCtx<'_> {
         self.events.push((self.id, None));
     }
 
-    /// The bytes of the RAM or ROM called `name` (the first one if names repeat).
+    /// The bytes of the RAM or ROM called `name` (the first one if names repeat), read-only.
+    pub fn buffer(&self, name: &str) -> Option<&[u8]> {
+        self.buffers
+            .iter()
+            .find(|b| b.name == name)
+            .map(|b| b.data.as_slice())
+    }
+
+    /// The bytes of the RAM or ROM called `name` (the first one if names repeat), to change
+    /// them. The map then treats the buffer as changed (code the CPU cached from it is stale),
+    /// so a device that only reads uses [`buffer`](Self::buffer).
     pub fn buffer_mut(&mut self, name: &str) -> Option<&mut [u8]> {
+        self.buffers_written = true;
         self.buffers
             .iter_mut()
             .find(|b| b.name == name)
@@ -177,6 +197,9 @@ pub enum StateError {
     Version { found: u32, expected: u32 },
     #[error("save state does not fit this machine: {0}")]
     Mismatch(String),
+    /// The body does not match the checksum in the header: damaged, truncated or edited.
+    #[error("save state is corrupt (checksum mismatch)")]
+    Corrupt,
 }
 
 /// Encode a device's state (postcard).

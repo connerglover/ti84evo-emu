@@ -12,6 +12,8 @@
 //! [`NvState`] is the non-volatile part of the machine (flash bytes and security registers) and
 //! its on-disk format, the flash file.
 
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -357,20 +359,29 @@ impl NvState {
     }
 
     /// Reads and validates a flash file. The file is never modified.
+    ///
+    /// The header is read first and the file's size is checked against its metadata before
+    /// the body is read, so a file of the wrong size (however large) is rejected without being
+    /// read whole.
     pub fn read_file(path: &Path) -> Result<Self, NvError> {
-        let mut bytes = std::fs::read(path)?;
-        let n = MAGIC.len().min(bytes.len());
-        if bytes[..n] != MAGIC[..n] {
+        let mut file = File::open(path)?;
+        let found = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+        let mut header = Vec::with_capacity(HEADER_LEN);
+        (&mut file)
+            .take(HEADER_LEN as u64)
+            .read_to_end(&mut header)?;
+        let n = MAGIC.len().min(header.len());
+        if header[..n] != MAGIC[..n] {
             return Err(NvError::BadMagic);
         }
-        if bytes.len() < HEADER_LEN {
+        if header.len() < HEADER_LEN {
             return Err(NvError::Size {
                 expected: FILE_LEN,
-                found: bytes.len(),
+                found,
             });
         }
         let word =
-            |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+            |o: usize| u32::from_le_bytes([header[o], header[o + 1], header[o + 2], header[o + 3]]);
         let version = word(8);
         if version != VERSION {
             return Err(NvError::Version(version));
@@ -382,33 +393,54 @@ impl NvState {
                 found: flash_len,
             });
         }
-        if bytes.len() != FILE_LEN {
+        if found != FILE_LEN {
             return Err(NvError::Size {
                 expected: FILE_LEN,
-                found: bytes.len(),
+                found,
             });
         }
-        let secregs = bytes.split_off(HEADER_LEN + NOR_SIZE);
-        bytes.drain(..HEADER_LEN);
-        Self::new(bytes, secregs)
+        let mut flash = vec![0; NOR_SIZE];
+        file.read_exact(&mut flash)?;
+        let mut secregs = vec![0; SECREGS_LEN];
+        file.read_exact(&mut secregs)?;
+        // The file grew after its size was checked: not a file this build wrote.
+        let mut extra = [0u8; 1];
+        if file.read(&mut extra)? != 0 {
+            return Err(NvError::Size {
+                expected: FILE_LEN,
+                found: FILE_LEN + 1,
+            });
+        }
+        Self::new(flash, secregs)
     }
 
-    /// Writes the flash file: first to `PATH.tmp`, then renamed over `path`, so a failed write
-    /// never leaves a partial file at `path`.
+    /// Writes the flash file atomically ([`write_atomic`]).
     pub fn write_file(&self, path: &Path) -> Result<(), NvError> {
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
-        let tmp = PathBuf::from(tmp);
         let mut out = Vec::with_capacity(FILE_LEN);
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
         out.extend_from_slice(&(NOR_SIZE as u32).to_le_bytes());
         out.extend_from_slice(&self.flash);
         out.extend_from_slice(&self.secregs);
-        let res = std::fs::write(&tmp, &out).and_then(|()| std::fs::rename(&tmp, path));
-        if res.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        Ok(res?)
+        Ok(write_atomic(path, &out)?)
     }
+}
+
+/// Writes `bytes` to `path` so that `path` always holds either its old contents or all of
+/// `bytes`: first to `PATH.tmp`, flushed to the disk (`sync_all`), then renamed over `path`.
+/// On error the temporary file is removed and `path` is untouched.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let res = File::create(&tmp)
+        .and_then(|mut f| {
+            f.write_all(bytes)?;
+            f.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
