@@ -749,7 +749,10 @@ mod tests {
         let (cpu, mut ram) = warm_cpu();
         assert!(!cpu.icache.0.is_empty(), "the original cached its code");
         let mut copy = cpu.clone();
-        assert!(copy.icache.0.is_empty(), "the copy does not carry the cache");
+        assert!(
+            copy.icache.0.is_empty(),
+            "the copy does not carry the cache"
+        );
         assert_eq!(copy, cpu);
         // The copy still runs, filling its own cache.
         assert_eq!(copy.step(&mut ram), StepResult::Executed { cycles: 1 });

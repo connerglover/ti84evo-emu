@@ -288,3 +288,29 @@ each), because the host's load moves absolute numbers by ±15 % between sessions
 | `boot_to_self_test`, code-epoch changes | 15 090 | 12 253 |
 | `boot_to_self_test`, thread CPU time | 139.4 M cycles/s | 141.0 M cycles/s (awake cycles unchanged) |
 | `busy_loop`, thread CPU time | 53.8 M cycles/s | 53.9 M cycles/s |
+
+### 14. Cached code is tracked by 4 KiB page
+
+After step 13 all 12 253 remaining epoch changes in the boot came from the OS programming
+flash (settings and file-system writes through the SPIF FIFO, far from any code): a device
+that borrowed a buffer for writing invalidated every decoded instruction, and so did any guest
+store into a 64 KiB page that held code anywhere.
+
+- `MemoryMap` remembers cached code per 4 KiB page of each buffer instead of per 64 KiB page,
+  and a store changes the epoch only if it touches such a page (both ends of the access are
+  checked).
+- `DevCtx::buffer_mut_range(name, range)` hands a device the buffer with the promise that it
+  changes only `range`; the map then checks just the code pages in that range.
+  `DevCtx::buffer_mut` still means "anything may have changed".
+  `NorFlash::begin_changes` / `write_changes` give the range an erase or a programmed byte
+  covers, and `Spif` declares exactly that.
+
+Decision: the epoch stays one value per map, so an instruction-cache hit is still a single
+compare; only the trigger is per page. A true per-page epoch would add a dependent load to
+every fetch to save work that, in the real boot, never happens any more.
+
+| | Before | After |
+|---|---|---|
+| `boot_to_self_test`, code-epoch changes | 12 253 | 0 |
+| `boot_to_self_test`, thread CPU time | 131.4 M cycles/s | 136.4 M cycles/s (awake cycles unchanged) |
+| `busy_loop`, thread CPU time | 52.7 M cycles/s | 54.7 M cycles/s |

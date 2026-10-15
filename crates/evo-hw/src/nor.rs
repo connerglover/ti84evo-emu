@@ -14,6 +14,7 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -115,21 +116,27 @@ impl NorFlash {
         self.sr1 &= !WEL;
     }
 
-    /// Whether [`begin`](Self::begin) of `op` would change the flash array now: an erase with
-    /// the write-enable latch set. For any other command `begin` leaves `flash` alone (an
-    /// empty slice does), so the caller need not borrow the array for writing.
-    pub fn begin_changes_array(&self, op: u8) -> bool {
-        self.wel() && matches!(op, 0x20 | 0x52 | 0xD8 | 0xC7 | 0x60)
+    /// The bytes of a `flash_len`-byte array that [`begin`](Self::begin) of `op` at `addr` would
+    /// change now: an erase with the write-enable latch set. `None` for any other command;
+    /// `begin` then leaves `flash` alone (an empty slice does), so the caller need not borrow
+    /// the array for writing.
+    pub fn begin_changes(&self, op: u8, addr: u32, flash_len: usize) -> Option<Range<usize>> {
+        if !self.wel() {
+            return None;
+        }
+        erase_range(op, addr, flash_len)
     }
 
-    /// Whether the next [`write_byte`](Self::write_byte) would change the flash array: a page
-    /// program phase is open and the write-enable latch is set. Otherwise `write_byte` leaves
-    /// `flash` alone (an empty slice does).
-    pub fn write_changes_array(&self) -> bool {
-        self.wel()
-            && self
-                .phase
-                .is_some_and(|p| p.kind == DataPhase::Write && matches!(p.op, 0x02 | 0x32))
+    /// The bytes of a `flash_len`-byte array the next [`write_byte`](Self::write_byte) would
+    /// change: one byte while a page program phase is open and the write-enable latch is set.
+    /// `None` otherwise; `write_byte` then leaves `flash` alone (an empty slice does).
+    pub fn write_changes(&self, flash_len: usize) -> Option<Range<usize>> {
+        let p = self.phase?;
+        if !self.wel() || p.kind != DataPhase::Write || !matches!(p.op, 0x02 | 0x32) {
+            return None;
+        }
+        let a = wrap(p.addr, flash_len)?;
+        Some(a..a + 1)
     }
 
     /// Starts command `op` at `addr` with a data length of `len` bytes, aborting any open phase.
@@ -294,23 +301,25 @@ impl NorFlash {
     }
 }
 
-/// Erases the 4K/32K/64K block (or the whole chip) that `addr` falls in.
-fn erase(op: u8, addr: u32, flash: &mut [u8]) {
+/// The bytes erase command `op` at `addr` clears in an array of `len` bytes: the 4K/32K/64K
+/// block `addr` falls in, or the whole chip. `None` for other commands and an empty array.
+fn erase_range(op: u8, addr: u32, len: usize) -> Option<Range<usize>> {
     let size = match op {
         0x20 => 4 << 10,
         0x52 => 32 << 10,
         0xD8 => 64 << 10,
-        _ => {
-            flash.fill(ERASED);
-            return;
-        }
+        0xC7 | 0x60 => return (len > 0).then_some(0..len),
+        _ => return None,
     };
-    let Some(a) = wrap(addr, flash.len()) else {
-        return;
-    };
-    let start = a & !(size - 1);
-    let end = (start + size).min(flash.len());
-    flash[start..end].fill(ERASED);
+    let start = wrap(addr, len)? & !(size - 1);
+    Some(start..(start + size).min(len))
+}
+
+/// Erases the 4K/32K/64K block (or the whole chip) that `addr` falls in.
+fn erase(op: u8, addr: u32, flash: &mut [u8]) {
+    if let Some(r) = erase_range(op, addr, flash.len()) {
+        flash[r].fill(ERASED);
+    }
 }
 
 const MAGIC: &[u8; 8] = b"EVOFLASH";
