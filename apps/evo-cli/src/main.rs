@@ -95,7 +95,8 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         load_state: Option<PathBuf>,
         /// Write a save state of the machine to FILE when the run ends, however it ends. The
-        /// flash and the NOR security registers are not in it (see --flash-file). A failed
+        /// flash and the NOR security registers are not in it (see --flash-file); without
+        /// --flash-file a note on stderr says that loading it needs the same flash. A failed
         /// write exits 1.
         #[arg(long, value_name = "FILE")]
         save_state: Option<PathBuf>,
