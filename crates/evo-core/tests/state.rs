@@ -503,3 +503,18 @@ fn load_state_rejects_bad_prigroup() {
         );
     }
 }
+
+/// The fingerprint is the SHA-256 of exactly the bytes `nv_state` returns (flash, then the
+/// security registers), so equal fingerprints mean equal flash files.
+#[test]
+fn nv_fingerprint_hashes_the_nv_state_bytes() {
+    use sha2::{Digest, Sha256};
+    let mut m = counter_uart().boot();
+    m.run(10_000);
+    let nv = m.nv_state();
+    let mut h = Sha256::new();
+    h.update(nv.flash());
+    h.update(nv.secregs());
+    let want: [u8; 32] = h.finalize().into();
+    assert_eq!(m.nv_fingerprint(), want);
+}

@@ -610,13 +610,7 @@ fn m4_image1_launches() {
 
     // The OS runs: by M4_HOME_CYCLES it shows its home screen (the app launcher).
     let stop = os.run_until(M4_HOME_CYCLES.saturating_sub(os.m.sched.now), |_| false);
-    assert_eq!(
-        stop,
-        StopReason::CycleLimit,
-        "UART0:
-{}",
-        os.uart_text()
-    );
+    assert_eq!(stop, StopReason::CycleLimit, "UART0:\n{}", os.uart_text());
     let frame = os.m.screen().expect("the LCD is on");
     let hash = sha256_hex(&frame.rgb);
     let path = scratch_dir().join("m4-home.png");
@@ -1038,7 +1032,7 @@ fn boot_without_keys(nv: NvState) -> Option<Result<u64, StopReason>> {
 /// A fresh unit boots into the diagnostic app; `evo_core::provision` drives the Engineering
 /// menu (Boot Select: Calc OS) and leaves a flash that boots straight to the OS, with no key
 /// input, on every later power-on: through a flash file, and again from the flash that boot
-/// re-saved (`boot-flow.md` §3.5).
+/// re-saved (`boot-flow.md` §3.5). Provisioning that unit again succeeds without toggling.
 #[test]
 fn provisioned_flash_boots_to_os_without_keys() {
     let Some(os) = Os::boot() else {
@@ -1076,6 +1070,11 @@ fn provisioned_flash_boots_to_os_without_keys() {
     let third = boot_without_keys(second.m.nv_state()).expect("not skipped");
     println!("provision: power-on 3 from the re-saved flash: {third:?}");
     assert!(third.is_ok(), "{third:?}");
+
+    // Provisioning an already provisioned unit succeeds and leaves Boot Select alone.
+    let again = evo_core::provision(&mut second.m).expect("re-provisioning succeeds");
+    println!("provision again: {again:?}");
+    assert!(!again.toggled, "Boot Select already read Calc OS");
 }
 
 /// Batched stepping (`Machine::set_batching`, on by default) changes nothing the guest or the
