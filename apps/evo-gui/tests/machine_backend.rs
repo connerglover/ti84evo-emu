@@ -1,12 +1,14 @@
 //! `MachineBackend` on a synthetic secure image (and on the real OS when `EVO_OS_IMAGE` is set).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use evo_core::{Key, NvState};
-use evo_gui::backend::machine::{KEY_MATRIX, MachineBackend, OpenError, fnv1a64, rgb888_to_rgba};
+use evo_gui::backend::machine::{MachineBackend, OpenError, core_key, fnv1a64, rgb888_to_rgba};
 use evo_gui::backend::{BackendError, EmuBackend, RunStatus};
 use evo_gui::keypad::KeyId;
+use evo_hw::dev::keypad::KEY_NAMES;
 
 /// The counter program at 0x100B_0600:
 /// `movs r2,#0x40; lsls r2,r2,#24; ldr r1,[r2]; adds r0,#1; b.n` back to `adds`.
@@ -195,24 +197,39 @@ fn rgb888_conversion() {
 }
 
 #[test]
-fn key_matrix_table_is_complete() {
-    assert_eq!(KEY_MATRIX.map(|e| e.0), KeyId::ALL);
-    let mut seen = std::collections::BTreeSet::new();
-    for (id, key) in KEY_MATRIX {
-        match key {
-            Key::Matrix { row, col } => {
-                assert!(row < 8 && col < 8, "{id:?} at r{row}c{col}");
-                assert!(seen.insert((row, col)), "{id:?}: r{row}c{col} used twice");
-            }
-            Key::On => assert_eq!(id, KeyId::On),
-        }
+fn every_gui_key_is_the_core_key_of_its_name() {
+    let mut names = BTreeSet::new();
+    for id in KeyId::ALL {
+        let name = id.core_name();
+        let want = Key::from_name(name).unwrap_or_else(|| panic!("{id:?}: no core key {name}"));
+        assert_eq!(core_key(id), want, "{id:?}");
+        assert!(names.insert(name), "{id:?}: {name} used twice");
     }
-    assert_eq!(seen.len(), 49);
-    let key = |id: KeyId| KEY_MATRIX.iter().find(|e| e.0 == id).unwrap().1;
-    assert_eq!(key(KeyId::On), Key::On);
-    assert_eq!(key(KeyId::Enter), Key::Matrix { row: 6, col: 0 });
-    assert_eq!(key(KeyId::Up), Key::Matrix { row: 7, col: 3 });
-    assert_eq!(key(KeyId::Second), Key::Matrix { row: 1, col: 5 });
+    // The GUI has exactly the core's keys: 49 matrix keys and ON.
+    let core: BTreeSet<&str> = KEY_NAMES.iter().map(|&(n, _)| n).collect();
+    assert_eq!(names, core);
+}
+
+#[test]
+fn gui_keys_follow_the_evo_keypad() {
+    let mx = |row, col| Key::Matrix { row, col };
+    for (id, key) in [
+        (KeyId::On, Key::On),
+        (KeyId::Enter, mx(6, 0)),
+        (KeyId::Toggle, mx(6, 1)),
+        (KeyId::Add, mx(6, 2)),
+        (KeyId::Sub, mx(6, 3)),
+        (KeyId::Mul, mx(6, 4)),
+        (KeyId::Div, mx(6, 5)),
+        (KeyId::Power, mx(2, 5)),
+        (KeyId::Frac, mx(3, 6)),
+        (KeyId::Up, mx(7, 3)),
+        (KeyId::Second, mx(1, 5)),
+        (KeyId::Two, mx(4, 1)),
+        (KeyId::Three, mx(5, 1)),
+    ] {
+        assert_eq!(core_key(id), key, "{id:?}");
+    }
 }
 
 /// `ldr r2,[pc,#4]; ldrh r0,[r2]; b.n` back to `ldrh`; `nop`; the literal `0x4010_xxxx`.

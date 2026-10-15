@@ -270,8 +270,8 @@ fn default_map_covers_essentials() {
     let essentials = [
         Zero, One, Two, Three, Four, Five, Six, Seven, Eight, Nine, Dot, Neg, Add, Sub, Mul, Div,
         Power, LParen, RParen, Comma, Enter, Del, Clear, Up, Down, Left, Right, Second, Alpha,
-        Mode, YEqu, Window, Zoom, Trace, Graph, On, Math, Apps, Vars, Stat, Sto, XTThetaN, Sin,
-        Cos, Tan, Log, Ln, Inverse, Prgm, Square,
+        Mode, YEqu, Window, Zoom, Trace, Graph, On, Math, Frac, Vars, Stat, Sto, XTThetaN, Sin,
+        Cos, Tan, Log, Ln, Prgm, Square,
     ];
     for id in essentials {
         assert!(!map.keys_for(id).is_empty(), "{id:?} has no PC binding");

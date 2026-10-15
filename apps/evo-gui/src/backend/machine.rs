@@ -44,80 +44,14 @@ pub fn rgb888_to_rgba(src: &[u8], dst: &mut Vec<u8>) {
     }
 }
 
-const fn mx(row: u8, col: u8) -> Key {
-    Key::Matrix { row, col }
+/// The core key a GUI key presses: the key named [`KeyId::core_name`] in the core's keypad
+/// table (`evo_hw::dev::keypad::KEY_NAMES`, the TI-84 Evo matrix of `docs/hardware/keypad.md`
+/// "Key map"), so the GUI keeps no matrix of its own. Every `KeyId` names a core key
+/// (`every_gui_key_is_the_core_key_of_its_name`).
+pub fn core_key(id: KeyId) -> Key {
+    Key::from_name(id.core_name())
+        .unwrap_or_else(|| unreachable!("{id:?}: no core key {}", id.core_name()))
 }
-
-/// Every GUI key's position in the keypad matrix, in [`KeyId::ALL`] order.
-///
-/// Hypothesis: the TI-84 Plus CE matrix, CE keypad group = `row`, bit = `col` (the CE port map
-/// on WikiTI and CEmu's keypad, the same as the TI-83+/84+ `GetCSC` groups); it matches
-/// `evo_core`'s `KEY_NAMES`. Task 11 Step 4 of the GUI plan checks it against the real OS
-/// (`docs/hardware/discovery-log.md`, "GUI bring-up").
-///
-/// | row | col 0 | col 1 | col 2 | col 3 | col 4 | col 5 | col 6 | col 7 |
-/// |---|---|---|---|---|---|---|---|---|
-/// | 1 | graph | trace | zoom | window | y= | 2nd | mode | del |
-/// | 2 | – | sto→ | ln | log | x² | x⁻¹ | math | alpha |
-/// | 3 | 0 | 1 | 4 | 7 | , | sin | apps | X,T,θ,n |
-/// | 4 | . | 2 | 5 | 8 | ( | cos | prgm | stat |
-/// | 5 | (−) | 3 | 6 | 9 | ) | tan | vars | – |
-/// | 6 | enter | + | − | × | ÷ | ^ | clear | – |
-/// | 7 | down | left | right | up | – | – | – | – |
-///
-/// `on` is [`Key::On`]: 49 matrix keys plus ON.
-pub const KEY_MATRIX: [(KeyId, Key); 50] = [
-    (KeyId::YEqu, mx(1, 4)),
-    (KeyId::Window, mx(1, 3)),
-    (KeyId::Zoom, mx(1, 2)),
-    (KeyId::Trace, mx(1, 1)),
-    (KeyId::Graph, mx(1, 0)),
-    (KeyId::Second, mx(1, 5)),
-    (KeyId::Mode, mx(1, 6)),
-    (KeyId::Del, mx(1, 7)),
-    (KeyId::Up, mx(7, 3)),
-    (KeyId::Left, mx(7, 1)),
-    (KeyId::Right, mx(7, 2)),
-    (KeyId::Down, mx(7, 0)),
-    (KeyId::Alpha, mx(2, 7)),
-    (KeyId::XTThetaN, mx(3, 7)),
-    (KeyId::Stat, mx(4, 7)),
-    (KeyId::Math, mx(2, 6)),
-    (KeyId::Apps, mx(3, 6)),
-    (KeyId::Prgm, mx(4, 6)),
-    (KeyId::Vars, mx(5, 6)),
-    (KeyId::Clear, mx(6, 6)),
-    (KeyId::Inverse, mx(2, 5)),
-    (KeyId::Sin, mx(3, 5)),
-    (KeyId::Cos, mx(4, 5)),
-    (KeyId::Tan, mx(5, 5)),
-    (KeyId::Power, mx(6, 5)),
-    (KeyId::Square, mx(2, 4)),
-    (KeyId::Comma, mx(3, 4)),
-    (KeyId::LParen, mx(4, 4)),
-    (KeyId::RParen, mx(5, 4)),
-    (KeyId::Div, mx(6, 4)),
-    (KeyId::Log, mx(2, 3)),
-    (KeyId::Seven, mx(3, 3)),
-    (KeyId::Eight, mx(4, 3)),
-    (KeyId::Nine, mx(5, 3)),
-    (KeyId::Mul, mx(6, 3)),
-    (KeyId::Ln, mx(2, 2)),
-    (KeyId::Four, mx(3, 2)),
-    (KeyId::Five, mx(4, 2)),
-    (KeyId::Six, mx(5, 2)),
-    (KeyId::Sub, mx(6, 2)),
-    (KeyId::Sto, mx(2, 1)),
-    (KeyId::One, mx(3, 1)),
-    (KeyId::Two, mx(4, 1)),
-    (KeyId::Three, mx(5, 1)),
-    (KeyId::Add, mx(6, 1)),
-    (KeyId::On, Key::On),
-    (KeyId::Zero, mx(3, 0)),
-    (KeyId::Dot, mx(4, 0)),
-    (KeyId::Neg, mx(5, 0)),
-    (KeyId::Enter, mx(6, 0)),
-];
 
 /// 64-bit FNV-1a of `bytes`.
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -248,10 +182,7 @@ impl EmuBackend for MachineBackend {
     }
 
     fn set_key(&mut self, key: KeyId, pressed: bool) {
-        // `KEY_MATRIX` lists every `KeyId` (`key_matrix_table_is_complete`).
-        if let Some(&(_, k)) = KEY_MATRIX.iter().find(|e| e.0 == key) {
-            self.machine.set_key(k, pressed);
-        }
+        self.machine.set_key(core_key(key), pressed);
     }
 
     fn run_for(&mut self, cycles: u64) -> RunStatus {

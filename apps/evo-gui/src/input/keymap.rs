@@ -85,7 +85,7 @@ const DEFAULT_FIXED: [(PcKey, KeyId); 44] = {
         (p(Key::F7), Alpha),
         (p(Key::F8), Mode),
         (p(Key::F9), Math),
-        (p(Key::F10), Apps),
+        (p(Key::F10), Frac),
         (p(Key::F11), Vars),
         (p(Key::F12), Stat),
         (p(Key::Home), On),

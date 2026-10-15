@@ -40,35 +40,35 @@ fn evo_legends() {
         (XTThetaN, Some("link"), None),
         (Stat, Some("list"), None),
         (Math, Some("test"), Some("A")),
-        (Apps, Some("angle"), Some("B")),
+        (Frac, Some("angle"), Some("B")),
         (Prgm, Some("draw"), Some("C")),
         (Vars, Some("distr"), None),
         (Clear, None, None),
-        (Inverse, Some("matrix"), Some("D")),
+        (Power, Some("\u{2E3}\u{221A}"), Some("D")),
         (Sin, Some("sin\u{207B}\u{B9}"), Some("E")),
         (Cos, Some("cos\u{207B}\u{B9}"), Some("F")),
         (Tan, Some("tan\u{207B}\u{B9}"), Some("G")),
-        (Power, Some("\u{3C0}"), Some("H")),
+        (Div, Some("\u{3C0}"), Some("H")),
         (Square, Some("\u{221A}"), Some("I")),
         (Comma, Some("EE"), Some("J")),
         (LParen, Some("{"), Some("K")),
         (RParen, Some("}"), Some("L")),
-        (Div, Some("e"), Some("M")),
+        (Mul, Some("e"), Some("M")),
         (Log, Some("10\u{2E3}"), Some("N")),
         (Seven, Some("u"), Some("O")),
         (Eight, Some("v"), Some("P")),
         (Nine, Some("w"), Some("Q")),
-        (Mul, Some("["), Some("R")),
+        (Sub, Some("["), Some("R")),
         (Ln, Some("e\u{2E3}"), Some("S")),
         (Four, Some("L4"), Some("T")),
         (Five, Some("L5"), Some("U")),
         (Six, Some("L6"), Some("V")),
-        (Sub, Some("]"), Some("W")),
+        (Add, Some("]"), Some("W")),
         (Sto, Some("recall"), Some("X")),
         (One, Some("L1"), Some("Y")),
         (Two, Some("L2"), Some("Z")),
         (Three, Some("L3"), Some("\u{3B8}")),
-        (Add, Some("mem"), Some("\"")),
+        (Toggle, Some("mem"), Some("\"")),
         (On, Some("off"), None),
         (Zero, Some("catalog"), Some("\u{2423}")),
         (Dot, Some("i"), Some(":")),
@@ -83,15 +83,15 @@ fn evo_legends() {
     assert_eq!(legends(Del), (Some("insert"), None));
     assert_eq!(legends(Sto), (Some("recall"), Some("X")));
     assert_eq!(legends(YEqu), (Some("plot"), Some("f1")));
-    assert_eq!(legends(Apps), (Some("angle"), Some("B")));
+    assert_eq!(legends(Frac), (Some("angle"), Some("B")));
     assert_eq!(legends(Math), (Some("test"), Some("A")));
     assert_eq!(legends(Vars), (Some("distr"), None));
     assert_eq!(legends(Stat), (Some("list"), None));
-    assert_eq!(legends(Inverse), (Some("matrix"), Some("D")));
+    assert_eq!(legends(Power), (Some("\u{2E3}\u{221A}"), Some("D")));
     assert_eq!(legends(Clear), (None, None));
     assert_eq!(legends(Zero), (Some("catalog"), Some("\u{2423}")));
     assert_eq!(legends(Enter), (Some("entry"), Some("solve")));
-    assert_eq!(legends(Add), (Some("mem"), Some("\"")));
+    assert_eq!(legends(Toggle), (Some("mem"), Some("\"")));
     assert_eq!(legends(On), (Some("off"), None));
     assert_eq!(legends(Second), (None, None));
 }
@@ -117,7 +117,7 @@ fn alpha_letters_run_a_to_theta() {
 #[test]
 fn punctuation_alpha_legends() {
     let got = [
-        KeyId::Add,
+        KeyId::Toggle,
         KeyId::Zero,
         KeyId::Dot,
         KeyId::Neg,
@@ -333,4 +333,14 @@ fn theme_tokens() {
     assert_eq!(key_colors(KeyStyle::Dpad), (KEY_NUMBER, LABEL_LIGHT));
     assert_eq!(key_colors(KeyStyle::Second), (KEY_SECOND, LABEL_LIGHT));
     assert_eq!(key_colors(KeyStyle::Alpha), (KEY_ALPHA, LABEL_LIGHT));
+}
+
+#[test]
+fn old_preference_key_names_still_load() {
+    // Keymaps saved while the GUI had the TI-84 Plus CE's APPS and x⁻¹ keys.
+    let apps: KeyId = serde_json::from_str("\"Apps\"").unwrap();
+    assert_eq!(apps, KeyId::Frac);
+    let inverse: KeyId = serde_json::from_str("\"Inverse\"").unwrap();
+    assert_eq!(inverse, KeyId::Power);
+    assert_eq!(serde_json::to_string(&KeyId::Frac).unwrap(), "\"Frac\"");
 }
