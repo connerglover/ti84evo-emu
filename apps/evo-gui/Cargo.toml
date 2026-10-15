@@ -12,6 +12,7 @@ snapshots = []
 [dependencies]
 armv8m = { path = "../../crates/armv8m" }
 evo-core = { path = "../../crates/evo-core" }
+evo-hw = { path = "../../crates/evo-hw" }
 evo-image = { path = "../../crates/evo-image" }
 eframe.workspace = true
 egui.workspace = true

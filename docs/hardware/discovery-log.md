@@ -572,3 +572,27 @@ nothing. By the Global Constraints decision rule of the GUI plan (a worker threa
 only if the GUI is below 100 % while the interpreter alone is above it), the UI-thread design
 stays. The interpreter itself is the bottleneck: reaching real time needs a roughly 8x faster
 core.
+
+### With Plan 2 (Task 11)
+
+Checked 2026-10-14 on the same machine with Plan 2 merged, `MachineBackend` wired to the LCD,
+backlight PWM, keypad, UART0, save states and the flash file. The check ran headless: the
+`egui_kittest` harness with the real `MachineBackend` and the 7.1 bundle (release build). No
+interactive session was possible, so no PC-keyboard typing was checked.
+
+- **LCD and backlight.** The boot screens and, after the Self-Test exit (ENTER at 2.5 s, `0`
+  at 3.1 s of guest time, as in M4), the OS home screen (an app grid titled `CALCULATOR`)
+  show in the GUI's LCD. The first frame comes before the backlight PWM is raised, so
+  `real_os_lcd_frame` waits for both. The LCD view is visibly dimmed by the OS's backlight
+  level.
+- **KEY_MATRIX.** Clicking the GUI keys `mode` (MODE settings screen opens), `clear` (back to
+  the calculation screen), `2nd` (the 2nd indicator appears in the status bar), plus the
+  `enter` and `0` taps above, behave as on a CE. Those five positions are verified. The other
+  44 match `evo_core`'s `KEY_NAMES`, which uses the same CE matrix, but each one was not
+  clicked individually.
+- **Speed.** With the OS running, the header showed `Running · 67–97%` in the release build
+  (the earlier 12 % was the Plan 1 reset loop).
+- **Flash file.** `persist` writes `{data_dir}/flash/{fnv1a64}.nv`. After the OS launched, it
+  held guest writes at 0x0009_1000..0x0009_3000 (the ITS/PS area), and reopening the bundle
+  starts from that file. On that reboot the BSP still showed its Self-Test info screen. It is
+  not yet known which flash state makes the BSP skip Self-Test.

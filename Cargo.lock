@@ -1492,6 +1492,7 @@ dependencies = [
  "egui_kittest",
  "env_logger",
  "evo-core",
+ "evo-hw",
  "evo-image",
  "image",
  "log",

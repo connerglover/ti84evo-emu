@@ -24,13 +24,16 @@ struct Args {
 fn main() -> ExitCode {
     env_logger::init();
     let args = Args::parse();
+    // Preferences, slots, screenshots and flash files live together (eframe's storage dir).
+    let data_dir =
+        eframe::storage_dir("evo-gui").unwrap_or_else(|| PathBuf::from("./evo-gui-data"));
     let (backend, notice): (Box<dyn EmuBackend>, Option<String>) =
         match choose_backend(args.bundle, args.demo, std::env::var_os("EVO_OS_IMAGE")) {
             Choice::Demo { notice } => (
                 Box::new(FakeBackend::new()),
                 notice.then(|| DEMO_NOTICE.to_owned()),
             ),
-            Choice::Bundle(path) => match MachineBackend::open(&path) {
+            Choice::Bundle(path) => match MachineBackend::open(&path, &data_dir.join("flash")) {
                 Ok(b) => (Box::new(b), None),
                 Err(e) => {
                     eprintln!("evo-gui: {}: {e}", path.display());
@@ -38,7 +41,7 @@ fn main() -> ExitCode {
                 }
             },
         };
-    match run(backend, notice) {
+    match run(backend, notice, data_dir) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("evo-gui: {e}");
@@ -47,9 +50,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(backend: Box<dyn EmuBackend>, notice: Option<String>) -> eframe::Result {
-    let data_dir =
-        eframe::storage_dir("evo-gui").unwrap_or_else(|| PathBuf::from("./evo-gui-data"));
+fn run(backend: Box<dyn EmuBackend>, notice: Option<String>, data_dir: PathBuf) -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(TITLE)
