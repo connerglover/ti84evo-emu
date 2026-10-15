@@ -51,3 +51,23 @@ So a step spends about a third of its time in the memory map (region binary sear
 classification and the generic read/write path for every access, including fetches), and the
 rest in per-step bookkeeping around the instruction: two pending-exception checks, the SysTick
 tick, attribution of the fetch and of every data access, and `sync_bus` after every step.
+
+## Optimization steps
+
+`busy_loop` from here on is the fastest of three 300 M-cycle runs (the baseline above was a
+single 200 M-cycle run). Per-piece timings are from the same isolated-timing harness as the
+hot-spot table.
+
+### 1. Page table in `MemoryMap`
+
+Every 64 KiB page that lies wholly inside one RAM or ROM window gets an entry (buffer, page
+index, ROM flag) in a flat table of 65 536 entries; an access that falls inside one such page
+is a slice copy. Everything else (devices, unmapped space, partly covered pages, ROM writes,
+accesses that cross a page end) takes the general path unchanged, so logging and device
+behaviour are identical.
+
+| | Before | After |
+|---|---|---|
+| `read16` flash / `read32` SRAM / `write32` SRAM | 14.1 / 11.2 / 11.5 ns | 1.3 / 1.2 / 1.3 ns |
+| `Cpu::step` / `Machine::step` | 70.6 / 84.4 ns | 44.8 / 57.9 ns |
+| `busy_loop` | 13.4 M cycles/s | 16.5 M cycles/s (11 %) |

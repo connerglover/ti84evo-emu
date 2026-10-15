@@ -67,31 +67,43 @@ fn report(what: &str, cycles: u64, awake: u64, secs: f64) {
     );
 }
 
-/// Busy guest code: no sleep, no devices, RAM loads and stores from flash-resident code.
+/// Busy guest code: no sleep, no devices, RAM loads and stores from flash-resident code. Runs
+/// `BENCH_REPEAT` (default 3) fresh machines of `BENCH_CYCLES` (default 300 M) cycles each and
+/// reports the fastest, which is the least disturbed by other work on the host.
 #[test]
 #[ignore = "benchmark: run with --release -- --ignored --nocapture"]
 fn busy_loop() {
-    let cycles: u64 = std::env::var("BENCH_CYCLES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1_000_000_000);
-    let mut m = busy_machine();
-    let t = Instant::now();
-    let stop = m.run(cycles);
-    let secs = t.elapsed().as_secs_f64();
-    assert_eq!(stop, StopReason::CycleLimit);
-    // The loop really ran: one store per iteration of 7 instructions (8 cycles); r0 counts
-    // the same iterations one instruction later.
-    let n = m.bus.peek(COUNTER, 4).expect("SRAM");
-    assert!(
-        n.wrapping_sub(m.cpu.regs.r[0]) <= 1,
-        "counter {n}, r0 {}",
-        m.cpu.regs.r[0]
-    );
-    assert!(
-        u64::from(n) >= cycles / 9,
-        "{n} iterations in {cycles} cycles"
-    );
+    let env = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    };
+    let cycles = env("BENCH_CYCLES", 300_000_000);
+    let mut best: Option<(f64, Machine)> = None;
+    for _ in 0..env("BENCH_REPEAT", 3).max(1) {
+        let mut m = busy_machine();
+        let t = Instant::now();
+        let stop = m.run(cycles);
+        let secs = t.elapsed().as_secs_f64();
+        assert_eq!(stop, StopReason::CycleLimit);
+        // The loop really ran: one store per iteration of 7 instructions (8 cycles); r0
+        // counts the same iterations one instruction later.
+        let n = m.bus.peek(COUNTER, 4).expect("SRAM");
+        assert!(
+            n.wrapping_sub(m.cpu.regs.r[0]) <= 1,
+            "counter {n}, r0 {}",
+            m.cpu.regs.r[0]
+        );
+        assert!(
+            u64::from(n) >= cycles / 9,
+            "{n} iterations in {cycles} cycles"
+        );
+        if best.as_ref().is_none_or(|(b, _)| secs < *b) {
+            best = Some((secs, m));
+        }
+    }
+    let (secs, m) = best.expect("at least one run");
     report("busy_loop", m.sched.now, m.awake_cycles(), secs);
 }
 

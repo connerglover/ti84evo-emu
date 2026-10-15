@@ -75,7 +75,26 @@ pub struct MemoryMap {
     /// Event requests `(device id, Some(at) | None = cancel)`, in order.
     #[serde(skip)]
     events: Vec<(u16, Option<u64>)>,
+    /// The fast path: one entry per 64 KiB page of the address space ([`Page`]), filled in as
+    /// RAM and ROM windows are added (windows are never removed, and a device can never share
+    /// a page with a whole-page window). Not serialized: a deserialized map has an empty table
+    /// and takes the general path for every access, with the same results.
+    #[serde(skip)]
+    pages: Vec<Page>,
 }
+
+/// log2 of the page size of [`MemoryMap::pages`].
+const PAGE_BITS: u32 = 16;
+const PAGE_SIZE: u32 = 1 << PAGE_BITS;
+/// [`Page`] flag: the page is ROM (reads only; writes take the general path, which logs them).
+const PAGE_ROM: u32 = 1 << 16;
+
+/// A page wholly inside one RAM or ROM window: bits 0..16 are the page's index within the
+/// buffer, bit 16 is [`PAGE_ROM`], bits 24..32 hold the buffer index plus one. 0 for every
+/// other page (devices, unmapped space, partly covered pages, buffers past index 254), which
+/// take the general path.
+#[derive(Clone, Copy, Default)]
+struct Page(u32);
 
 /// Where an access lands relative to the window table.
 enum Span {
@@ -128,6 +147,60 @@ impl MemoryMap {
                 target,
             };
             region::insert(&mut self.regions, region);
+            self.map_pages(base, size, b, rom);
+        }
+    }
+
+    /// Enter the whole pages of a new RAM/ROM window (at `base`, `size` bytes, buffer `b`) in
+    /// the page table. Partly covered pages stay on the general path.
+    fn map_pages(&mut self, base: u32, size: u32, b: usize, rom: bool) {
+        let Some(tag) = u32::try_from(b + 1).ok().filter(|&t| t <= 0xFF) else {
+            return;
+        };
+        if !base.is_multiple_of(PAGE_SIZE) {
+            return;
+        }
+        if self.pages.is_empty() {
+            self.pages = vec![Page::default(); 1 << (32 - PAGE_BITS)];
+        }
+        let first = (base >> PAGE_BITS) as usize;
+        let rom = if rom { PAGE_ROM } else { 0 };
+        for i in 0..(size >> PAGE_BITS) {
+            self.pages[first + i as usize] = Page(tag << 24 | rom | i);
+        }
+    }
+
+    /// The bytes of a RAM/ROM access of `width` bytes at `addr` that lies inside one whole
+    /// page of the page table (and, for `write`, not in ROM); `None` sends it down the
+    /// general path.
+    #[inline]
+    fn page_bytes(&mut self, addr: u32, width: u32, write: bool) -> Option<&mut [u8]> {
+        let page = self.pages.get((addr >> PAGE_BITS) as usize)?.0;
+        let in_page = addr & (PAGE_SIZE - 1);
+        if page == 0 || in_page + width > PAGE_SIZE || (write && page & PAGE_ROM != 0) {
+            return None;
+        }
+        let buf = self
+            .buffers
+            .get_mut(((page >> 24) as usize).checked_sub(1)?)?;
+        let start = ((page & 0xFFFF) << PAGE_BITS | in_page) as usize;
+        buf.data.get_mut(start..start + width as usize)
+    }
+
+    #[inline]
+    fn fast_read<const N: usize>(&mut self, addr: u32) -> Option<[u8; N]> {
+        let bytes = self.page_bytes(addr, N as u32, false)?;
+        <[u8; N]>::try_from(&*bytes).ok()
+    }
+
+    #[inline]
+    fn fast_write(&mut self, addr: u32, v: &[u8]) -> bool {
+        match self.page_bytes(addr, v.len() as u32, true) {
+            Some(dst) => {
+                dst.copy_from_slice(v);
+                true
+            }
+            None => false,
         }
     }
 
@@ -537,26 +610,49 @@ impl MemoryMap {
     }
 }
 
+/// Every access first tries the page table (whole RAM/ROM pages: a plain copy, nothing to log),
+/// then the general path.
 impl Bus for MemoryMap {
+    #[inline]
     fn read8(&mut self, addr: u32, a: Access) -> Result<u8, BusError> {
+        if let Some([b]) = self.fast_read(addr) {
+            return Ok(b);
+        }
         Ok(self.bus_read(addr, 1, a)? as u8)
     }
+    #[inline]
     fn read16(&mut self, addr: u32, a: Access) -> Result<u16, BusError> {
+        if let Some(b) = self.fast_read(addr) {
+            return Ok(u16::from_le_bytes(b));
+        }
         Ok(self.bus_read(addr, 2, a)? as u16)
     }
+    #[inline]
     fn read32(&mut self, addr: u32, a: Access) -> Result<u32, BusError> {
+        if let Some(b) = self.fast_read(addr) {
+            return Ok(u32::from_le_bytes(b));
+        }
         self.bus_read(addr, 4, a)
     }
+    #[inline]
     fn write8(&mut self, addr: u32, v: u8, a: Access) -> Result<(), BusError> {
-        self.write(addr, 1, u32::from(v), a.secure);
+        if !self.fast_write(addr, &[v]) {
+            self.write(addr, 1, u32::from(v), a.secure);
+        }
         Ok(())
     }
+    #[inline]
     fn write16(&mut self, addr: u32, v: u16, a: Access) -> Result<(), BusError> {
-        self.write(addr, 2, u32::from(v), a.secure);
+        if !self.fast_write(addr, &v.to_le_bytes()) {
+            self.write(addr, 2, u32::from(v), a.secure);
+        }
         Ok(())
     }
+    #[inline]
     fn write32(&mut self, addr: u32, v: u32, a: Access) -> Result<(), BusError> {
-        self.write(addr, 4, v, a.secure);
+        if !self.fast_write(addr, &v.to_le_bytes()) {
+            self.write(addr, 4, v, a.secure);
+        }
         Ok(())
     }
 }

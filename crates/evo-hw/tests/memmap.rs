@@ -675,3 +675,58 @@ fn deserialized_map_without_devices_logs_instead_of_panicking() {
     assert_eq!(back.log.len(), 2);
     assert_eq!(back.peek(0x4000_0000, 4), None);
 }
+
+// ---- large windows (whole 64 KiB pages, which the map serves through its page table) ----
+
+fn write_acc() -> Access {
+    Access {
+        kind: AccessKind::Write,
+        secure: S,
+        privileged: true,
+    }
+}
+
+#[test]
+fn page_sized_ram_and_rom_behave_like_any_window() {
+    let mut m = MemoryMap::new();
+    // RAM of one and a half pages, then a gap; ROM of two pages right after a device.
+    m.add_ram("ram", 0x1_8000, &[0x2000_0000, 0x3000_0000]);
+    m.add_rom(
+        "rom",
+        (0..0x2_0000u32).map(|i| i as u8).collect(),
+        &[0x0001_0000],
+    );
+    m.pc_hint = 0x42;
+
+    // Across the page boundary inside the RAM, through both aliases.
+    m.write32(0x2000_FFFE, 0x1122_3344, write_acc()).unwrap();
+    assert_eq!(m.read32(0x3000_FFFE, acc(S)), Ok(0x1122_3344));
+    assert_eq!(m.read16(0x3001_0000, acc(NS)), Ok(0x1122));
+    // The last word of the half page is RAM, the next byte is not.
+    m.write32(0x2001_7FFC, 0xAABB_CCDD, write_acc()).unwrap();
+    assert_eq!(m.read32(0x2001_7FFC, fetch(S)), Ok(0xAABB_CCDD));
+    assert_eq!(m.read32(0x2001_7FFE, acc(S)), Ok(0xAABB));
+    assert_eq!(m.read8(0x2001_8000, fetch(S)), Err(BusError::Decode));
+    assert_eq!(m.log.len(), 3, "two unmapped bytes and the fetch");
+
+    // ROM reads, across its page boundary too; writes are dropped and logged.
+    assert_eq!(m.read32(0x0001_0004, fetch(S)), Ok(0x0706_0504));
+    assert_eq!(m.read32(0x0001_FFFE, acc(S)), Ok(0x0100_FFFE));
+    m.write16(0x0001_0000, 0xBEEF, write_acc()).unwrap();
+    assert_eq!(m.read16(0x0001_0000, acc(S)), Ok(0x0100));
+    assert_eq!(m.log.len(), 4);
+    // A flash controller changes ROM through its buffer; reads see the new bytes.
+    m.buffer_mut("rom").unwrap()[0x1_0000] = 0x5A;
+    assert_eq!(m.read8(0x0002_0000, acc(S)), Ok(0x5A));
+    assert_eq!(m.peek(0x0002_0000, 1), Some(0x5A));
+}
+
+#[test]
+fn page_table_follows_windows_added_later() {
+    let mut m = MemoryMap::new();
+    assert_eq!(m.read32(0x2000_0000, acc(S)), Ok(0));
+    m.add_ram("ram", 0x1_0000, &[0x2000_0000]);
+    m.write32(0x2000_0000, 7, write_acc()).unwrap();
+    assert_eq!(m.read32(0x2000_0000, acc(S)), Ok(7));
+    assert_eq!(m.log.len(), 1, "only the read before the RAM existed");
+}
