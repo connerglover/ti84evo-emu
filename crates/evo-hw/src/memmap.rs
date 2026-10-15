@@ -7,6 +7,8 @@
 //! `BusError::Decode` so the CPU raises IBUSERR instead of executing zeros (`movs r0, r0`)
 //! forever. Data accesses never fault in Plan 1.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use armv8m::{Access, AccessKind, Bus, BusError};
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +87,28 @@ pub struct MemoryMap {
     /// lines, pulses and event requests change; cleared by [`MemoryMap::take_device_activity`].
     #[serde(skip)]
     device_activity: bool,
+    /// [`Bus::code_epoch`]: replaced by a fresh value whenever bytes the CPU may have cached as
+    /// code can have changed (a write to a code page, `buffer_mut`, `poke`, a device writing a
+    /// buffer). Fresh per map, so a CPU moved to another map never mistakes its old entries.
+    #[serde(skip)]
+    code_epoch: Epoch,
+    /// Per buffer, per 64 KiB page of the buffer: whether [`Bus::cache_code`] accepted code
+    /// in it, so writes to it must change `code_epoch`. Grown on demand.
+    #[serde(skip)]
+    code_pages: Vec<Vec<bool>>,
+}
+
+/// Source of [`MemoryMap::code_epoch`] values, unique within the process.
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// A [`Bus::code_epoch`] value; `default` takes a fresh one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Epoch(u64);
+
+impl Default for Epoch {
+    fn default() -> Self {
+        Epoch(NEXT_EPOCH.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 /// log2 of the page size of [`MemoryMap::pages`].
@@ -184,11 +208,55 @@ impl MemoryMap {
         if page == 0 || in_page + width > PAGE_SIZE || (write && page & PAGE_ROM != 0) {
             return None;
         }
-        let buf = self
-            .buffers
-            .get_mut(((page >> 24) as usize).checked_sub(1)?)?;
-        let start = ((page & 0xFFFF) << PAGE_BITS | in_page) as usize;
+        let b = ((page >> 24) as usize).checked_sub(1)?;
+        let buf_page = (page & 0xFFFF) as usize;
+        if write {
+            self.note_write(b, buf_page);
+        }
+        let buf = self.buffers.get_mut(b)?;
+        let start = (buf_page << PAGE_BITS) | in_page as usize;
         buf.data.get_mut(start..start + width as usize)
+    }
+
+    /// A write is about to change page `buf_page` of buffer `b`: if the CPU may have cached
+    /// code from it, change the code epoch.
+    #[inline]
+    fn note_write(&mut self, b: usize, buf_page: usize) {
+        let code = self
+            .code_pages
+            .get(b)
+            .and_then(|pages| pages.get(buf_page))
+            .copied()
+            .unwrap_or(false);
+        if code {
+            self.code_changed();
+        }
+    }
+
+    /// Bytes the CPU may have cached as code can have changed.
+    fn code_changed(&mut self) {
+        self.code_epoch = Epoch::default();
+    }
+
+    /// Mark the page holding `addr` as code for [`Bus::cache_code`], if it is a whole RAM/ROM
+    /// page; `false` otherwise.
+    fn mark_code(&mut self, addr: u32) -> bool {
+        let Some(&Page(page)) = self.pages.get((addr >> PAGE_BITS) as usize) else {
+            return false;
+        };
+        let Some(b) = ((page >> 24) as usize).checked_sub(1) else {
+            return false;
+        };
+        let buf_page = (page & 0xFFFF) as usize;
+        if self.code_pages.len() <= b {
+            self.code_pages.resize(b + 1, Vec::new());
+        }
+        let pages = &mut self.code_pages[b];
+        if pages.len() <= buf_page {
+            pages.resize(buf_page + 1, false);
+        }
+        pages[buf_page] = true;
+        true
     }
 
     #[inline]
@@ -264,7 +332,11 @@ impl MemoryMap {
             self.pc_hint,
             secure,
         );
-        Some(f(slot.dev.as_mut(), &mut ctx))
+        let r = f(slot.dev.as_mut(), &mut ctx);
+        if ctx.buffers_written() {
+            self.code_changed();
+        }
+        Some(r)
     }
 
     fn slot_id(&self, name: &str) -> Option<usize> {
@@ -333,6 +405,7 @@ impl MemoryMap {
 
     /// Backing bytes of the RAM or ROM called `name` (the first one if names repeat).
     pub fn buffer_mut(&mut self, name: &str) -> Option<&mut [u8]> {
+        self.code_changed();
         self.buffers
             .iter_mut()
             .find(|b| b.name == name)
@@ -426,6 +499,7 @@ impl MemoryMap {
                 *slot = b;
             }
         }
+        self.code_changed();
         true
     }
 
@@ -526,6 +600,8 @@ impl MemoryMap {
         match target {
             Target::Ram(b) => {
                 let start = off as usize;
+                self.note_write(b, start >> PAGE_BITS);
+                self.note_write(b, (start + usize::from(width) - 1) >> PAGE_BITS);
                 let dst = self
                     .buffers
                     .get_mut(b)
@@ -666,5 +742,16 @@ impl Bus for MemoryMap {
             self.write(addr, 4, v, a.secure);
         }
         Ok(())
+    }
+    fn code_epoch(&self) -> u64 {
+        self.code_epoch.0
+    }
+    /// Code in whole RAM/ROM pages (the page table) can be cached; writes to those pages,
+    /// `buffer_mut`, `poke` and devices writing buffers change the epoch.
+    fn cache_code(&mut self, addr: u32, len: u32) -> bool {
+        let Some(last) = addr.checked_add(len.saturating_sub(1)) else {
+            return false;
+        };
+        self.mark_code(addr) && self.mark_code(last)
     }
 }

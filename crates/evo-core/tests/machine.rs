@@ -1214,3 +1214,70 @@ fn power_cycle_keeps_nv_and_restarts_the_rest() {
     m.run(1_000);
     assert_ne!(m.cpu.regs.r[0], 0);
 }
+
+// ---- Code that changes: the CPU's decoded-instruction cache must never run stale code ----
+
+/// `ldr rt, [pc, #..]` at payload offset `at` loading the word at payload offset `lit`.
+fn ldr_lit(rt: u16, at: u32, lit: u32) -> u16 {
+    let base = (addr(at) + 4) & !3;
+    0x4800 | (rt << 8) | ((addr(lit) - base) / 4) as u16
+}
+
+/// Secure code writes a function into SRAM (`movs r0, #1 ; bx lr`), calls it twice, rewrites
+/// it in place (`movs r0, #2 ; bx lr`) and calls it again, through the other SRAM alias too.
+#[test]
+fn rewritten_ram_code_runs_new_instructions() {
+    const LIT1: u32 = 0x280;
+    const LIT2: u32 = 0x284;
+    const LIT_NS: u32 = 0x288;
+    let mut p = Payload::new();
+    let prog = [
+        0x2130,                    // 200: movs r1, #0x30
+        0x0609,                    // 202: lsls r1, r1, #24
+        0x2501,                    // 204: movs r5, #1
+        0x042D,                    // 206: lsls r5, r5, #16
+        0x1949,                    // 208: adds r1, r1, r5      r1 = 0x3001_0000
+        0x1C4B,                    // 20a: adds r3, r1, #1      Thumb address
+        ldr_lit(2, 0x20C, LIT1),   // 20c: ldr r2, =movs r0,#1 ; bx lr
+        0x600A,                    // 20e: str r2, [r1]
+        0x4798,                    // 210: blx r3
+        0x0004,                    // 212: movs r4, r0
+        0x4798,                    // 214: blx r3               (cached now)
+        0x1906,                    // 216: adds r6, r0, r4      r6 = 2
+        ldr_lit(2, 0x218, LIT2),   // 218: ldr r2, =movs r0,#2 ; bx lr
+        0x600A,                    // 21a: str r2, [r1]
+        0x4798,                    // 21c: blx r3
+        0x0007,                    // 21e: movs r7, r0          r7 = 2
+        ldr_lit(5, 0x220, LIT_NS), // 220: ldr r5, =0x2001_0000 (Non-secure alias)
+        0x2220,                    // 222: movs r2, #0x20
+        0x0212,                    // 224: lsls r2, r2, #8
+        0x3203,                    // 226: adds r2, #3          r2 = movs r0, #3
+        0x802A,                    // 228: strh r2, [r5]        through the NS alias
+        0x4798,                    // 22a: blx r3
+        0xE7FE,                    // 22c: b .
+    ];
+    p.vector(1, CODE)
+        .code(CODE, &prog)
+        .word(LIT1, 0x4770_2001)
+        .word(LIT2, 0x4770_2002)
+        .word(LIT_NS, 0x2001_0000);
+    let mut m = p.boot();
+    run_to(&mut m, 0x22C);
+    let r = &m.cpu.regs.r;
+    assert_eq!((r[4], r[6], r[7], r[0]), (1, 2, 2, 3));
+}
+
+/// A debugger patch (`MemoryMap::poke`) of code that already ran takes effect.
+#[test]
+fn poked_code_runs_new_instructions() {
+    let mut m = looping().boot();
+    assert_eq!(m.run(100), StopReason::CycleLimit);
+    let before = m.cpu.regs.r[0];
+    assert!(before > 0);
+    // `adds r0, #1` becomes `adds r0, #2`.
+    assert!(m.bus.poke(addr(CODE), 2, 0x3002));
+    run_to(&mut m, CODE);
+    let at = m.cpu.regs.r[0];
+    run_to(&mut m, CODE + 2);
+    assert_eq!(m.cpu.regs.r[0], at + 2);
+}

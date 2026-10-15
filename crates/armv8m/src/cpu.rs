@@ -65,6 +65,60 @@ pub struct Cpu {
     /// serialized, ignored by equality, flushed whenever the SAU or the IDAU changes.
     #[serde(skip)]
     attr_cache: AttrCache,
+    /// Decoded instructions by address, valid while the bus's `code_epoch` is unchanged (see
+    /// `fetch`). Not state: not serialized, ignored by equality.
+    #[serde(skip)]
+    icache: ICache,
+}
+
+/// Entries of `ICache`, a power of two.
+const ICACHE: usize = 4096;
+
+/// One decoded instruction: at `pc`, `len` bytes (0: empty entry), decoded while the bus's
+/// code epoch was `epoch`.
+#[derive(Clone, Copy, Debug)]
+struct ICacheEntry {
+    epoch: u64,
+    pc: u32,
+    len: u8,
+    instr: Instr,
+}
+
+/// Direct-mapped cache of decoded instructions, indexed by halfword address. Allocated on
+/// the first fill, so a CPU on a bus that caches nothing (`Bus::cache_code`) never pays for it.
+#[derive(Clone, Debug, Default)]
+struct ICache(Vec<ICacheEntry>);
+
+impl PartialEq for ICache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ICache {}
+
+impl ICache {
+    fn slot(pc: u32) -> usize {
+        (pc >> 1) as usize % ICACHE
+    }
+
+    fn get(&self, pc: u32, epoch: u64) -> Option<(Instr, u8)> {
+        let e = self.0.get(Self::slot(pc))?;
+        (e.len != 0 && e.pc == pc && e.epoch == epoch).then_some((e.instr, e.len))
+    }
+
+    fn put(&mut self, entry: ICacheEntry) {
+        if self.0.is_empty() {
+            let empty = ICacheEntry {
+                epoch: 0,
+                pc: 0,
+                len: 0,
+                instr: Instr::Undefined { raw: 0 },
+            };
+            self.0 = vec![empty; ICACHE];
+        }
+        self.0[Self::slot(entry.pc)] = entry;
+    }
 }
 
 /// Entries of `AttrCache`, a power of two.
@@ -182,6 +236,7 @@ impl Cpu {
             ppb_misses: Vec::new(),
             idau: IdauHandle::default(),
             attr_cache: AttrCache::default(),
+            icache: ICache::default(),
         }
     }
 
@@ -211,6 +266,7 @@ impl Cpu {
         *self = saved;
         self.idau = idau;
         self.flush_attr_cache();
+        self.icache = ICache::default();
     }
 
     /// Install the SoC's IDAU (default: `DefaultIdau`, address bit 28 set is Secure).
@@ -299,7 +355,23 @@ impl Cpu {
             Attr::NonSecure => false,
             Attr::Secure | Attr::NonSecureCallable => true,
         };
-        let decoded = self.read_instr(bus, addr, secure)?;
+        // A decoded copy is good while the bus's code epoch stands (`Bus::cache_code`).
+        let epoch = bus.code_epoch();
+        let decoded = match self.icache.get(addr, epoch) {
+            Some(hit) => hit,
+            None => {
+                let (instr, len) = self.read_instr(bus, addr, secure)?;
+                if bus.cache_code(addr, u32::from(len)) {
+                    self.icache.put(ICacheEntry {
+                        epoch: bus.code_epoch(),
+                        pc: addr,
+                        len,
+                        instr,
+                    });
+                }
+                (instr, len)
+            }
+        };
         if sec == Sec::NonSecure && attr == Attr::NonSecureCallable && decoded.0 != Instr::Sg {
             return Err(Fault::InvEp);
         }

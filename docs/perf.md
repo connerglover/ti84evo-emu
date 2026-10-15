@@ -121,3 +121,23 @@ trait documents that its answer must be constant per block. `TT`, `decode_at` an
 | | Before | After |
 |---|---|---|
 | `busy_loop`, thread CPU time | 28.7 M cycles/s | 32.2 M cycles/s (21 %) |
+
+### 6. Decoded-instruction cache
+
+`Cpu` keeps decoded instructions in a 4096-entry direct-mapped table by halfword address. An
+entry is used only while the bus's `code_epoch` is the one it was decoded under, and only for
+bytes the bus accepted through `Bus::cache_code` (both new `Bus` methods default to "never
+cache", so other buses behave as before). `MemoryMap` accepts code in whole RAM/ROM pages,
+remembers which buffer pages hold cached code, and takes a fresh, process-unique epoch on any
+write to such a page (through any alias, fast or general path), on `buffer_mut` and `poke`,
+and when a device changed a buffer (`DevCtx::buffer_mut`; SPIF reads now use the read-only
+`DevCtx::buffer`). The attribution and Execute Never checks still run on every fetch.
+
+The real-OS boot now has a fingerprint: it reaches exactly the same number of awake cycles
+(138 149 424 at 390 M cycles) as the baseline, which it would not if any step had changed
+what the guest does.
+
+| | Before | After |
+|---|---|---|
+| `busy_loop`, thread CPU time | 32.2 M cycles/s | 35.3 M cycles/s (23 %) |
+| `boot_to_self_test`, thread CPU time | — | 96.4 M cycles/s, 34.1 M awake cycles/s (15 090 epoch changes) |
