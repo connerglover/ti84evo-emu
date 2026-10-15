@@ -174,3 +174,16 @@ A raw `Cpu::step` loop on the same machine (no `Machine` bookkeeping) runs at 59
 |---|---|---|
 | `busy_loop`, thread CPU time | 50.8 M cycles/s | 50.4 M cycles/s (no device or event traffic) |
 | `boot_to_self_test`, thread CPU time | 126.7 M cycles/s | 132.8 M cycles/s (awake cycles unchanged) |
+
+### 9. Attribution in the instruction cache
+
+An instruction-cache entry also keeps the attribution of its address, so a hit skips the
+attribution lookup and the Execute Never check (both passed when the entry was made) and only
+re-checks the fetch against the current security state. `flush_attr_cache` (SAU write,
+`set_idau`, restore) now empties the instruction cache too. `preemptable_pending`, the slow
+half of the pending check, is out of line.
+
+| | Before | After |
+|---|---|---|
+| `busy_loop`, thread CPU time | 51.2 M cycles/s | 54.2 M cycles/s (35 %) |
+| raw `Cpu::step` loop | 59.8 M cycles/s | 64.6 M cycles/s |

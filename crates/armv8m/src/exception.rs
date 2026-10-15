@@ -353,6 +353,7 @@ impl Cpu {
     }
 
     /// The pending exception that preempts the current execution priority, if any.
+    #[inline(never)]
     pub(crate) fn preemptable_pending(&self) -> Option<(u16, Sec)> {
         // Fast rejection, run before and after every instruction: `highest_pending` only
         // considers pending system exceptions and IRQs that are both pending and enabled.

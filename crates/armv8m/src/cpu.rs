@@ -75,12 +75,14 @@ pub struct Cpu {
 const ICACHE: usize = 4096;
 
 /// One decoded instruction: at `pc`, `len` bytes (0: empty entry), decoded while the bus's
-/// code epoch was `epoch`.
+/// code epoch was `epoch`, with the attribution of `pc` then (`Cpu::flush_attr_cache` empties
+/// the cache when attribution can change).
 #[derive(Clone, Copy, Debug)]
 struct ICacheEntry {
     epoch: u64,
     pc: u32,
     len: u8,
+    attr: Attr,
     instr: Instr,
 }
 
@@ -102,9 +104,9 @@ impl ICache {
         (pc >> 1) as usize % ICACHE
     }
 
-    fn get(&self, pc: u32, epoch: u64) -> Option<(Instr, u8)> {
+    fn get(&self, pc: u32, epoch: u64) -> Option<&ICacheEntry> {
         let e = self.0.get(Self::slot(pc))?;
-        (e.len != 0 && e.pc == pc && e.epoch == epoch).then_some((e.instr, e.len))
+        (e.len != 0 && e.pc == pc && e.epoch == epoch).then_some(e)
     }
 
     fn put(&mut self, entry: ICacheEntry) {
@@ -113,6 +115,7 @@ impl ICache {
                 epoch: 0,
                 pc: 0,
                 len: 0,
+                attr: Attr::Secure,
                 instr: Instr::Undefined { raw: 0 },
             };
             self.0 = vec![empty; ICACHE];
@@ -296,6 +299,7 @@ impl Cpu {
     /// Forget every cached attribution: the SAU or the IDAU changed.
     pub(crate) fn flush_attr_cache(&mut self) {
         self.attr_cache = AttrCache::default();
+        self.icache = ICache::default();
     }
 
     /// `SecurityCheck()` for `addr`, with the region numbers `TT` reports.
@@ -340,13 +344,19 @@ impl Cpu {
     /// enter Secure memory only at an `SG` in a Non-secure callable region (else INVEP), and
     /// Secure code reaches Non-secure memory only through BXNS/BLXNS (else INVTRAN).
     fn fetch(&mut self, bus: &mut impl Bus, addr: u32) -> Result<(Instr, u8), Fault> {
+        // A decoded copy is good while the bus's code epoch stands (`Bus::cache_code`). It
+        // passed the Execute Never check and the read when it was made; the security checks
+        // depend on the current state, so they run again.
+        let epoch = bus.code_epoch();
+        if let Some(e) = self.icache.get(addr, epoch) {
+            let (instr, len, attr) = (e.instr, e.len, e.attr);
+            Self::fetch_security(self.regs.sec, attr)?;
+            Self::nsc_entry(self.regs.sec, attr, &instr)?;
+            return Ok((instr, len));
+        }
         let attr = self.attr_of(addr);
         let sec = self.regs.sec;
-        match (sec, attr) {
-            (Sec::NonSecure, Attr::Secure) => return Err(Fault::InvEp),
-            (Sec::Secure, Attr::NonSecure) => return Err(Fault::InvTran),
-            _ => {}
-        }
+        Self::fetch_security(sec, attr)?;
         if execute_never(addr) {
             return Err(Fault::IAccViol);
         }
@@ -355,27 +365,39 @@ impl Cpu {
             Attr::NonSecure => false,
             Attr::Secure | Attr::NonSecureCallable => true,
         };
-        // A decoded copy is good while the bus's code epoch stands (`Bus::cache_code`).
-        let epoch = bus.code_epoch();
-        let decoded = match self.icache.get(addr, epoch) {
-            Some(hit) => hit,
-            None => {
-                let (instr, len) = self.read_instr(bus, addr, secure)?;
-                if bus.cache_code(addr, u32::from(len)) {
-                    self.icache.put(ICacheEntry {
-                        epoch: bus.code_epoch(),
-                        pc: addr,
-                        len,
-                        instr,
-                    });
-                }
-                (instr, len)
-            }
-        };
-        if sec == Sec::NonSecure && attr == Attr::NonSecureCallable && decoded.0 != Instr::Sg {
+        let (instr, len) = self.read_instr(bus, addr, secure)?;
+        if bus.cache_code(addr, u32::from(len)) {
+            self.icache.put(ICacheEntry {
+                epoch: bus.code_epoch(),
+                pc: addr,
+                len,
+                attr,
+                instr,
+            });
+        }
+        Self::nsc_entry(sec, attr, &instr)?;
+        Ok((instr, len))
+    }
+
+    /// A fetch's security must match the current state: Non-secure code reaches Secure memory
+    /// only through Non-secure callable memory (INVEP), Secure code Non-secure memory only
+    /// through BXNS/BLXNS (INVTRAN).
+    #[inline]
+    fn fetch_security(sec: Sec, attr: Attr) -> Result<(), Fault> {
+        match (sec, attr) {
+            (Sec::NonSecure, Attr::Secure) => Err(Fault::InvEp),
+            (Sec::Secure, Attr::NonSecure) => Err(Fault::InvTran),
+            _ => Ok(()),
+        }
+    }
+
+    /// Non-secure code may execute only an `SG` in Non-secure callable memory (INVEP).
+    #[inline]
+    fn nsc_entry(sec: Sec, attr: Attr, instr: &Instr) -> Result<(), Fault> {
+        if sec == Sec::NonSecure && attr == Attr::NonSecureCallable && *instr != Instr::Sg {
             return Err(Fault::InvEp);
         }
-        Ok(decoded)
+        Ok(())
     }
 
     /// Read and decode the instruction at `addr` with a fetch of security `secure`.
