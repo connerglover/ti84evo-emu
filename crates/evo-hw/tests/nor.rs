@@ -1,6 +1,7 @@
 //! NOR flash command engine and flash file (`docs/hardware/spif-nor.md` §6.2, §8.5-8.6).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use evo_hw::nor::{DataPhase, JEDEC_ID, NOR_SIZE, NorFlash, NvError, NvState, SECREGS_LEN};
 
@@ -30,9 +31,47 @@ fn write(nor: &mut NorFlash, op: u8, addr: u32, data: &[u8], flash: &mut [u8]) -
     data.iter().map(|&b| nor.write_byte(b, flash)).collect()
 }
 
-/// A path in the cargo test scratch directory, unique to `name`.
-fn tmp(name: &str) -> PathBuf {
-    let p = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("nor-{name}.evoflash"));
+/// A flash-file path in the cargo test scratch directory that no other test (or test process)
+/// uses, removed together with its `.tmp` sibling when dropped. Tests run in parallel, so a
+/// name shared by two tests lets one delete or overwrite the other's file.
+struct TmpFile(PathBuf);
+
+impl TmpFile {
+    /// `PATH.tmp`, where `NvState::write_file` writes first.
+    fn tmp_sibling(&self) -> PathBuf {
+        let mut name = self.0.clone().into_os_string();
+        name.push(".tmp");
+        PathBuf::from(name)
+    }
+}
+
+impl std::ops::Deref for TmpFile {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TmpFile {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TmpFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(self.tmp_sibling());
+    }
+}
+
+/// A fresh [`TmpFile`] named after `name`, the process id and a per-process counter.
+fn tmp(name: &str) -> TmpFile {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let file = format!("nor-{name}-{}-{n}.evoflash", std::process::id());
+    let p = TmpFile(PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(file));
     let _ = std::fs::remove_file(&p);
     p
 }
@@ -297,9 +336,7 @@ fn nvstate_file_roundtrip() {
     assert_eq!(&bytes[12..16], &0x0100_0000u32.to_le_bytes());
     assert_eq!(bytes.len(), 16 + NOR_SIZE + SECREGS_LEN);
     // No temporary file left behind.
-    let mut tmp_name = p.clone().into_os_string();
-    tmp_name.push(".tmp");
-    assert!(!PathBuf::from(tmp_name).exists());
+    assert!(!p.tmp_sibling().exists());
 
     let back = NvState::read_file(&p).expect("read");
     assert_eq!(back.flash(), nv.flash());
@@ -364,6 +401,27 @@ fn nvstate_rejects_truncated() {
     let mut long = b.clone();
     long.push(0);
     assert!(matches!(rejects("too-long", &long), NvError::Size { .. }));
+}
+
+#[test]
+fn nvstate_rejects_oversized_file_by_its_size() {
+    // A valid header on a file 256 MiB too long: rejected from its metadata, with the size
+    // the file has.
+    let p = tmp("oversized");
+    let good = good_file_bytes();
+    std::fs::write(&p, &good[..64]).unwrap();
+    let len = good.len() + (256 << 20);
+    std::fs::File::options()
+        .write(true)
+        .open(&p)
+        .unwrap()
+        .set_len(len as u64)
+        .unwrap();
+    let e = NvState::read_file(&p).expect_err("accepted");
+    assert!(
+        matches!(e, NvError::Size { expected, found } if expected == good.len() && found == len),
+        "{e:?}"
+    );
 }
 
 #[test]
