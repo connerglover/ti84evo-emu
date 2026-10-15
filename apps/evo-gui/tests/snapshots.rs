@@ -1,41 +1,22 @@
 //! Golden images and pixel probes. They need a wgpu adapter, so they run only
 //! with `cargo test -p evo-gui --features snapshots`.
 
-use std::sync::{Mutex, MutexGuard};
+mod common;
 
+use common::{gpu_lock, open_action, snap_harness};
 use egui::{Color32, Pos2, pos2, vec2};
 use egui_kittest::Harness;
-use evo_gui::app::{AppOptions, EvoApp};
+use evo_gui::app::EvoApp;
 use evo_gui::backend::fake::FakeBackend;
 use evo_gui::keypad::geometry::{KEYPAD_ORIGIN, LCD_RECT, key_rect};
 use evo_gui::keypad::{KeyId, KeyShape, key_def};
+use evo_gui::platform::FakePlatform;
 use evo_gui::theme::{APP_BG, BODY_OUTLINE, KEY_ALPHA, KEY_NUMBER, KEY_SECOND, NO_SIGNAL_BG};
+use evo_gui::toolbar::Action;
 
-/// Serializes the tests. Several wgpu test renderers alive on different
-/// threads at once crash the process now and then on Windows
-/// (`STATUS_ACCESS_VIOLATION`), and a crash during `UPDATE_SNAPSHOTS=1`
-/// leaves truncated PNGs behind.
-static GPU: Mutex<()> = Mutex::new(());
-
-fn gpu_lock() -> MutexGuard<'static, ()> {
-    GPU.lock().unwrap_or_else(|e| e.into_inner())
-}
-
+/// The default window, 520×960, paused, on a fake platform.
 fn harness(fake: FakeBackend) -> Harness<'static, EvoApp> {
-    let opts = AppOptions {
-        start_paused: true,
-        ..AppOptions::new(std::env::temp_dir().join("evo-gui-tests-snapshots"))
-    };
-    let mut h = Harness::builder()
-        .with_size([520.0, 960.0])
-        // kittest sets its theme (dark by default) after the app is built, which
-        // overrides the light theme `EvoApp::new` asks for; render as the app runs.
-        .with_theme(egui::Theme::Light)
-        .with_pixels_per_point(1.0)
-        .with_step_dt(1.0 / 60.0)
-        .build_eframe(|cc| EvoApp::new(&cc.egui_ctx, Box::new(fake), opts));
-    h.run_steps(10);
-    h
+    snap_harness(fake, [520.0, 960.0], FakePlatform::shared())
 }
 
 fn body(x: f32, y: f32) -> Pos2 {
@@ -160,12 +141,10 @@ fn snapshot_calculator_enter_held() {
     ignore = "golden images: cargo test -p evo-gui --features snapshots"
 )]
 fn snapshot_about_window() {
-    use egui_kittest::kittest::Queryable;
     let _gpu = gpu_lock();
     let mut h = harness(FakeBackend::new());
-    h.get_by_label("About").click();
-    // Move the pointer off the toolbar so no hover highlight or tooltip shows.
-    h.run_steps(3);
+    open_action(&mut h, Action::About);
+    // Move the pointer off the sidebar so no hover highlight or tooltip shows.
     h.hover_at(egui::pos2(500.0, 950.0));
     h.run_steps(10);
     h.snapshot("about_window");
@@ -177,22 +156,10 @@ fn snapshot_about_window() {
     ignore = "golden images: cargo test -p evo-gui --features snapshots"
 )]
 fn snapshot_debug_panels() {
-    use egui_kittest::kittest::Queryable;
     let _gpu = gpu_lock();
-    let opts = AppOptions {
-        start_paused: true,
-        ..AppOptions::new(std::env::temp_dir().join("evo-gui-tests-snapshots"))
-    };
-    let mut h = Harness::builder()
-        .with_size([1060.0, 960.0])
-        .with_theme(egui::Theme::Light)
-        .with_pixels_per_point(1.0)
-        .with_step_dt(1.0 / 60.0)
-        .build_eframe(|cc| EvoApp::new(&cc.egui_ctx, Box::new(FakeBackend::new()), opts));
-    h.run_steps(3);
-    h.get_by_label("Debug panels").click();
-    // Move the pointer off the toolbar so no hover highlight or tooltip shows.
-    h.run_steps(3);
+    let mut h = snap_harness(FakeBackend::new(), [1060.0, 960.0], FakePlatform::shared());
+    open_action(&mut h, Action::ToggleDebug);
+    // Move the pointer off the sidebar so no hover highlight or tooltip shows.
     h.hover_at(egui::pos2(300.0, 950.0));
     h.run_steps(10);
     h.snapshot("debug_panels");
@@ -204,13 +171,28 @@ fn snapshot_debug_panels() {
     ignore = "golden images: cargo test -p evo-gui --features snapshots"
 )]
 fn snapshot_keymap_window() {
-    use egui_kittest::kittest::Queryable;
     let _gpu = gpu_lock();
     let mut h = harness(FakeBackend::new());
-    h.get_by_label("Keyboard mapping").click();
-    // Move the pointer off the toolbar so no hover highlight or tooltip shows.
-    h.run_steps(3);
+    open_action(&mut h, Action::Keymap);
+    // Move the pointer off the sidebar so no hover highlight or tooltip shows.
     h.hover_at(egui::pos2(500.0, 950.0));
     h.run_steps(10);
     h.snapshot("keymap_window");
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "snapshots"),
+    ignore = "golden images: cargo test -p evo-gui --features snapshots"
+)]
+fn snapshot_sidebar_calculator_popover() {
+    use egui_kittest::kittest::Queryable;
+    let _gpu = gpu_lock();
+    let mut h = harness(FakeBackend::new());
+    h.get_by_label("Calculator").click();
+    h.run_steps(3);
+    // Move the pointer off the sidebar so no hover highlight or tooltip shows.
+    h.hover_at(egui::pos2(500.0, 950.0));
+    h.run_steps(10);
+    h.snapshot("sidebar_calculator_popover");
 }

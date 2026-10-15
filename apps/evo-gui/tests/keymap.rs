@@ -1,5 +1,8 @@
 //! The keyboard-mapping window and persisted preferences.
 
+mod common;
+
+use common::{open_action, test_options};
 use egui::Key;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
@@ -9,13 +12,18 @@ use evo_gui::input::{Keymap, PcKey};
 use evo_gui::keypad::KeyId;
 use evo_gui::lcd::ScaleFilter;
 use evo_gui::pacer::Speed;
+use evo_gui::platform::FakePlatform;
 use evo_gui::prefs::{PREFS_KEY, Prefs};
+use evo_gui::toolbar::Action;
 
 fn harness_with(fake: FakeBackend, prefs: Prefs) -> Harness<'static, EvoApp> {
     let opts = AppOptions {
         start_paused: true,
         prefs,
-        ..AppOptions::new(std::env::temp_dir().join("evo-gui-tests-keymap"))
+        ..test_options(
+            &std::env::temp_dir().join("evo-gui-tests-keymap"),
+            FakePlatform::shared(),
+        )
     };
     let mut h = Harness::builder()
         .with_size([520.0, 960.0])
@@ -30,10 +38,9 @@ fn harness(fake: FakeBackend) -> Harness<'static, EvoApp> {
     harness_with(fake, Prefs::default())
 }
 
-/// Opens the keyboard-mapping window from the toolbar.
+/// Opens the keyboard-mapping window from the sidebar.
 fn open_window(h: &mut Harness<'static, EvoApp>) {
-    h.get_by_label("Keyboard mapping").click();
-    h.run_steps(3);
+    open_action(h, Action::Keymap);
 }
 
 /// A test-local `eframe::Storage`.
@@ -116,9 +123,7 @@ fn app_starts_from_prefs_and_reports_them() {
 #[test]
 fn save_writes_prefs() {
     let mut h = harness(FakeBackend::new());
-    h.get_by_label("Smooth scaling (better at non-integer sizes)")
-        .click();
-    h.run_steps(2);
+    open_action(&mut h, Action::Smooth);
     let mut storage = MemStorage::default();
     eframe::App::save(h.state_mut(), &mut storage);
     let saved: Prefs = eframe::get_value(&storage, PREFS_KEY).expect("prefs saved");
@@ -275,7 +280,10 @@ fn restored_debug_panel_does_not_grow_on_first_frame() {
     let opts = AppOptions {
         start_paused: true,
         prefs: debug_prefs(),
-        ..AppOptions::new(std::env::temp_dir().join("evo-gui-tests-keymap"))
+        ..test_options(
+            &std::env::temp_dir().join("evo-gui-tests-keymap"),
+            FakePlatform::shared(),
+        )
     };
     let mut app = EvoApp::new(&ctx, Box::new(FakeBackend::new()), opts);
     let mut frame = eframe::Frame::_new_kittest();

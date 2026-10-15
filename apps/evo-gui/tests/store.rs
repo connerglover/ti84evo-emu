@@ -1,4 +1,4 @@
-//! State slots, screenshots and the toolbar's tool table.
+//! State slots, screenshots and the sidebar's group and action tables.
 
 mod common;
 
@@ -7,9 +7,10 @@ use common::TempDir;
 use egui::{FontId, RawInput};
 use evo_gui::backend::fake::FakeBackend;
 use evo_gui::backend::{BackendError, EmuBackend, Frame};
+use evo_gui::pacer::Speed;
 use evo_gui::store::{SLOT_MAGIC, SLOT_VERSION, SLOTS, Store, StoreError};
 use evo_gui::theme::{has_glyphs, install_fonts};
-use evo_gui::toolbar::Tool;
+use evo_gui::toolbar::{Action, Group};
 
 /// A fresh, empty data directory for one test.
 fn fresh_dir(test: &str) -> TempDir {
@@ -217,58 +218,115 @@ fn screenshot_of_invalid_frame_is_no_frame() {
 }
 
 #[test]
-fn tool_table() {
-    use Tool::*;
+fn group_and_action_tables() {
+    use Group::*;
     assert_eq!(
-        Tool::ALL,
-        [
-            Screenshot,
-            SaveState,
-            LoadState,
-            Reset,
-            Reprovision,
-            Smooth,
-            Debug,
-            Keymap,
-            About
-        ]
+        Group::ALL,
+        [Calculator, Capture, Files, Debug, Tools, Settings, Help]
     );
-    let rows: Vec<_> = Tool::ALL
+    let rows: Vec<_> = Group::ALL
         .iter()
-        .map(|t| (t.icon(), t.fallback(), t.tooltip()))
+        .map(|g| (g.icon(), g.fallback(), g.tooltip()))
         .collect();
     assert_eq!(
         rows,
         [
-            ("\u{1F4F7}", "Shot", "Screenshot"),
-            ("\u{1F4BE}", "Save", "Save state"),
-            ("\u{1F4C2}", "Load", "Load state"),
-            ("\u{1F504}", "Reset", "Reset"),
-            ("\u{1F527}", "Prov", "Re-provision"),
-            (
-                "\u{1F5BC}",
-                "Smooth",
-                "Smooth scaling (better at non-integer sizes)"
-            ),
+            ("\u{1F5A9}", "Calc", "Calculator"),
+            ("\u{1F4F7}", "Shot", "Capture"),
+            ("\u{1F4C1}", "Files", "Files"),
             ("\u{1F41B}", "Debug", "Debug panels"),
-            ("\u{2328}", "Keys", "Keyboard mapping"),
-            ("\u{2139}", "About", "About"),
+            ("\u{1F527}", "Tools", "Tools"),
+            ("\u{2699}", "Prefs", "Settings"),
+            ("\u{2753}", "Help", "Help"),
         ]
     );
+    let by_group = |g: Group| -> Vec<&str> {
+        Action::ALL
+            .iter()
+            .filter(|a| a.group() == g)
+            .map(|a| a.label())
+            .collect()
+    };
+    assert_eq!(
+        by_group(Calculator),
+        [
+            "Reset",
+            "Re-provision",
+            "Reload ROM",
+            "Change ROM\u{2026}",
+            "Save state",
+            "Load state",
+            "Pause",
+            "Speed 1\u{d7}",
+            "Speed 2\u{d7}",
+            "Speed 4\u{d7}",
+            "Speed unlimited",
+        ]
+    );
+    assert_eq!(
+        by_group(Capture),
+        [
+            "Screenshot",
+            "Copy screen",
+            "Record animated PNG",
+            "Record MP4"
+        ]
+    );
+    assert_eq!(
+        by_group(Files),
+        [
+            "Import RAM image\u{2026}",
+            "Export RAM image\u{2026}",
+            "Import calculator state\u{2026}",
+            "Export calculator state\u{2026}",
+            "Import debug state\u{2026}",
+            "Export debug state\u{2026}",
+            "Import settings\u{2026}",
+            "Export settings\u{2026}",
+            "Import flash image\u{2026}",
+            "Export flash image\u{2026}",
+        ]
+    );
+    assert_eq!(by_group(Debug), ["Debug panels"]);
+    assert_eq!(
+        by_group(Tools),
+        ["Key history", "Macros / AutoTester", "Hardware"]
+    );
+    assert_eq!(
+        by_group(Settings),
+        [
+            "Keyboard mapping",
+            "Smooth scaling (better at non-integer sizes)",
+            "Instances\u{2026}",
+            "Compact mode",
+            "Reset layout",
+            "Reset everything\u{2026}",
+        ]
+    );
+    assert_eq!(
+        by_group(Help),
+        [
+            "About",
+            "Third-party licenses",
+            "Check for updates",
+            "Report a bug"
+        ]
+    );
+    assert_eq!(Action::Speed(Speed::Unlimited).group(), Calculator);
 }
 
 #[test]
-fn toolbar_icons_have_a_drawable_label() {
+fn sidebar_icons_have_a_drawable_label() {
     let ctx = egui::Context::default();
     install_fonts(&ctx);
     let mut out = ctx.run_ui(RawInput::default(), |_| {});
     out.textures_delta.clear();
     let font = FontId::proportional(14.0);
-    for t in Tool::ALL {
-        assert!(has_glyphs(&ctx, &font, t.fallback()), "{t:?} fallback");
+    for g in Group::ALL {
+        assert!(has_glyphs(&ctx, &font, g.fallback()), "{g:?} fallback");
         assert!(
-            has_glyphs(&ctx, &font, t.icon()) || has_glyphs(&ctx, &font, t.fallback()),
-            "{t:?}"
+            has_glyphs(&ctx, &font, g.icon()) || has_glyphs(&ctx, &font, g.fallback()),
+            "{g:?}"
         );
     }
 }

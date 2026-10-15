@@ -14,12 +14,13 @@ mod common;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use common::TempDir;
+use common::{TempDir, test_options};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use evo_gui::app::{AppOptions, EvoApp};
+use evo_gui::app::EvoApp;
 use evo_gui::backend::machine::MachineBackend;
 use evo_gui::backend::{CLOCK_HZ, EmuBackend};
+use evo_gui::platform::FakePlatform;
 
 /// The selected tile's colour on the OS 7.1.0.4421 app launcher (RGB565 0x035E,
 /// `docs/hardware/lcdc.md` "Colour order"); with red and blue swapped it would be orange.
@@ -133,7 +134,7 @@ fn real_os_home_screen_and_keypad() {
     let data = TempDir::new("evo-gui-tests-real-os-data", true);
     let backend = MachineBackend::open(&path, &nv).unwrap();
     assert!(backend.needs_provision());
-    let opts = AppOptions::new(data.to_path_buf());
+    let opts = test_options(&data, FakePlatform::shared());
     let mut h = Harness::builder()
         .with_size([520.0, 960.0])
         .with_theme(egui::Theme::Light)

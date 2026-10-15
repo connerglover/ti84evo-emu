@@ -1,4 +1,4 @@
-//! The application shell: header, toolbar, calculator view, run loop and
+//! The application shell: header, sidebar and its popovers, calculator view, run loop and
 //! keypad input, and debug panels.
 
 use std::collections::BTreeSet;
@@ -25,13 +25,14 @@ use crate::keypad::paint::{body_rect_to_screen, keypad_rect_to_screen, paint_bod
 use crate::keypad::{KEYS, KeyId, KeyShape, key_def};
 use crate::lcd::{LcdView, ScaleFilter};
 use crate::pacer::{FrameRunner, Pacer, Speed, SpeedMeter, WALL_BUDGET};
+use crate::platform::{DesktopPlatform, PlatformRef};
 use crate::prefs::{PREFS_KEY, Prefs};
 use crate::store::{Store, StoreError};
 use crate::theme::{APP_BG, HEADER_BG, LABEL_DARK, install_fonts};
 use crate::toast::{ToastKind, Toasts};
 use crate::toolbar::{
-    PickerMode, TOOLBAR_W, Tool, about_window, drawable_icons, slot_picker, toolbar_buttons,
-    toolbar_frame,
+    Action, Group, PickerMode, TOOLBAR_W, about_window, drawable_icons, group_popover,
+    not_available, sidebar_buttons, slot_picker, toolbar_frame,
 };
 
 /// The window and header title.
@@ -57,6 +58,12 @@ const DEBUG_PANEL_ID: &str = "debug";
 const GROW_WAIT_FRAMES: u32 = 30;
 /// The smallest calculator scale the debug panel may squeeze the view to.
 const MIN_CALC_SCALE_WITH_DEBUG: f32 = 0.6;
+/// The window size Reset layout asks for (the default window).
+const DEFAULT_WINDOW: Vec2 = vec2(520.0, 960.0);
+/// The toast after Reset layout.
+pub const LAYOUT_RESET: &str = "Layout reset";
+/// The compact-mode context menu entry that brings the header and sidebar back.
+pub const EXIT_COMPACT: &str = "Exit compact mode";
 
 /// The widest the debug panel may be in a window `window_w` points wide:
 /// what is left after the toolbar, the central margins and a calculator at
@@ -114,16 +121,19 @@ pub struct AppOptions {
     pub prefs: Prefs,
     /// Shown as an Info toast on the first frame.
     pub notice: Option<String>,
+    /// File dialogs, clipboard, browser, network and process spawning.
+    pub platform: PlatformRef,
 }
 
 impl AppOptions {
-    /// Defaults: not paused, default preferences, no notice.
+    /// Defaults: not paused, default preferences, no notice, the desktop platform.
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             start_paused: false,
             data_dir,
             prefs: Prefs::default(),
             notice: None,
+            platform: DesktopPlatform::shared(),
         }
     }
 }
@@ -216,15 +226,24 @@ pub struct EvoApp {
     transform: CalcTransform,
     store: Store,
     toasts: Toasts,
-    /// Per tool, whether its icon is drawable; filled on the first frame,
+    /// Per group, whether its icon is drawable; filled on the first frame,
     /// once the fonts are loaded.
-    icons: Option<[bool; 9]>,
+    icons: Option<[bool; 7]>,
+    /// The open group popover and where it sits.
+    popover: Option<(Group, Pos2)>,
+    /// Where the last popover sat: the slot picker opens there.
+    popover_pos: Pos2,
     /// The open slot picker and where it sits.
     picker: Option<(PickerMode, Pos2)>,
+    /// Reset layout was asked for; it runs at the start of the next `ui` pass, which has
+    /// the context it needs.
+    pending_reset_layout: bool,
     about_open: bool,
     keymap_window: KeymapWindow,
-    /// The toolbar panel as laid out in the last frame.
+    /// The sidebar panel as laid out in the last frame.
     toolbar_rect: Rect,
+    /// The platform services; features reach them through the app.
+    platform: PlatformRef,
 }
 
 impl EvoApp {
@@ -245,7 +264,10 @@ impl EvoApp {
             store: Store::new(opts.data_dir.clone()),
             toasts,
             icons: None,
+            popover: None,
+            popover_pos: pos2(TOOLBAR_W, HEADER_H),
             picker: None,
+            pending_reset_layout: false,
             about_open: false,
             keymap_window: KeymapWindow::new(),
             toolbar_rect: Rect::NOTHING,
@@ -278,6 +300,7 @@ impl EvoApp {
             compact: opts.prefs.compact,
             speed_setting: opts.prefs.speed,
             transform: CalcTransform::fit(egui::Rect::ZERO),
+            platform: opts.platform,
         };
         if needs_provision {
             app.start_provision();
@@ -378,6 +401,21 @@ impl EvoApp {
 
     pub fn debug_open(&self) -> bool {
         self.debug_open
+    }
+
+    /// True in compact mode: no header and no sidebar.
+    pub fn compact(&self) -> bool {
+        self.compact
+    }
+
+    /// The selected emulation speed.
+    pub fn speed(&self) -> Speed {
+        self.speed_setting
+    }
+
+    /// The platform services the app was built with.
+    pub fn platform(&self) -> &PlatformRef {
+        &self.platform
     }
 
     /// Why the last run returned.
@@ -496,64 +534,168 @@ impl EvoApp {
         }
     }
 
-    /// Opens the slot picker in `mode` beside `button`, or closes it when it
-    /// is already open in that mode.
-    fn toggle_picker(&mut self, mode: PickerMode, button: Rect) {
-        self.picker = match self.picker {
-            Some((open, _)) if open == mode => None,
-            _ => Some((mode, pos2(self.toolbar_rect.right(), button.top()))),
-        };
+    /// Pauses, or resumes. Resuming from a breakpoint first steps off it, or the run would
+    /// stop on it at once.
+    fn toggle_pause(&mut self) {
+        if self.paused && matches!(self.status, RunStatus::Breakpoint(_)) {
+            self.status = self.backend.step();
+        }
+        self.paused = !self.paused;
+        if !self.paused && !self.status.is_stop() {
+            self.status = RunStatus::Running;
+        }
+        self.speed.reset();
     }
 
-    fn apply_tool(&mut self, tool: Tool, button: Rect) {
-        let machine_tool = matches!(
-            tool,
-            Tool::Screenshot | Tool::SaveState | Tool::LoadState | Tool::Reset | Tool::Reprovision
+    fn set_speed(&mut self, s: Speed) {
+        self.speed_setting = s;
+        self.pacer.speed = s.factor();
+        self.speed.reset();
+    }
+
+    /// Closes the debug dock and leaves compact mode, forgets window and panel positions
+    /// and sizes, and asks for the default window size.
+    fn reset_layout(&mut self, ctx: &egui::Context) {
+        self.debug_open = false;
+        self.debug_shown = false;
+        self.compact = false;
+        self.grown = false;
+        self.grow_target = None;
+        self.popover = None;
+        self.picker = None;
+        ctx.data_mut(|d| d.remove::<egui::PanelState>(Id::new(DEBUG_PANEL_ID)));
+        ctx.memory_mut(|m| m.reset_areas());
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(DEFAULT_WINDOW));
+        self.toasts.push(LAYOUT_RESET, ToastKind::Info);
+    }
+
+    /// Whether `a` is drawn selected in its popover.
+    fn action_active(&self, a: Action) -> bool {
+        match a {
+            Action::TogglePause => self.paused,
+            Action::Speed(s) => s == self.speed_setting,
+            Action::ToggleDebug => self.debug_open,
+            Action::Keymap => self.keymap_window.is_open(),
+            Action::Smooth => self.filter == ScaleFilter::Smooth,
+            Action::Compact => self.compact,
+            Action::About => self.about_open,
+            _ => false,
+        }
+    }
+
+    /// Runs one sidebar action. The slot picker of Save state and Load state opens where
+    /// the last popover sat. An action the app does not handle shows [`not_available`].
+    pub fn run_action(&mut self, a: Action) {
+        let machine = matches!(
+            a,
+            Action::Reset
+                | Action::Reprovision
+                | Action::SaveState
+                | Action::LoadState
+                | Action::Screenshot
+                | Action::ReloadRom
+                | Action::ChangeRom
+                | Action::ImportRam
+                | Action::ExportRam
+                | Action::ImportState
+                | Action::ExportState
+                | Action::ImportDebug
+                | Action::ExportDebug
+                | Action::ImportSettings
+                | Action::ExportSettings
+                | Action::ImportFlash
+                | Action::ExportFlash
         );
-        if machine_tool && self.provisioning() {
+        if machine && self.provisioning() {
             self.toasts.push(PROVISION_BUSY, ToastKind::Info);
             return;
         }
-        match tool {
-            Tool::Screenshot => self.screenshot(),
-            Tool::SaveState => self.toggle_picker(PickerMode::Save, button),
-            Tool::LoadState => self.toggle_picker(PickerMode::Load, button),
-            Tool::Reset => self.reset_machine(),
-            Tool::Reprovision => {
+        match a {
+            Action::Reset => self.reset_machine(),
+            Action::Reprovision => {
                 self.picker = None;
                 self.start_provision();
             }
-            Tool::Smooth => {
+            Action::SaveState => self.picker = Some((PickerMode::Save, self.popover_pos)),
+            Action::LoadState => self.picker = Some((PickerMode::Load, self.popover_pos)),
+            Action::TogglePause => self.toggle_pause(),
+            Action::Speed(s) => self.set_speed(s),
+            Action::Screenshot => self.screenshot(),
+            Action::ToggleDebug => self.debug_open = !self.debug_open,
+            Action::Keymap => self.keymap_window.toggle(),
+            Action::Smooth => {
                 self.filter = match self.filter {
                     ScaleFilter::Nearest => ScaleFilter::Smooth,
                     ScaleFilter::Smooth => ScaleFilter::Nearest,
                 };
             }
-            Tool::Debug => self.debug_open = !self.debug_open,
-            Tool::Keymap => self.keymap_window.toggle(),
-            Tool::About => self.about_open = !self.about_open,
+            Action::Compact => {
+                self.compact = !self.compact;
+                self.popover = None;
+                self.picker = None;
+            }
+            Action::ResetLayout => self.pending_reset_layout = true,
+            Action::About => self.about_open = !self.about_open,
+            other => self.toasts.push(not_available(other), ToastKind::Info),
         }
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
+    /// Opens `group`'s popover beside `button`, or closes it when it is already open.
+    /// Debug has no popover: it toggles the dock.
+    fn click_group(&mut self, group: Group, button: Rect) {
+        self.picker = None;
+        if group == Group::Debug {
+            self.popover = None;
+            self.run_action(Action::ToggleDebug);
+            return;
+        }
+        self.popover = match self.popover {
+            Some((open, _)) if open == group => None,
+            _ => Some((group, pos2(self.toolbar_rect.right(), button.top()))),
+        };
+    }
+
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
         self.toolbar_rect = ui.max_rect();
         let icons = *self.icons.get_or_insert_with(|| drawable_icons(ui.ctx()));
-        let (filter, debug_open) = (self.filter, self.debug_open);
-        let keymap_open = self.keymap_window.is_open();
-        let out = toolbar_buttons(ui, &icons, |t| match t {
-            Tool::Smooth => filter == ScaleFilter::Smooth,
-            Tool::Debug => debug_open,
-            Tool::Keymap => keymap_open,
-            _ => false,
-        });
-        if let (Some(tool), Some(rect)) = (out.clicked, out.clicked_rect) {
-            self.apply_tool(tool, rect);
+        let debug_open = self.debug_open;
+        let open = self.popover.map(|(g, _)| g);
+        let out = sidebar_buttons(ui, &icons, open, |g| g == Group::Debug && debug_open);
+        if let (Some(group), Some(rect)) = (out.clicked, out.clicked_rect) {
+            self.click_group(group, rect);
         }
+    }
+
+    /// The open group popover: runs the action picked and closes, or closes on a click
+    /// outside it and the sidebar.
+    fn popover(&mut self, ctx: &egui::Context) {
+        let Some((group, pos)) = self.popover else {
+            return;
+        };
+        let out = group_popover(ctx, pos, group, |a| self.action_active(a));
+        if let Some(a) = out.picked {
+            self.popover = None;
+            self.popover_pos = pos;
+            self.run_action(a);
+        } else if out.clicked_elsewhere && !self.on_sidebar(ctx) {
+            // A click on the sidebar is handled by its button.
+            self.popover = None;
+        }
+    }
+
+    /// True when this frame's click is on the sidebar.
+    fn on_sidebar(&self, ctx: &egui::Context) -> bool {
+        !self.compact
+            && ctx
+                .input(|i| i.pointer.interact_pos())
+                .is_some_and(|p| self.toolbar_rect.contains(p))
     }
 
     /// The slot picker, About and keyboard-mapping windows and toasts, over
     /// everything else.
     fn overlays(&mut self, ctx: &egui::Context) {
+        let had_picker = self.picker.is_some();
+        self.popover(ctx);
         if let Some((mode, pos)) = self.picker {
             let store = &self.store;
             let out = slot_picker(ctx, pos, mode, |n| store.has_slot(n));
@@ -562,14 +704,10 @@ impl EvoApp {
                     PickerMode::Save => self.save_slot(n),
                     PickerMode::Load => self.load_slot(n),
                 }
-            } else if out.clicked_elsewhere {
-                // A click on the toolbar is handled by the tool itself.
-                let on_toolbar = ctx
-                    .input(|i| i.pointer.interact_pos())
-                    .is_some_and(|p| self.toolbar_rect.contains(p));
-                if !on_toolbar {
-                    self.picker = None;
-                }
+            } else if out.clicked_elsewhere && had_picker && !self.on_sidebar(ctx) {
+                // A click on the sidebar is handled by its button, and the click that
+                // picked Save state or Load state in a popover this frame opened it.
+                self.picker = None;
             }
         }
         about_window(ctx, &mut self.about_open);
@@ -660,15 +798,7 @@ impl EvoApp {
             self.status = self.backend.step();
         }
         if out.toggle_pause {
-            if self.paused && matches!(self.status, RunStatus::Breakpoint(_)) {
-                // Move off the breakpoint, or the run would stop on it at once.
-                self.status = self.backend.step();
-            }
-            self.paused = !self.paused;
-            if !self.paused && !self.status.is_stop() {
-                self.status = RunStatus::Running;
-            }
-            self.speed.reset();
+            self.toggle_pause();
         }
     }
 
@@ -754,7 +884,23 @@ impl EvoApp {
         )
     }
 
+    /// In compact mode, the right-click menu on the calculator view's background. It is
+    /// added before the keys, so the keys stay on top of it.
+    fn compact_menu(&mut self, ui: &mut egui::Ui) {
+        let bg = ui.interact(ui.max_rect(), Id::new("evo-compact-bg"), Sense::click());
+        bg.context_menu(|ui| {
+            let exit = ui.add(egui::Button::new(EXIT_COMPACT).sense(Sense::CLICK));
+            if exit.clicked() {
+                self.compact = false;
+                ui.close();
+            }
+        });
+    }
+
     fn calculator(&mut self, ui: &mut egui::Ui) {
+        if self.compact {
+            self.compact_menu(ui);
+        }
         let t = CalcTransform::fit(ui.available_rect_before_wrap());
         self.transform = t;
         let painter = ui.painter().clone();
@@ -858,19 +1004,25 @@ impl eframe::App for EvoApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Panel::top("header")
-            .exact_size(HEADER_H)
-            .frame(
-                Frame::NONE
-                    .fill(HEADER_BG)
-                    .inner_margin(Margin::symmetric(12, 0)),
-            )
-            .show(ui, |ui| self.header(ui));
-        egui::Panel::left("toolbar")
-            .exact_size(TOOLBAR_W)
-            .resizable(false)
-            .frame(toolbar_frame())
-            .show(ui, |ui| self.toolbar(ui));
+        if std::mem::take(&mut self.pending_reset_layout) {
+            let ctx = ui.ctx().clone();
+            self.reset_layout(&ctx);
+        }
+        if !self.compact {
+            egui::Panel::top("header")
+                .exact_size(HEADER_H)
+                .frame(
+                    Frame::NONE
+                        .fill(HEADER_BG)
+                        .inner_margin(Margin::symmetric(12, 0)),
+                )
+                .show(ui, |ui| self.header(ui));
+            egui::Panel::left("toolbar")
+                .exact_size(TOOLBAR_W)
+                .resizable(false)
+                .frame(toolbar_frame())
+                .show(ui, |ui| self.sidebar(ui));
+        }
         if self.debug_open {
             let window_w = ui.max_rect().width();
             if let Some((target, left)) = self.grow_target {

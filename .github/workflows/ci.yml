@@ -59,7 +59,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.98"
-      - run: cargo test -p evo-gui --features snapshots --test snapshots
+      - run: cargo test -p evo-gui --features snapshots --test "snapshots*"
       - if: failure()
         uses: actions/upload-artifact@v4
         with:

@@ -1,14 +1,27 @@
-//! Lane 0 foundation: speed setting, the new preferences, the platform seam and the log buffer.
+//! Lane 0 foundation: speed setting, the new preferences, the platform seam, the log buffer
+//! and the grouped sidebar.
 
+mod common;
+
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use common::{TempDir, harness_with, open_action, test_options};
+use egui::accesskit::Role;
+use egui::{Event, FontId, Modifiers, PointerButton, RawInput, pos2};
+use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
+use evo_gui::app::{AppOptions, EvoApp};
 use evo_gui::backend::fake::FakeBackend;
 use evo_gui::backend::{CLOCK_HZ, EmuBackend, Frame};
 use evo_gui::logbuf::{LOG_CAP, LogBuf};
 use evo_gui::pacer::{Pacer, Speed};
 use evo_gui::platform::{FakePlatform, FileFilter, Platform, PlatformRef};
 use evo_gui::prefs::Prefs;
+use evo_gui::store::Store;
+use evo_gui::theme::{has_glyphs, install_fonts};
+use evo_gui::toolbar::{Action, Group, not_available};
 
 #[test]
 fn speed_factors_and_labels() {
@@ -176,4 +189,208 @@ fn logbuf_keeps_the_last_cap_lines() {
         b.record(format!("line {i}"));
     }
     assert_eq!(b.drain(), ["line 2", "line 3", "line 4"]);
+}
+
+// ---------------------------------------------------------------------------
+// Task 0.4: grouped sidebar, popovers, compact mode, reset layout.
+
+/// A 520x960 harness on a fresh data dir with a fake platform.
+fn sidebar_harness(test: &str, paused: bool) -> (Harness<'static, EvoApp>, TempDir) {
+    let dir = TempDir::new(&format!("evo-gui-foundation-{test}"), false);
+    let opts = AppOptions {
+        start_paused: paused,
+        ..test_options(&dir, FakePlatform::shared())
+    };
+    (harness_with(FakeBackend::new(), opts), dir)
+}
+
+/// A primary or secondary click at `pos`, then 3 steps.
+fn click_at(h: &mut Harness<'static, EvoApp>, pos: egui::Pos2, button: PointerButton) {
+    h.event(Event::PointerMoved(pos));
+    for pressed in [true, false] {
+        h.event(Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: Modifiers::NONE,
+        });
+    }
+    h.run_steps(3);
+}
+
+fn has_button(h: &Harness<'static, EvoApp>, label: &str) -> bool {
+    h.query_by_role_and_label(Role::Button, label).is_some()
+}
+
+#[test]
+fn group_and_action_tables() {
+    assert_eq!(Action::ALL.len(), 39);
+    let labels: HashSet<&str> = Action::ALL.iter().map(|a| a.label()).collect();
+    assert_eq!(labels.len(), Action::ALL.len(), "labels are unique");
+    for g in Group::ALL {
+        let n = Action::ALL.iter().filter(|a| a.group() == g).count();
+        if g == Group::Debug {
+            assert_eq!(n, 1, "Debug holds only ToggleDebug");
+        } else {
+            assert!(n >= 1, "{g:?} has no action");
+        }
+    }
+    assert_eq!(Action::ToggleDebug.group(), Group::Debug);
+    let speeds: Vec<Action> = Action::ALL
+        .into_iter()
+        .filter(|a| matches!(a, Action::Speed(_)))
+        .collect();
+    assert_eq!(speeds, Speed::ALL.map(Action::Speed));
+    assert_eq!(Action::Speed(Speed::X2).label(), "Speed 2\u{d7}");
+}
+
+#[test]
+fn every_action_label_is_drawable() {
+    let ctx = egui::Context::default();
+    install_fonts(&ctx);
+    let mut out = ctx.run_ui(RawInput::default(), |_| {});
+    out.textures_delta.clear();
+    let font = FontId::proportional(14.0);
+    for g in Group::ALL {
+        assert!(has_glyphs(&ctx, &font, g.fallback()), "{g:?} fallback");
+        assert!(has_glyphs(&ctx, &font, g.tooltip()), "{g:?} tooltip");
+    }
+    for a in Action::ALL {
+        assert!(has_glyphs(&ctx, &font, a.label()), "{a:?} label");
+    }
+}
+
+#[test]
+fn popover_lists_its_group() {
+    let (mut h, _dir) = sidebar_harness("popover", true);
+    h.get_by_role_and_label(Role::Button, "Capture").click();
+    h.run_steps(3);
+    for label in [
+        "Screenshot",
+        "Copy screen",
+        "Record animated PNG",
+        "Record MP4",
+    ] {
+        assert!(has_button(&h, label), "{label}");
+    }
+    assert!(!has_button(&h, "Save state"));
+    // Another group's button replaces it.
+    h.get_by_role_and_label(Role::Button, "Calculator").click();
+    h.run_steps(3);
+    assert!(has_button(&h, "Save state"));
+    assert!(has_button(&h, "Speed unlimited"));
+    assert!(!has_button(&h, "Copy screen"));
+    // Its own button closes it.
+    h.get_by_role_and_label(Role::Button, "Calculator").click();
+    h.run_steps(3);
+    assert!(!has_button(&h, "Save state"));
+}
+
+#[test]
+fn popover_closes_after_pick_and_on_outside_click() {
+    let (mut h, _dir) = sidebar_harness("popclose", true);
+    open_action(&mut h, Action::Screenshot);
+    assert!(!has_button(&h, "Record MP4"), "closed after the pick");
+    h.get_by_label_contains("Screenshot saved to");
+
+    h.get_by_role_and_label(Role::Button, "Capture").click();
+    h.run_steps(3);
+    assert!(has_button(&h, "Record MP4"));
+    // A click on the header, away from the sidebar and the popover.
+    click_at(&mut h, pos2(300.0, 20.0), PointerButton::Primary);
+    assert!(!has_button(&h, "Record MP4"), "closed by the outside click");
+}
+
+#[test]
+fn save_state_from_popover_opens_slot_picker() {
+    let (mut h, dir) = sidebar_harness("popsave", true);
+    open_action(&mut h, Action::SaveState);
+    assert!(!has_button(&h, "Load state"), "popover closed");
+    h.get_by_label("Save to slot");
+    h.get_by_label("Slot 1").click();
+    h.run_steps(3);
+    h.get_by_label("Saved slot 1");
+    assert!(Store::new(dir.to_path_buf()).has_slot(1));
+}
+
+#[test]
+fn speed_action_sets_pacer() {
+    let (mut h, _dir) = sidebar_harness("speed", true);
+    assert_eq!(h.state().speed(), Speed::X1);
+    open_action(&mut h, Action::Speed(Speed::X4));
+    assert_eq!(h.state().speed(), Speed::X4);
+    assert_eq!(h.state().prefs().speed, Speed::X4);
+    open_action(&mut h, Action::Speed(Speed::Unlimited));
+    assert_eq!(h.state().speed(), Speed::Unlimited);
+}
+
+#[test]
+fn pause_action_toggles() {
+    let (mut h, _dir) = sidebar_harness("pause", false);
+    assert!(!h.state().paused());
+    open_action(&mut h, Action::TogglePause);
+    assert!(h.state().paused());
+    h.get_by_label("Paused");
+    open_action(&mut h, Action::TogglePause);
+    assert!(!h.state().paused());
+}
+
+#[test]
+fn not_available_text() {
+    assert_eq!(
+        not_available(Action::ReportBug),
+        "Report a bug is not available yet"
+    );
+}
+
+#[test]
+fn compact_hides_sidebar_and_context_menu_restores() {
+    let (mut h, _dir) = sidebar_harness("compact", true);
+    open_action(&mut h, Action::Compact);
+    assert!(h.state().compact());
+    assert!(h.state().prefs().compact);
+    assert!(h.query_by_label("Calculator").is_none());
+    assert!(h.query_by_label("TI-84 Evo Emulator").is_none());
+    let p = h.state().calc_transform().to_screen(pos2(20.0, 20.0));
+    click_at(&mut h, p, PointerButton::Secondary);
+    h.get_by_label("Exit compact mode").click();
+    h.run_steps(3);
+    assert!(!h.state().compact());
+    assert!(has_button(&h, "Calculator"));
+    h.get_by_label("TI-84 Evo Emulator");
+}
+
+#[test]
+fn compact_and_speed_restore_from_prefs() {
+    let dir = TempDir::new("evo-gui-foundation-compactprefs", false);
+    let opts = AppOptions {
+        start_paused: true,
+        prefs: Prefs {
+            compact: true,
+            speed: Speed::X2,
+            ..Prefs::default()
+        },
+        ..test_options(&dir, FakePlatform::shared())
+    };
+    let h = harness_with(FakeBackend::new(), opts);
+    assert!(h.state().compact());
+    assert_eq!(h.state().speed(), Speed::X2);
+    assert!(h.query_by_label("Calculator").is_none());
+}
+
+#[test]
+fn reset_layout_closes_dock_and_compact() {
+    let (mut h, _dir) = sidebar_harness("resetlayout", true);
+    open_action(&mut h, Action::ToggleDebug);
+    assert!(h.state().debug_open());
+    open_action(&mut h, Action::ResetLayout);
+    assert!(!h.state().debug_open());
+    h.get_by_label("Layout reset");
+    h.state_mut().run_action(Action::Compact);
+    h.run_steps(2);
+    assert!(h.state().compact());
+    h.state_mut().run_action(Action::ResetLayout);
+    h.run_steps(2);
+    assert!(!h.state().compact());
+    assert!(has_button(&h, "Calculator"));
 }

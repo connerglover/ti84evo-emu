@@ -1,6 +1,6 @@
 mod common;
 
-use common::TempDir;
+use common::{TempDir, open_action, test_options};
 use egui::{Event, Key, PointerButton, Pos2, Rect, pos2, vec2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
@@ -10,8 +10,9 @@ use evo_gui::backend::{EmuBackend, Frame, RunStatus};
 use evo_gui::keypad::KeyId;
 use evo_gui::keypad::geometry::{DPAD_CENTER, KEYPAD_ORIGIN};
 use evo_gui::lcd::{ScaleFilter, backlight_tint, lcd_draw_rect};
+use evo_gui::platform::FakePlatform;
 use evo_gui::store::Store;
-use evo_gui::toolbar::Tool;
+use evo_gui::toolbar::{Action, Group};
 
 fn data_dir() -> std::path::PathBuf {
     std::env::temp_dir().join("evo-gui-tests-app")
@@ -86,7 +87,7 @@ fn header_shows_title_and_backend() {
 fn assert_header_fits(w: f32, name: &str) -> bool {
     let opts = AppOptions {
         start_paused: true,
-        ..AppOptions::new(data_dir())
+        ..test_options(&data_dir(), FakePlatform::shared())
     };
     let fake = FakeBackend::new().named(name);
     let mut h = Harness::builder()
@@ -404,7 +405,7 @@ fn harness_in(
 ) -> Harness<'static, EvoApp> {
     let opts = AppOptions {
         start_paused: paused,
-        ..AppOptions::new(dir)
+        ..test_options(&dir, FakePlatform::shared())
     };
     Harness::builder()
         .with_size([520.0, 960.0])
@@ -437,11 +438,11 @@ impl eframe::Storage for MemStorage {
 }
 
 #[test]
-fn toolbar_has_every_tool() {
+fn sidebar_has_every_group() {
     let mut h = harness(FakeBackend::new(), true);
     h.run_steps(1);
-    for t in Tool::ALL {
-        h.get_by_label(t.tooltip());
+    for g in Group::ALL {
+        h.get_by_label(g.tooltip());
     }
 }
 
@@ -452,29 +453,29 @@ fn reset_button_resets_backend() {
     let dir = fresh_dir("reset");
     let mut h = harness_in(fake, true, dir.to_path_buf());
     h.run_steps(1);
-    click(&mut h, "Reset");
+    open_action(&mut h, Action::Reset);
     assert_eq!(probe.resets(), 1);
     assert_eq!(probe.persists(), 1);
-    // The toolbar button and the toast.
-    assert_eq!(h.query_all_by_label("Reset").count(), 2);
+    // Only the toast: the popover closed after the pick.
+    assert_eq!(h.query_all_by_label("Reset").count(), 1);
 }
 
 #[test]
-fn save_and_load_via_toolbar() {
+fn save_and_load_via_sidebar() {
     let dir = fresh_dir("saveload");
     let store = Store::new(dir.to_path_buf());
     let fake = FakeBackend::new();
     let probe = fake.probe();
     let mut h = harness_in(fake, true, dir.to_path_buf());
     h.run_steps(1);
-    click(&mut h, "Save state");
+    open_action(&mut h, Action::SaveState);
     assert_eq!(h.query_all_by_label("empty").count(), 4);
     click(&mut h, "Slot 1");
     assert!(store.slot_path(1).exists());
     h.get_by_label("saved");
     h.get_by_label("Saved slot 1");
 
-    click(&mut h, "Load state");
+    open_action(&mut h, Action::LoadState);
     click(&mut h, "Slot 1");
     h.get_by_label("Loaded slot 1");
     // Loading persists flash first.
@@ -486,7 +487,7 @@ fn loading_empty_slot_shows_error_toast() {
     let dir = fresh_dir("loadempty");
     let mut h = harness_in(FakeBackend::new(), true, dir.to_path_buf());
     h.run_steps(1);
-    click(&mut h, "Load state");
+    open_action(&mut h, Action::LoadState);
     click(&mut h, "Slot 2");
     h.get_by_label("Load failed: slot 2 is empty");
 }
@@ -503,7 +504,7 @@ fn loading_corrupt_slot_shows_error_toast() {
     let mut h = harness_in(fake, true, dir.to_path_buf());
     h.run_steps(1);
     let before = probe.cycles();
-    click(&mut h, "Load state");
+    open_action(&mut h, Action::LoadState);
     h.get_by_label("saved");
     click(&mut h, "Slot 1");
     h.get_by_label_contains("Load failed");
@@ -521,9 +522,9 @@ fn load_while_key_held_releases_keys() {
     h.key_down(Key::Enter);
     h.run_steps(1);
     assert_eq!(probe.held(), [KeyId::Enter]);
-    click(&mut h, "Save state");
+    open_action(&mut h, Action::SaveState);
     click(&mut h, "Slot 1");
-    click(&mut h, "Load state");
+    open_action(&mut h, Action::LoadState);
     click(&mut h, "Slot 1");
     h.get_by_label("Loaded slot 1");
     assert!(probe.held().is_empty(), "{:?}", probe.held());
@@ -546,9 +547,9 @@ fn smooth_toggle_flips_filter() {
     let mut h = harness(FakeBackend::new(), true);
     h.run_steps(1);
     assert_eq!(h.state().filter(), ScaleFilter::Nearest);
-    click(&mut h, "Smooth scaling (better at non-integer sizes)");
+    open_action(&mut h, Action::Smooth);
     assert_eq!(h.state().filter(), ScaleFilter::Smooth);
-    click(&mut h, "Smooth scaling (better at non-integer sizes)");
+    open_action(&mut h, Action::Smooth);
     assert_eq!(h.state().filter(), ScaleFilter::Nearest);
 }
 
@@ -567,7 +568,7 @@ fn screenshot_button_writes_png() {
     let dir = fresh_dir("screenshot");
     let mut h = harness_in(FakeBackend::new(), true, dir.to_path_buf());
     h.run_steps(1);
-    click(&mut h, "Screenshot");
+    open_action(&mut h, Action::Screenshot);
     let shots: Vec<_> = std::fs::read_dir(dir.join("screenshots"))
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -581,11 +582,11 @@ fn long_toast_after_a_short_one_stays_wide() {
     let dir = fresh_dir("toastwidth");
     let mut h = harness_in(FakeBackend::new(), true, dir.to_path_buf());
     h.run_steps(1);
-    click(&mut h, "Save state");
+    open_action(&mut h, Action::SaveState);
     click(&mut h, "Slot 2");
     h.get_by_label("Saved slot 2");
     h.run_steps(10);
-    click(&mut h, "Screenshot");
+    open_action(&mut h, Action::Screenshot);
     h.run_steps(2);
     let r = h.get_by_label_contains("Screenshot saved to").rect();
     // The 520 pt window leaves room for a 360 pt toast: the path wraps to a few lines, not
@@ -600,14 +601,14 @@ fn toast_fits_a_narrow_window() {
     let dir = fresh_dir("toastnarrow");
     let opts = AppOptions {
         start_paused: true,
-        ..AppOptions::new(dir.to_path_buf())
+        ..test_options(&dir, FakePlatform::shared())
     };
     let mut h = Harness::builder()
         .with_size([320.0, 600.0])
         .with_pixels_per_point(1.0)
         .build_eframe(|cc| EvoApp::new(&cc.egui_ctx, Box::new(FakeBackend::new()), opts));
     h.run_steps(1);
-    click(&mut h, "Screenshot");
+    open_action(&mut h, Action::Screenshot);
     h.run_steps(2);
     let r = h.get_by_label_contains("Screenshot saved to").rect();
     assert!(r.width() >= 240.0, "toast {r:?}");
@@ -619,7 +620,7 @@ fn screenshot_without_display_shows_error_toast() {
     let dir = fresh_dir("noshot");
     let mut h = harness_in(FakeBackend::without_display(), true, dir.to_path_buf());
     h.run_steps(1);
-    click(&mut h, "Screenshot");
+    open_action(&mut h, Action::Screenshot);
     h.get_by_label("Screenshot failed: no display frame to capture");
 }
 
@@ -628,18 +629,18 @@ fn toasts_expire() {
     let dir = fresh_dir("expire");
     let mut h = harness_in(FakeBackend::new(), true, dir.to_path_buf());
     h.run_steps(1);
-    click(&mut h, "Reset");
-    assert_eq!(h.query_all_by_label("Reset").count(), 2);
+    open_action(&mut h, Action::Reset);
+    assert_eq!(h.query_all_by_label("Reset").count(), 1);
     // 4 s at 60 frames per second, plus slack.
     h.run_steps(260);
-    assert_eq!(h.query_all_by_label("Reset").count(), 1);
+    assert_eq!(h.query_all_by_label("Reset").count(), 0);
 }
 
 #[test]
 fn about_window_shows_disclaimer() {
     let mut h = harness(FakeBackend::new(), true);
     h.run_steps(1);
-    click(&mut h, "About");
+    open_action(&mut h, Action::About);
     h.get_by_label_contains("Not affiliated with Texas Instruments");
     h.get_by_label("You must supply your own OS bundle.");
     h.get_by_label_contains(env!("CARGO_PKG_VERSION"));
@@ -652,7 +653,7 @@ fn about_window_shows_disclaimer() {
 fn harness_sized(fake: FakeBackend, paused: bool, size: [f32; 2]) -> Harness<'static, EvoApp> {
     let opts = AppOptions {
         start_paused: paused,
-        ..AppOptions::new(data_dir())
+        ..test_options(&data_dir(), FakePlatform::shared())
     };
     Harness::builder()
         .with_size(size)
@@ -885,7 +886,7 @@ fn notice_is_shown_as_a_toast() {
     let opts = AppOptions {
         start_paused: true,
         notice: Some(DEMO_NOTICE.to_owned()),
-        ..AppOptions::new(data_dir())
+        ..test_options(&data_dir(), FakePlatform::shared())
     };
     let mut h = Harness::builder()
         .with_size([520.0, 960.0])
@@ -975,7 +976,7 @@ fn reprovision_tool_provisions_again() {
     let dir = fresh_dir("reprovision");
     let mut h = harness_in(fake, true, dir.to_path_buf());
     h.run_steps(1);
-    click(&mut h, "Re-provision");
+    open_action(&mut h, Action::Reprovision);
     finish_provisioning(&mut h);
     assert_eq!(probe.provisions(), 1);
     assert_eq!(probe.persists(), 1);
@@ -990,8 +991,8 @@ fn machine_tools_wait_for_provisioning() {
     let dir = fresh_dir("provisionbusy");
     let mut h = harness_in(fake, true, dir.to_path_buf());
     h.run_steps(2);
-    click(&mut h, "Reset");
-    click(&mut h, "Re-provision");
+    open_action(&mut h, Action::Reset);
+    open_action(&mut h, Action::Reprovision);
     assert_eq!(
         h.query_all_by_label("Wait until the calculator is ready")
             .count(),
@@ -1029,8 +1030,8 @@ fn failed_provisioning_is_not_saved_so_the_next_launch_retries() {
     // eframe's periodic and shutdown save, Reset and Load state all persist flash: none of
     // them may write the half-provisioned flash.
     eframe::App::save(h.state_mut(), &mut MemStorage::default());
-    click(&mut h, "Reset");
-    click(&mut h, "Load state");
+    open_action(&mut h, Action::Reset);
+    open_action(&mut h, Action::LoadState);
     click(&mut h, "Slot 1");
     assert_eq!(probe.resets(), 1);
     assert_eq!(probe.persists(), 0);
