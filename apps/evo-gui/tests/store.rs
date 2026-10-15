@@ -1,6 +1,8 @@
 //! State slots, screenshots and the toolbar's tool table.
 
-use std::path::PathBuf;
+mod common;
+
+use common::TempDir;
 
 use egui::{FontId, RawInput};
 use evo_gui::backend::fake::FakeBackend;
@@ -10,10 +12,8 @@ use evo_gui::theme::{has_glyphs, install_fonts};
 use evo_gui::toolbar::Tool;
 
 /// A fresh, empty data directory for one test.
-fn fresh_dir(test: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("evo-gui-store-{test}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+fn fresh_dir(test: &str) -> TempDir {
+    TempDir::new(&format!("evo-gui-store-{test}"), false)
 }
 
 /// Writes `bytes` as slot `n`, creating the states directory.
@@ -42,14 +42,15 @@ fn constants() {
 #[test]
 fn slot_and_screenshot_paths() {
     let dir = fresh_dir("paths");
-    let store = Store::new(dir.clone());
+    let store = Store::new(dir.to_path_buf());
     assert_eq!(store.slot_path(2), dir.join("states").join("slot2.state"));
     assert!(!store.has_slot(2));
 }
 
 #[test]
 fn save_then_load_roundtrip() {
-    let store = Store::new(fresh_dir("roundtrip"));
+    let dir = fresh_dir("roundtrip");
+    let store = Store::new(dir.to_path_buf());
     let mut fake = FakeBackend::new();
     fake.run_for(123);
     let path = store.save_slot(1, &fake).unwrap();
@@ -64,7 +65,8 @@ fn save_then_load_roundtrip() {
 
 #[test]
 fn save_overwrites_an_existing_slot() {
-    let store = Store::new(fresh_dir("overwrite"));
+    let dir = fresh_dir("overwrite");
+    let store = Store::new(dir.to_path_buf());
     let mut fake = FakeBackend::new();
     fake.run_for(5);
     store.save_slot(1, &fake).unwrap();
@@ -77,7 +79,8 @@ fn save_overwrites_an_existing_slot() {
 
 #[test]
 fn slot_file_layout() {
-    let store = Store::new(fresh_dir("layout"));
+    let dir = fresh_dir("layout");
+    let store = Store::new(dir.to_path_buf());
     let fake = FakeBackend::new();
     store.save_slot(4, &fake).unwrap();
     let bytes = std::fs::read(store.slot_path(4)).unwrap();
@@ -88,7 +91,8 @@ fn slot_file_layout() {
 
 #[test]
 fn missing_slot_is_empty_error() {
-    let store = Store::new(fresh_dir("missing"));
+    let dir = fresh_dir("missing");
+    let store = Store::new(dir.to_path_buf());
     let mut fake = FakeBackend::new();
     let err = store.load_slot(3, &mut fake).unwrap_err();
     assert!(matches!(err, StoreError::Empty(3)), "{err:?}");
@@ -97,7 +101,8 @@ fn missing_slot_is_empty_error() {
 
 #[test]
 fn garbage_file_is_rejected_unchanged() {
-    let store = Store::new(fresh_dir("garbage"));
+    let dir = fresh_dir("garbage");
+    let store = Store::new(dir.to_path_buf());
     write_slot(&store, 2, b"hello");
     let mut fake = FakeBackend::new();
     fake.run_for(77);
@@ -111,7 +116,8 @@ fn garbage_file_is_rejected_unchanged() {
 
 #[test]
 fn raw_core_state_is_not_a_slot() {
-    let store = Store::new(fresh_dir("rawcore"));
+    let dir = fresh_dir("rawcore");
+    let store = Store::new(dir.to_path_buf());
     write_slot(&store, 2, b"EVOSTATE\x01\0\0\0");
     let mut fake = FakeBackend::new();
     let err = store.load_slot(2, &mut fake).unwrap_err();
@@ -120,7 +126,8 @@ fn raw_core_state_is_not_a_slot() {
 
 #[test]
 fn truncated_header_is_not_a_state() {
-    let store = Store::new(fresh_dir("truncated"));
+    let dir = fresh_dir("truncated");
+    let store = Store::new(dir.to_path_buf());
     let mut fake = FakeBackend::new();
     let full = header(1, "demo");
     for len in [8, 9, 11, full.len() - 1] {
@@ -135,7 +142,8 @@ fn truncated_header_is_not_a_state() {
 
 #[test]
 fn state_from_other_backend_rejected() {
-    let store = Store::new(fresh_dir("otherbackend"));
+    let dir = fresh_dir("otherbackend");
+    let store = Store::new(dir.to_path_buf());
     let mut a = FakeBackend::new();
     a.run_for(9);
     store.save_slot(1, &a).unwrap();
@@ -155,7 +163,8 @@ fn state_from_other_backend_rejected() {
 
 #[test]
 fn future_version_rejected() {
-    let store = Store::new(fresh_dir("version"));
+    let dir = fresh_dir("version");
+    let store = Store::new(dir.to_path_buf());
     let mut bytes = header(2, "demo");
     bytes.extend_from_slice(&FakeBackend::new().save_state().unwrap());
     write_slot(&store, 1, &bytes);
@@ -166,7 +175,8 @@ fn future_version_rejected() {
 
 #[test]
 fn corrupt_payload_rejected_unchanged() {
-    let store = Store::new(fresh_dir("corrupt"));
+    let dir = fresh_dir("corrupt");
+    let store = Store::new(dir.to_path_buf());
     let mut bytes = header(1, "demo");
     bytes.extend_from_slice(b"{");
     write_slot(&store, 1, &bytes);
@@ -183,7 +193,7 @@ fn corrupt_payload_rejected_unchanged() {
 #[test]
 fn screenshot_writes_png() {
     let dir = fresh_dir("screenshot");
-    let store = Store::new(dir.clone());
+    let store = Store::new(dir.to_path_buf());
     let mut fake = FakeBackend::new();
     let frame = fake.framebuffer().unwrap().clone();
     let path = store.screenshot(&frame, 1_700_000_000_123).unwrap();
@@ -195,7 +205,8 @@ fn screenshot_writes_png() {
 
 #[test]
 fn screenshot_of_invalid_frame_is_no_frame() {
-    let store = Store::new(fresh_dir("noframe"));
+    let dir = fresh_dir("noframe");
+    let store = Store::new(dir.to_path_buf());
     let bad = Frame {
         width: 320,
         height: 240,

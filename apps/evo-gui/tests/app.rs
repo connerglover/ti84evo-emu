@@ -1,3 +1,6 @@
+mod common;
+
+use common::TempDir;
 use egui::{Event, Key, PointerButton, Pos2, Rect, pos2, vec2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
@@ -309,10 +312,8 @@ fn running_advances_cycles_and_reports_speed() {
 // Toolbar, state slots, screenshots, toasts and persistence hooks (Task 7).
 
 /// A fresh, empty data directory for one test.
-fn fresh_dir(test: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("evo-gui-app-{test}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+fn fresh_dir(test: &str) -> TempDir {
+    TempDir::new(&format!("evo-gui-app-{test}"), false)
 }
 
 fn harness_in(
@@ -367,7 +368,8 @@ fn toolbar_has_every_tool() {
 fn reset_button_resets_backend() {
     let fake = FakeBackend::new();
     let probe = fake.probe();
-    let mut h = harness_in(fake, true, fresh_dir("reset"));
+    let dir = fresh_dir("reset");
+    let mut h = harness_in(fake, true, dir.to_path_buf());
     h.run_steps(1);
     click(&mut h, "Reset");
     assert_eq!(probe.resets(), 1);
@@ -379,10 +381,10 @@ fn reset_button_resets_backend() {
 #[test]
 fn save_and_load_via_toolbar() {
     let dir = fresh_dir("saveload");
-    let store = Store::new(dir.clone());
+    let store = Store::new(dir.to_path_buf());
     let fake = FakeBackend::new();
     let probe = fake.probe();
-    let mut h = harness_in(fake, true, dir);
+    let mut h = harness_in(fake, true, dir.to_path_buf());
     h.run_steps(1);
     click(&mut h, "Save state");
     assert_eq!(h.query_all_by_label("empty").count(), 4);
@@ -400,7 +402,8 @@ fn save_and_load_via_toolbar() {
 
 #[test]
 fn loading_empty_slot_shows_error_toast() {
-    let mut h = harness_in(FakeBackend::new(), true, fresh_dir("loadempty"));
+    let dir = fresh_dir("loadempty");
+    let mut h = harness_in(FakeBackend::new(), true, dir.to_path_buf());
     h.run_steps(1);
     click(&mut h, "Load state");
     click(&mut h, "Slot 2");
@@ -410,13 +413,13 @@ fn loading_empty_slot_shows_error_toast() {
 #[test]
 fn loading_corrupt_slot_shows_error_toast() {
     let dir = fresh_dir("loadcorrupt");
-    let store = Store::new(dir.clone());
+    let store = Store::new(dir.to_path_buf());
     let path = store.slot_path(1);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, b"hello").unwrap();
     let fake = FakeBackend::new();
     let probe = fake.probe();
-    let mut h = harness_in(fake, true, dir);
+    let mut h = harness_in(fake, true, dir.to_path_buf());
     h.run_steps(1);
     let before = probe.cycles();
     click(&mut h, "Load state");
@@ -431,7 +434,8 @@ fn loading_corrupt_slot_shows_error_toast() {
 fn load_while_key_held_releases_keys() {
     let fake = FakeBackend::new();
     let probe = fake.probe();
-    let mut h = harness_in(fake, true, fresh_dir("loadheld"));
+    let dir = fresh_dir("loadheld");
+    let mut h = harness_in(fake, true, dir.to_path_buf());
     h.run_steps(1);
     h.key_down(Key::Enter);
     h.run_steps(1);
@@ -449,7 +453,8 @@ fn load_while_key_held_releases_keys() {
 fn save_hook_persists_flash() {
     let fake = FakeBackend::new();
     let probe = fake.probe();
-    let mut h = harness_in(fake, true, fresh_dir("savehook"));
+    let dir = fresh_dir("savehook");
+    let mut h = harness_in(fake, true, dir.to_path_buf());
     h.run_steps(1);
     eframe::App::save(h.state_mut(), &mut MemStorage::default());
     assert_eq!(probe.persists(), 1);
@@ -479,7 +484,7 @@ fn debug_toggle_flips_debug_open() {
 #[test]
 fn screenshot_button_writes_png() {
     let dir = fresh_dir("screenshot");
-    let mut h = harness_in(FakeBackend::new(), true, dir.clone());
+    let mut h = harness_in(FakeBackend::new(), true, dir.to_path_buf());
     h.run_steps(1);
     click(&mut h, "Screenshot");
     let shots: Vec<_> = std::fs::read_dir(dir.join("screenshots"))
@@ -492,7 +497,8 @@ fn screenshot_button_writes_png() {
 
 #[test]
 fn screenshot_without_display_shows_error_toast() {
-    let mut h = harness_in(FakeBackend::without_display(), true, fresh_dir("noshot"));
+    let dir = fresh_dir("noshot");
+    let mut h = harness_in(FakeBackend::without_display(), true, dir.to_path_buf());
     h.run_steps(1);
     click(&mut h, "Screenshot");
     h.get_by_label("Screenshot failed: no display frame to capture");
@@ -500,7 +506,8 @@ fn screenshot_without_display_shows_error_toast() {
 
 #[test]
 fn toasts_expire() {
-    let mut h = harness_in(FakeBackend::new(), true, fresh_dir("expire"));
+    let dir = fresh_dir("expire");
+    let mut h = harness_in(FakeBackend::new(), true, dir.to_path_buf());
     h.run_steps(1);
     click(&mut h, "Reset");
     assert_eq!(h.query_all_by_label("Reset").count(), 2);

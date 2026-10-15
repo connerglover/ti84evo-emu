@@ -1,8 +1,11 @@
 //! `MachineBackend` on a synthetic secure image (and on the real OS when `EVO_OS_IMAGE` is set).
 
+mod common;
+
+use common::TempDir;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use evo_core::{Key, NvState};
 use evo_gui::backend::machine::{MachineBackend, OpenError, core_key, fnv1a64, rgb888_to_rgba};
@@ -25,17 +28,9 @@ fn bundle_bytes(code: &[u16]) -> Vec<u8> {
     evo_image::testutil::secure_image_bundle(body)
 }
 
-/// A fresh, empty directory for one test's flash files.
-fn nv_dir() -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "evo-gui-tests-nv-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A fresh, empty directory for one test's flash files, removed when the guard drops.
+fn nv_dir() -> TempDir {
+    TempDir::new("evo-gui-tests-nv", true)
 }
 
 fn backend(code: &[u16]) -> MachineBackend {
@@ -169,8 +164,7 @@ fn garbage_bundle_is_an_error() {
 
 #[test]
 fn open_names_backend_after_file() {
-    let dir = std::env::temp_dir().join("evo-gui-tests-machine");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = nv_dir();
     let path = dir.join("counter.84b2");
     std::fs::write(&path, bundle_bytes(&COUNTER)).unwrap();
     let b = MachineBackend::open(&path, &nv_dir()).unwrap();
@@ -313,7 +307,8 @@ fn flash_file_is_loaded_and_written_back() {
 
 #[test]
 fn persist_creates_flash_file() {
-    let dir = nv_dir().join("flash");
+    let root = nv_dir();
+    let dir = root.join("flash");
     let bundle = bundle_bytes(&COUNTER);
     let path = nv_path_for(&dir, &bundle);
     let mut b = MachineBackend::from_bytes(&bundle, "test.84b2".into(), &dir).unwrap();
@@ -364,4 +359,14 @@ fn real_os_lcd_frame() {
     assert!(frame.is_valid());
     assert_eq!((frame.width, frame.height), (320, 240));
     assert!(b.backlight() > 0.0, "backlight {}", b.backlight());
+}
+
+#[test]
+fn test_dirs_are_removed() {
+    let dir = nv_dir();
+    let path = dir.to_path_buf();
+    std::fs::write(dir.join("x.nv"), b"x").unwrap();
+    assert!(path.exists());
+    drop(dir);
+    assert!(!path.exists(), "{} was left behind", path.display());
 }
