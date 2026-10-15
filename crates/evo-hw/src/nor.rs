@@ -312,6 +312,10 @@ pub enum NvError {
     Version(u32),
     #[error("flash file size: expected {expected} bytes, found {found}")]
     Size { expected: usize, found: usize },
+    /// The file had `expected` bytes when its size was checked but more when it was read: it
+    /// grew while being read.
+    #[error("flash file grew while it was read: more than the {expected} bytes it had")]
+    Grew { expected: usize },
 }
 
 /// The non-volatile state: the flash array and the security registers.
@@ -366,10 +370,13 @@ impl NvState {
     pub fn read_file(path: &Path) -> Result<Self, NvError> {
         let mut file = File::open(path)?;
         let found = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+        Self::read_from(&mut file, found)
+    }
+
+    /// [`read_file`](Self::read_file) on an open file whose metadata gave its size as `found`.
+    fn read_from(file: &mut impl Read, found: usize) -> Result<Self, NvError> {
         let mut header = Vec::with_capacity(HEADER_LEN);
-        (&mut file)
-            .take(HEADER_LEN as u64)
-            .read_to_end(&mut header)?;
+        file.take(HEADER_LEN as u64).read_to_end(&mut header)?;
         let n = MAGIC.len().min(header.len());
         if header[..n] != MAGIC[..n] {
             return Err(NvError::BadMagic);
@@ -403,26 +410,29 @@ impl NvState {
         file.read_exact(&mut flash)?;
         let mut secregs = vec![0; SECREGS_LEN];
         file.read_exact(&mut secregs)?;
-        // The file grew after its size was checked: not a file this build wrote.
+        // The file grew after its size was checked: not a file this build wrote. Its new size
+        // is not known (it may still be growing), so it gets its own error.
         let mut extra = [0u8; 1];
         if file.read(&mut extra)? != 0 {
-            return Err(NvError::Size {
-                expected: FILE_LEN,
-                found: FILE_LEN + 1,
-            });
+            return Err(NvError::Grew { expected: FILE_LEN });
         }
         Self::new(flash, secregs)
     }
 
     /// Writes the flash file atomically ([`write_atomic`]).
     pub fn write_file(&self, path: &Path) -> Result<(), NvError> {
+        Ok(write_atomic(path, &self.to_bytes())?)
+    }
+
+    /// The flash-file bytes ([`FILE_LEN`] of them).
+    fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(FILE_LEN);
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
         out.extend_from_slice(&(NOR_SIZE as u32).to_le_bytes());
         out.extend_from_slice(&self.flash);
         out.extend_from_slice(&self.secregs);
-        Ok(write_atomic(path, &out)?)
+        out
     }
 }
 
@@ -443,4 +453,20 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_that_grew_after_its_size_check_is_reported_as_grown() {
+        // The metadata said FILE_LEN, but the reader yields more: the file grew in between.
+        let mut bytes = NvState::erased().to_bytes();
+        assert_eq!(bytes.len(), FILE_LEN);
+        assert!(NvState::read_from(&mut bytes.as_slice(), FILE_LEN).is_ok());
+        bytes.push(0);
+        let e = NvState::read_from(&mut bytes.as_slice(), FILE_LEN).expect_err("accepted");
+        assert!(matches!(e, NvError::Grew { expected: FILE_LEN }), "{e:?}");
+    }
 }
