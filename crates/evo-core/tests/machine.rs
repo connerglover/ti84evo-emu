@@ -400,6 +400,21 @@ fn wfi_wakes_on_systick() {
 }
 
 #[test]
+fn awake_cycles_leave_out_sleep() {
+    let mut m = looping().boot();
+    assert_eq!(m.run(1_000), StopReason::CycleLimit);
+    assert_eq!(m.awake_cycles(), m.sched.now, "never asleep");
+
+    let mut m = sleeper().boot();
+    m.cpu.ppb_write32(SYST_RVR, 999);
+    m.cpu.ppb_write32(SYST_CSR, 0b111);
+    assert_eq!(m.run(10_000), StopReason::CycleLimit);
+    // About ten wake-ups of a handful of cycles each, the rest asleep.
+    let awake = m.awake_cycles();
+    assert!((10..500).contains(&awake), "{awake} awake cycles");
+}
+
+#[test]
 fn system_reset_request_reboots() {
     // Each boot increments a counter in SRAM and reads an unmapped address; the first two
     // boots then request a system reset through AIRCR.

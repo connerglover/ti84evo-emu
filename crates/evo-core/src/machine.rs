@@ -175,6 +175,10 @@ pub struct Machine {
     /// it and loads only on a machine with the same one.
     #[serde(default)]
     pub(crate) bundle_id: [u8; 32],
+    /// Cycles of CPU steps (instructions and exception entries) since power-on: `sched.now`
+    /// without the time skipped while asleep. Statistics only: not saved.
+    #[serde(skip)]
+    pub(crate) awake_cycles: u64,
 }
 
 impl Machine {
@@ -262,6 +266,7 @@ impl Machine {
             applied_irqs: 0,
             recent: RecentSteps::default(),
             bundle_id,
+            awake_cycles: 0,
         };
         if let Some(secregs) = secregs {
             m.with_dev("spif", |s: &mut Spif, _| s.nor_mut().set_secregs(secregs));
@@ -360,6 +365,13 @@ impl Machine {
     /// the WFI/WFE, whether or not anything is pending. Does nothing while awake.
     pub fn wake(&mut self) {
         self.sleep = None;
+    }
+
+    /// Cycles this machine spent executing (instructions and exception entries) since power-on:
+    /// time it advanced minus the time skipped while asleep. Statistics only: not in a save
+    /// state, and a restore keeps the count going.
+    pub fn awake_cycles(&self) -> u64 {
+        self.awake_cycles
     }
 
     /// Run for up to `max_cycles` cycles from now.
@@ -483,11 +495,13 @@ impl Machine {
         self.sync_bus();
         let stop = match result {
             StepResult::Executed { cycles } => {
+                self.awake_cycles += u64::from(cycles);
                 self.advance(u64::from(cycles));
                 None
             }
             StepResult::Sleep(kind) => {
                 // The step does not report its cycles; WFI/WFE cost 1.
+                self.awake_cycles += 1;
                 self.advance(1);
                 self.sleep = Some(kind);
                 self.wake_if_due();
