@@ -602,3 +602,452 @@ fn m4_image1_launches() {
     );
     assert_eq!(os.m.bus.irq_lines() & FATAL_STUB_IRQS, 0);
 }
+
+// ---- Every key on the OS (`keypad.md` "Verification on the OS") ----
+
+/// `all_keys_type_expected_text`: the app launcher is up by this cycle after the M4 Self-Test
+/// exit.
+const LAUNCHER_CYCLES: u64 = 2_500_000_000;
+/// Guest time after the last tap of a sequence, for the OS to finish drawing.
+const SETTLE_MS: u64 = 150;
+
+/// Edit-line tokens of OS 7.1.0.4421: the 16-bit codes the calculator app stores for what a
+/// key types (each was checked on the emulated screen, `keypad.md`).
+mod tok {
+    /// The digit `d`.
+    pub const fn digit(d: u16) -> u16 {
+        0xE401 + d
+    }
+    /// The letter `c` (`A`..=`Z`); θ follows Z.
+    pub const fn letter(c: u8) -> u16 {
+        0xE800 + (c - b'A') as u16
+    }
+    pub const DECPNT: u16 = 0xE40B;
+    pub const IMAG_I: u16 = 0xE40E;
+    pub const LPAREN: u16 = 0xE410;
+    pub const RPAREN: u16 = 0xE411;
+    pub const QUOTE: u16 = 0xE416;
+    pub const COMMA: u16 = 0xE417;
+    pub const COLON: u16 = 0xE418;
+    pub const SPACE: u16 = 0xE419;
+    pub const QUESTION: u16 = 0xE41B;
+    pub const STORE: u16 = 0xE41D;
+    pub const SQUARED: u16 = 0xE41F;
+    pub const ADD: u16 = 0xE428;
+    pub const SUB: u16 = 0xE429;
+    pub const MUL: u16 = 0xE42A;
+    pub const DIV: u16 = 0xE42B;
+    pub const POWER: u16 = 0xE42C;
+    pub const XROOT: u16 = 0xE42D;
+    pub const NEG: u16 = 0xE42E;
+    pub const ABS: u16 = 0xE430;
+    pub const SQRT: u16 = 0xE439;
+    pub const LN: u16 = 0xE43B;
+    pub const EXP: u16 = 0xE43C;
+    pub const LOG: u16 = 0xE43D;
+    pub const TEN_POW: u16 = 0xE43E;
+    pub const SIN: u16 = 0xE43F;
+    pub const ASIN: u16 = 0xE440;
+    pub const COS: u16 = 0xE441;
+    pub const ACOS: u16 = 0xE442;
+    pub const TAN: u16 = 0xE443;
+    pub const ATAN: u16 = 0xE444;
+    pub const TO_DEC: u16 = 0xE426;
+    pub const TO_FRAC: u16 = 0xE427;
+    pub const SORT_A: u16 = 0xE4D9;
+    pub const CLR_DRAW: u16 = 0xE4EA;
+    pub const FRAC: u16 = 0xE6C2;
+    pub const THETA: u16 = 0xE81A;
+    pub const ANS: u16 = 0xE81B;
+    pub const Y1: u16 = 0xE840;
+    pub const XMIN: u16 = 0xE98F;
+    /// MathPrint's x²: a superscript template holding 2.
+    pub const MP_SQUARED: [u16; 3] = [0xE12B, 0x0002, 0xE130];
+}
+
+/// Typed after every sequence, to find the edit line: 9 8.
+const SUFFIX: [u16; 2] = [tok::digit(9), tok::digit(8)];
+
+/// The calculator app, driven from save states taken once the OS is up.
+struct Calc {
+    m: Machine,
+}
+
+impl Calc {
+    /// Tap each whitespace-separated key name of `keys` as a key script does (hold
+    /// `TAP_HOLD_MS`, then wait `TAP_GAP_MS`).
+    fn keys(&mut self, keys: &str) {
+        for name in keys.split_whitespace() {
+            let key = evo_core::Key::from_name(name).unwrap_or_else(|| panic!("no key {name}"));
+            self.m.set_key(key, true);
+            self.m.run(ms(evo_core::keys::TAP_HOLD_MS));
+            self.m.set_key(key, false);
+            self.m.run(ms(evo_core::keys::TAP_GAP_MS));
+        }
+    }
+
+    /// From `state`, tap `keys`, then 9 8, and return the edit line before the cursor without
+    /// the 9 8.
+    fn line(&mut self, state: &[u8], keys: &str) -> Vec<u16> {
+        self.m.load_state(state).expect("load the state");
+        self.keys(keys);
+        self.keys("9 8");
+        self.m.run(ms(SETTLE_MS));
+        let mut line = self.edit_line();
+        assert!(line.ends_with(&SUFFIX), "[{keys}] {line:04x?}");
+        line.truncate(line.len() - SUFFIX.len());
+        line
+    }
+
+    /// From `state`, tap `keys` and return the screen.
+    fn frame(&mut self, state: &[u8], keys: &str) -> Vec<u8> {
+        self.m.load_state(state).expect("load the state");
+        self.keys(keys);
+        self.m.run(ms(SETTLE_MS));
+        self.m.screen().expect("the LCD is on").rgb
+    }
+
+    /// The edit line up to the cursor. The OS keeps it in a gap buffer: a word pair {start,
+    /// cursor} somewhere in RAM points at its tokens. The line ends in [`SUFFIX`], so this
+    /// finds every copy of the suffix, then every word pair whose cursor is just past that copy
+    /// and whose start is at most 1 KiB before it; exactly one line must come out.
+    fn edit_line(&self) -> Vec<u16> {
+        use evo_core::machine::SRAM_NS;
+        let sram = self
+            .m
+            .bus
+            .region_bytes(evo_hw::soc::SRAM_BUFFER)
+            .expect("SRAM");
+        let half = |a: usize| u16::from_le_bytes([sram[a], sram[a + 1]]);
+        let word = |a: usize| u32::from_le_bytes([sram[a], sram[a + 1], sram[a + 2], sram[a + 3]]);
+        let mut lines: Vec<Vec<u16>> = Vec::new();
+        for at in (0..sram.len() - 4).step_by(2) {
+            if [half(at), half(at + 2)] != SUFFIX {
+                continue;
+            }
+            let cursor = SRAM_NS + at as u32 + 4;
+            for d in (4..sram.len() - 3).step_by(4) {
+                let start = word(d - 4);
+                if word(d) == cursor
+                    && start >= SRAM_NS
+                    && start <= cursor
+                    && cursor - start <= 0x400
+                    && start % 2 == 0
+                {
+                    let from = (start - SRAM_NS) as usize;
+                    let to = (cursor - SRAM_NS) as usize;
+                    lines.push((from..to).step_by(2).map(half).collect());
+                }
+            }
+        }
+        lines.sort();
+        lines.dedup();
+        match <[_; 1]>::try_from(lines) {
+            Ok([line]) => line,
+            Err(lines) => panic!("no single edit line ending in 9 8: {lines:04x?}"),
+        }
+    }
+}
+
+/// Type `pairs` (key sequence, the token it types) on one line from `state` and compare token
+/// by token; returns a line per mismatch, naming the sequence.
+fn check_typing(calc: &mut Calc, state: &[u8], what: &str, pairs: &[(&str, u16)]) -> Vec<String> {
+    let keys: Vec<&str> = pairs.iter().map(|&(k, _)| k).collect();
+    let line = calc.line(state, &keys.join(" "));
+    let want: Vec<u16> = pairs.iter().map(|&(_, t)| t).collect();
+    let mut bad = Vec::new();
+    if line.len() != want.len() {
+        bad.push(format!("{what}: typed {line:04x?}, want {want:04x?}"));
+    } else {
+        for (&(keys, want), got) in pairs.iter().zip(&line) {
+            if *got != want {
+                bad.push(format!(
+                    "{what}: `{keys}` typed {got:#06x}, want {want:#06x}"
+                ));
+            }
+        }
+    }
+    println!("keys: {what}: {} sequences checked", pairs.len());
+    bad
+}
+
+/// Every one of the 50 keys does on the real OS what its name says (`keypad.md` "Verification
+/// on the OS"). After the M4 Self-Test exit and ENTER on the launcher (its first app is the
+/// calculator), the calculator is switched to CLASSIC so that every key types flat tokens.
+/// Keys that type are checked by the edit line's tokens; 2nd and ALPHA by the second and alpha
+/// functions, whose letters are the ones TI's keypad labels give; the others by what they do:
+/// menus by the token of a menu item, editing and navigation keys by the edit line they leave,
+/// and the screens by comparing screens.
+#[test]
+fn all_keys_type_expected_text() {
+    let Some(mut os) = Os::boot() else {
+        return;
+    };
+    for (at, key) in [(ms(2500), "enter"), (ms(3100), "0")] {
+        let stop = os.tap_at(at, key);
+        assert_eq!(stop, StopReason::CycleLimit, "UART0:\n{}", os.uart_text());
+    }
+    let stop = os.run_until(LAUNCHER_CYCLES - os.m.sched.now, |_| false);
+    assert_eq!(stop, StopReason::CycleLimit, "UART0:\n{}", os.uart_text());
+    let mut calc = Calc { m: os.m };
+    calc.keys("enter");
+    calc.m.run(ms(SETTLE_MS));
+    let mathprint = calc.m.save_state();
+    let mathprint_home = calc.frame(&mathprint, "");
+
+    let mut bad = Vec::new();
+    // MODE: MathPrint types x² as a template; after CLASSIC (MODE, up to the first row, right,
+    // ENTER, 2nd MODE = QUIT) it types the flat ².
+    let mp_square = calc.line(&mathprint, "1 square");
+    if mp_square != [&[tok::digit(1)][..], &tok::MP_SQUARED].concat() {
+        bad.push(format!("MathPrint `1 square` typed {mp_square:04x?}"));
+    }
+    calc.m.load_state(&mathprint).expect("load the state");
+    calc.keys("mode up up up right enter 2nd mode");
+    calc.m.run(ms(SETTLE_MS));
+    let classic = calc.m.save_state();
+
+    // Keys that type.
+    let mut typing: Vec<(String, u16)> = (0..10).map(|d| (d.to_string(), tok::digit(d))).collect();
+    for (k, t) in [
+        ("decpnt", tok::DECPNT),
+        ("lparen", tok::LPAREN),
+        ("rparen", tok::RPAREN),
+        ("comma", tok::COMMA),
+        ("sto", tok::STORE),
+        ("square", tok::SQUARED),
+        ("add", tok::ADD),
+        ("sub", tok::SUB),
+        ("mul", tok::MUL),
+        ("div", tok::DIV),
+        ("power", tok::POWER),
+        ("chs", tok::NEG),
+        ("ln", tok::LN),
+        ("log", tok::LOG),
+        ("sin", tok::SIN),
+        ("cos", tok::COS),
+        ("tan", tok::TAN),
+        ("frac", tok::FRAC),
+        ("xton", tok::letter(b'X')),
+    ] {
+        typing.push((k.to_owned(), t));
+    }
+    let typing: Vec<(&str, u16)> = typing.iter().map(|(k, t)| (k.as_str(), *t)).collect();
+    bad.extend(check_typing(&mut calc, &classic, "typing", &typing));
+    // 2nd: the second functions.
+    bad.extend(check_typing(
+        &mut calc,
+        &classic,
+        "2nd",
+        &[
+            ("2nd sin", tok::ASIN),
+            ("2nd cos", tok::ACOS),
+            ("2nd tan", tok::ATAN),
+            ("2nd ln", tok::EXP),
+            ("2nd log", tok::TEN_POW),
+            ("2nd square", tok::SQRT),
+            ("2nd power", tok::XROOT),
+            ("2nd decpnt", tok::IMAG_I),
+            ("2nd chs", tok::ANS),
+        ],
+    ));
+    // ALPHA: the letters A..Z as TI's keypad labels them, then θ, space, :, ? and ".
+    let mut alpha: Vec<(String, u16)> = [
+        "math", "frac", "prgm", "power", "sin", "cos", "tan", "div", "square", "comma", "lparen",
+        "rparen", "mul", "log", "7", "8", "9", "sub", "ln", "4", "5", "6", "add", "sto", "1", "2",
+    ]
+    .iter()
+    .zip(b'A'..=b'Z')
+    .map(|(k, c)| (format!("alpha {k}"), tok::letter(c)))
+    .collect();
+    for (k, t) in [
+        ("3", tok::THETA),
+        ("0", tok::SPACE),
+        ("decpnt", tok::COLON),
+        ("chs", tok::QUESTION),
+        ("toggle", tok::QUOTE),
+    ] {
+        alpha.push((format!("alpha {k}"), t));
+    }
+    let alpha: Vec<(&str, u16)> = alpha.iter().map(|(k, t)| (k.as_str(), *t)).collect();
+    bad.extend(check_typing(&mut calc, &classic, "alpha", &alpha));
+
+    // Editing, navigation and menus, each from the CLASSIC state: (keys, the line they leave).
+    let (one, four, seven) = (tok::digit(1), tok::digit(4), tok::digit(7));
+    let cases: &[(&str, &[u16])] = &[
+        ("1 4 7 del", &[one, four]),
+        ("1 4 left", &[one]),
+        ("1 4 left right", &[one, four]),
+        ("1 4 7 clear", &[]),
+        // ENTER runs the line; 2nd ENTER (ENTRY) brings it back.
+        ("1 4 7 enter 2nd enter", &[one, four, seven]),
+        // UP selects the last entry in the history; ENTER copies it.
+        ("1 4 enter up enter", &[one, four]),
+        // ON leaves for the launcher; ENTER comes back to the line.
+        ("1 4 on enter", &[one, four]),
+        // MATH: item 1 is ►Frac, item 2 ►Dec (Ans first on an empty line); DOWN and UP move.
+        ("math enter", &[tok::ANS, tok::TO_FRAC]),
+        ("math 2", &[tok::ANS, tok::TO_DEC]),
+        ("math down enter", &[tok::ANS, tok::TO_DEC]),
+        ("math down down up enter", &[tok::ANS, tok::TO_DEC]),
+        // VARS 1 (Window…) 1 is Xmin; VARS right (Y-VARS) 1 (Function…) 1 is Y1.
+        ("vars 1 1", &[tok::XMIN]),
+        ("vars right 1 1", &[tok::Y1]),
+        // STAT 2 is SortA(; 2nd PRGM (DRAW) 1 is ClrDraw.
+        ("stat 2", &[tok::SORT_A]),
+        ("2nd prgm 1", &[tok::CLR_DRAW]),
+        // The ALPHA F-keys: F1 (Y=) 1 is n/d, F2 (WINDOW) 1 abs(, F4 (TRACE) 1 Y1.
+        ("alpha yequ 1", &[tok::FRAC]),
+        ("alpha window 1", &[tok::ABS]),
+        ("alpha trace 1", &[tok::Y1]),
+    ];
+    for &(keys, want) in cases {
+        let line = calc.line(&classic, keys);
+        if line != want {
+            bad.push(format!("`{keys}` left {line:04x?}, want {want:04x?}"));
+        }
+    }
+    println!(
+        "keys: {} editing, navigation and menu sequences checked",
+        cases.len()
+    );
+
+    // The screens.
+    let graph = calc.frame(&classic, "graph");
+    // ZOOM 4 (Zoom Default) draws the default window, as GRAPH shows it.
+    if calc.frame(&classic, "zoom 4") != graph {
+        bad.push("`zoom 4` does not show the graph screen".into());
+    }
+    // ZOOM 6 (Zoom [-10,10]) changes what WINDOW shows.
+    let window = calc.frame(&classic, "window");
+    if calc.frame(&classic, "zoom 6 2nd mode window") == window {
+        bad.push("`zoom 6` does not change the window".into());
+    }
+    // TOGGLE switches an answer between decimal and fraction, and back.
+    let quarter = calc.frame(&classic, "1 div 4 enter");
+    let toggled = calc.frame(&classic, "1 div 4 enter toggle");
+    let back = calc.frame(&classic, "1 div 4 enter toggle toggle");
+    if toggled == quarter || back != quarter {
+        bad.push("`toggle` does not switch 1/4 between 0.25 and 1/4".into());
+    }
+    // Each screen key opens a screen of its own.
+    let screens = [
+        ("calculator", calc.frame(&classic, "")),
+        ("graph", graph),
+        ("window", window),
+        ("zoom", calc.frame(&classic, "zoom")),
+        ("yequ", calc.frame(&classic, "yequ")),
+        ("mode", calc.frame(&classic, "mode")),
+        ("on", calc.frame(&classic, "on")),
+    ];
+    for (i, (a, fa)) in screens.iter().enumerate() {
+        for (b, fb) in &screens[i + 1..] {
+            if fa == fb {
+                bad.push(format!("`{a}` and `{b}` show the same screen"));
+            }
+        }
+    }
+    if screens[0].1 == mathprint_home {
+        bad.push("CLASSIC does not change the status bar".into());
+    }
+    println!("keys: screens checked");
+    assert!(bad.is_empty(), "keys that misbehave:\n{}", bad.join("\n"));
+}
+
+/// The selected tile's colour on OS 7.1.0.4421: image 1 picks RGB565 0x035E for it
+/// (`movwne r0, #0x35e` at 0x004C_14E6; `lcdc.md` "Colour order"), decoded through
+/// `Machine::screen` with the firmware's CONTROL (BGR = 1).
+const SELECTION_BLUE: [u8; 3] = [0, 105, 247];
+
+/// The colour order end to end: on the app launcher (after the M4 Self-Test exit) the selected
+/// tile is blue, as on hardware, and nothing on the screen is that colour with red and blue
+/// swapped (the orange of the old decode).
+#[test]
+fn launcher_selection_is_blue() {
+    let Some(mut os) = Os::boot() else {
+        return;
+    };
+    for (at, key) in [(ms(2500), "enter"), (ms(3100), "0")] {
+        let stop = os.tap_at(at, key);
+        assert_eq!(stop, StopReason::CycleLimit, "UART0:\n{}", os.uart_text());
+    }
+    let stop = os.run_until(LAUNCHER_CYCLES - os.m.sched.now, |_| false);
+    assert_eq!(stop, StopReason::CycleLimit, "UART0:\n{}", os.uart_text());
+    let frame = os.m.screen().expect("the LCD is on");
+    let px = frame.rgb.as_chunks::<3>().0;
+    let [r, g, b] = SELECTION_BLUE;
+    let blue = px.iter().filter(|&&p| p == SELECTION_BLUE).count();
+    let swapped = px.iter().filter(|&&p| p == [b, g, r]).count();
+    println!("launcher: {blue} selection-blue pixels, {swapped} swapped");
+    assert!(
+        blue >= 1000,
+        "the selected tile is not blue ({blue} pixels)"
+    );
+    assert_eq!(swapped, 0, "red and blue are swapped");
+}
+
+// ---- Factory provisioning (`boot-flow.md` §3.5) ----
+
+/// Budget for a boot with no key input to reach [`IMAGE1_ENTRY`] once the unit is provisioned
+/// (measured about 300 M; `boot-flow.md` §3.5).
+const PROVISIONED_BOOT_BUDGET: u64 = 1_000_000_000;
+/// The diagnostic app's entry (`boot-flow.md` §3.5): reached on a boot that shows Self-Test or
+/// Engineering instead of launching the OS.
+const DIAG_APP_ENTRY: u32 = 0x0011_7AFC;
+
+/// Power on from `nv` with no key held and report where the BSP went: `Ok(cycle)` when image 1
+/// is entered, `Err(stop)` otherwise (the diagnostic app's entry, or the budget).
+fn boot_without_keys(nv: NvState) -> Option<Result<u64, StopReason>> {
+    let mut os = Os::boot_nv(nv)?;
+    os.m.breakpoints.insert(IMAGE1_ENTRY);
+    os.m.breakpoints.insert(DIAG_APP_ENTRY);
+    let stop = os.run_until(PROVISIONED_BOOT_BUDGET, |_| false);
+    assert_eq!(os.m.resets, 0);
+    Some(match stop {
+        StopReason::Breakpoint(IMAGE1_ENTRY) => Ok(os.m.sched.now),
+        other => Err(other),
+    })
+}
+
+/// A fresh unit boots into the diagnostic app; `evo_core::provision` drives the Engineering
+/// menu (Boot Select: Calc OS) and leaves a flash that boots straight to the OS, with no key
+/// input, on every later power-on: through a flash file, and again from the flash that boot
+/// re-saved (`boot-flow.md` §3.5).
+#[test]
+fn provisioned_flash_boots_to_os_without_keys() {
+    let Some(os) = Os::boot() else {
+        return;
+    };
+    // A fresh flash shows the diagnostic app (Self-Test), not the OS.
+    let fresh = boot_without_keys(os.m.nv_state()).expect("not skipped");
+    assert_eq!(fresh, Err(StopReason::Breakpoint(DIAG_APP_ENTRY)));
+
+    let mut m = os.m;
+    let report = evo_core::provision(&mut m).expect("provisioning succeeds");
+    println!("provision: {report:?}");
+    assert!(report.toggled, "Boot Select was Self-Test on a fresh unit");
+
+    // Through a flash file, as `evo-cli provision --flash-file` writes it.
+    let path = target_dir().join("provisioned.evoflash");
+    m.nv_state()
+        .write_file(&path)
+        .expect("write the flash file");
+    let nv = NvState::read_file(&path).expect("read the flash file");
+    let _ = std::fs::remove_file(&path);
+
+    let mut second = Os::boot_nv(nv).expect("not skipped");
+    second.m.breakpoints.insert(IMAGE1_ENTRY);
+    second.m.breakpoints.insert(DIAG_APP_ENTRY);
+    let stop = second.run_until(PROVISIONED_BOOT_BUDGET, |_| false);
+    println!(
+        "provision: power-on 2 from the flash file: {stop:?} at cycle {}",
+        second.m.sched.now
+    );
+    assert_eq!(stop, StopReason::Breakpoint(IMAGE1_ENTRY));
+    // Let the OS run a while, then power-cycle once more from the flash it re-saved.
+    second.m.breakpoints.clear();
+    second.run_until(500_000_000, |_| false);
+    let third = boot_without_keys(second.m.nv_state()).expect("not skipped");
+    println!("provision: power-on 3 from the re-saved flash: {third:?}");
+    assert!(third.is_ok(), "{third:?}");
+}

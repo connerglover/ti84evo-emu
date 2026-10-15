@@ -224,7 +224,7 @@ fn write_state(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// `--flash-file PATH`: the saved state, `None` (start erased) if there is no file yet. An
 /// unreadable or invalid file is reported and is `Err`; the file is not touched.
-fn read_flash_file(path: &Path) -> Result<Option<NvState>, ()> {
+pub(crate) fn read_flash_file(path: &Path) -> Result<Option<NvState>, ()> {
     match NvState::read_file(path) {
         Ok(nv) => Ok(Some(nv)),
         Err(NvError::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(None),

@@ -90,6 +90,8 @@ impl Lcdc {
     /// the whole framebuffer at UPBASE (Secure alias folded onto the Non-secure one) lies
     /// inside `sram`. The portrait buffer (PPL pixels per line, LPP lines) is shown landscape:
     /// `width = LPP`, `height = PPL`, output pixel (x, y) = buffer pixel (line x, pixel y).
+    /// Colour order is PL111's: red is bits 4:0 and blue bits 15:11 of a pixel, swapped when
+    /// CONTROL bit 8 (BGR) is set, as the firmware sets it (`lcdc.md` "Colour order").
     pub fn frame(&self, sram: &[u8], sram_base: u32) -> Option<Frame> {
         let c = self.control;
         if c & LCD_EN == 0 || c & LCD_PWR == 0 || (c >> 1) & 7 != BPP_565 {
@@ -111,10 +113,9 @@ impl Lcdc {
         for (line, row) in fb.chunks_exact(h * 2).enumerate() {
             for (px, p) in row.as_chunks::<2>().0.iter().enumerate() {
                 let p = u16::from_le_bytes(*p);
-                let (mut r5, g6, mut b5) = ((p >> 11) as u8, ((p >> 5) & 63) as u8, (p & 31) as u8);
-                if bgr {
-                    std::mem::swap(&mut r5, &mut b5);
-                }
+                let (hi5, g6, lo5) = ((p >> 11) as u8, ((p >> 5) & 63) as u8, (p & 31) as u8);
+                // PL111 takes red from bits 4:0 unless BGR swaps it to bits 15:11.
+                let (r5, b5) = if bgr { (hi5, lo5) } else { (lo5, hi5) };
                 let o = (px * w + line) * 3;
                 rgb[o] = (r5 << 3) | (r5 >> 2);
                 rgb[o + 1] = (g6 << 2) | (g6 >> 4);

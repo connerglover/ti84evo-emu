@@ -4,6 +4,7 @@ pub mod gdb;
 pub mod host;
 pub mod keys;
 pub mod machine;
+pub mod provision;
 pub mod scheduler;
 pub mod state;
 
@@ -14,5 +15,6 @@ pub use evo_hw::nor::{NvError, NvState};
 pub use host::UartPort;
 pub use keys::{Key, KeyAction, KeyScriptError, parse_key_script};
 pub use machine::{CPU_HZ, Machine, StopReason};
+pub use provision::{ProvisionError, ProvisionReport, provision};
 pub use scheduler::{EventKind, Scheduler};
 pub use state::{STATE_MAGIC, STATE_VERSION};

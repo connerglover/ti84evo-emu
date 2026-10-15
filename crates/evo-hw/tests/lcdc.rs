@@ -174,8 +174,8 @@ fn frame_decode() {
     let f = l.frame(&sram, SRAM_BASE).expect("frame");
     assert_eq!((f.width, f.height), (320, 240));
     assert_eq!(f.rgb.len(), 320 * 240 * 3);
-    assert_eq!(rgb(&f, 0, 0), (0, 0, 255), "BGR: the r5 field is blue");
-    assert_eq!(rgb(&f, 319, 239), (255, 0, 0));
+    assert_eq!(rgb(&f, 0, 0), (255, 0, 0), "BGR = 1: bits 15:11 are red");
+    assert_eq!(rgb(&f, 319, 239), (0, 0, 255), "BGR = 1: bits 4:0 are blue");
     assert_eq!(rgb(&f, 5, 7), (0, 255, 0));
     // r5 = 16, g6 = 32, b5 = 16: (16 << 3) | (16 >> 2) = 132, (32 << 2) | (32 >> 4) = 130.
     assert_eq!(rgb(&f, 6, 8), (132, 130, 132));
@@ -184,12 +184,26 @@ fn frame_decode() {
     let mut h = DevHarness::new();
     let ls = lcd_on(&mut h, FB | 0x1000_0000);
     assert_eq!(ls.frame(&sram, SRAM_BASE), Some(f.clone()));
-    // Without BGR the fields are in RGB order.
+    // With BGR = 0 PL111 takes red from bits 4:0 and blue from bits 15:11.
     let mut l = lcd_on(&mut h, FB);
     h.write(&mut l, CONTROL, 4, (CTRL_ON | PWR) & !0x100);
     let g = l.frame(&sram, SRAM_BASE).expect("frame");
-    assert_eq!(rgb(&g, 0, 0), (255, 0, 0));
-    assert_eq!(rgb(&g, 319, 239), (0, 0, 255));
+    assert_eq!(rgb(&g, 0, 0), (0, 0, 255));
+    assert_eq!(rgb(&g, 319, 239), (255, 0, 0));
+}
+
+/// OS 7.1.0.4421 picks 0x035E for a selected tile (image 1, `movwne r0, #0x35e` at 0x004C_14E6,
+/// white otherwise; `lcdc.md` "Colour order"). On hardware the selection is blue, so with the
+/// firmware's CONTROL (BGR = 1) the decoded pixel must be blue-dominant.
+#[test]
+fn frame_os_selection_colour_is_blue() {
+    let mut sram = vec![0u8; SRAM_LEN];
+    put(&mut sram, 10, 20, 0x035E);
+    let mut h = DevHarness::new();
+    let l = lcd_on(&mut h, FB);
+    let f = l.frame(&sram, SRAM_BASE).expect("frame");
+    // r5 = 0, g6 = 26, b5 = 30: (26 << 2) | (26 >> 4) = 105, (30 << 3) | (30 >> 2) = 247.
+    assert_eq!(rgb(&f, 10, 20), (0, 105, 247));
 }
 
 #[test]

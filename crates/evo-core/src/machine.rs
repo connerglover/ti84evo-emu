@@ -214,7 +214,34 @@ impl Machine {
         if vtor & 0x7F != 0 {
             log::warn!("vector table {vtor:#010x} is not 128-byte aligned; VTOR ignores bits 6:0");
         }
+        let bundle_id = state::bundle_id(&pkg.bytes, layout.secure_slot_base, layout.ns_slot_base);
+        Ok(Self::power_on(
+            flash,
+            nv.as_ref().map(NvState::secregs),
+            vtor,
+            bundle_id,
+        ))
+    }
 
+    /// Switch the calculator off and on again: the machine becomes what
+    /// [`from_bundle_nv`](Self::from_bundle_nv) builds from [`nv_state`](Self::nv_state) (the
+    /// bundle's images are already in that flash). Flash and the NOR security registers are
+    /// kept; the CPU, SRAM, devices, time, `resets`, breakpoints, held keys and host inputs
+    /// start over as at power-on.
+    pub fn power_cycle(&mut self) {
+        let nv = self.nv_state();
+        *self = Self::power_on(
+            nv.flash().to_vec(),
+            Some(nv.secregs()),
+            self.boot_vtor,
+            self.bundle_id,
+        );
+    }
+
+    /// The machine at power-on with `flash` (images already placed) and, if given, these NOR
+    /// security registers: map built, BL2 header written, CPU reset into `vtor`, board inputs
+    /// driven.
+    fn power_on(flash: Vec<u8>, secregs: Option<&[u8]>, vtor: u32, bundle_id: [u8; 32]) -> Self {
         let mut bus = MemoryMap::new();
         bus.add_rom(FLASH_BUFFER, flash, &[FLASH_NS, FLASH_S]);
         bus.add_ram(SRAM_BUFFER, SRAM_SIZE, &[SRAM_NS, SRAM_S]);
@@ -234,17 +261,15 @@ impl Machine {
             stopped_at: None,
             applied_irqs: 0,
             recent: RecentSteps::default(),
-            bundle_id: state::bundle_id(&pkg.bytes, layout.secure_slot_base, layout.ns_slot_base),
+            bundle_id,
         };
-        if let Some(nv) = &nv {
-            m.with_dev("spif", |s: &mut Spif, _| {
-                s.nor_mut().set_secregs(nv.secregs())
-            });
+        if let Some(secregs) = secregs {
+            m.with_dev("spif", |s: &mut Spif, _| s.nor_mut().set_secregs(secregs));
         }
         for pin in BOARD_INPUTS_HIGH {
             m.set_gpio_input(pin, Some(true));
         }
-        Ok(m)
+        m
     }
 
     /// The non-volatile state now, as a flash file stores it: the flash bytes and the SPIF NOR

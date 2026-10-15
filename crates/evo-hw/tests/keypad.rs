@@ -79,8 +79,70 @@ fn scans_repeat_while_held_and_stop_after_release() {
     set_key(&mut h, &mut k, m(6, 0), false);
     assert_eq!(h.event, Some(Some(h.now + SCAN_CYCLES)), "release scans");
     assert!(h.fire(&mut k));
-    assert_eq!(h.event, None, "no further scans with no key held");
+    assert_eq!(
+        h.event, None,
+        "no further scans with no key held and scan-done masked"
+    );
     assert!(!h.fire(&mut k));
+}
+
+/// The BSP decodes the rows only after a key change (STATUS bit 1) and then six scan-dones; a
+/// release must be a key change too, or the BSP never sees the rows go empty and takes the
+/// next press of the same key for the key still being held.
+#[test]
+fn release_is_a_key_change() {
+    let mut h = DevHarness::new();
+    let mut k = Keypad::new();
+    h.write(&mut k, MASK, 4, 2);
+    set_key(&mut h, &mut k, m(4, 1), true);
+    h.write(&mut k, STATUS, 4, 3);
+    assert_eq!(h.irq, 0);
+    set_key(&mut h, &mut k, m(4, 1), false);
+    assert_eq!(h.read(&mut k, STATUS, 4) & 2, 2, "key change on release");
+    assert_eq!(h.irq, IRQ_BIT);
+    assert_eq!(h.read(&mut k, ROWS + 8, 2), 0);
+}
+
+/// While the guest unmasks scan-done (the BSP does from a key change until it has decoded the
+/// rows), the scanner keeps scanning even with no key held, as it does in continuous mode.
+#[test]
+fn scans_continue_while_scan_done_is_unmasked() {
+    let mut h = DevHarness::new();
+    let mut k = Keypad::new();
+    h.write(&mut k, MASK, 4, 2);
+    set_key(&mut h, &mut k, m(4, 1), true);
+    set_key(&mut h, &mut k, m(4, 1), false);
+    // The BSP's handler: acknowledge, unmask scan-done; then six scans.
+    h.write(&mut k, STATUS, 4, 2);
+    h.write(&mut k, MASK, 4, 3);
+    for n in 1..=6 {
+        assert!(h.fire(&mut k), "scan {n}");
+        assert_eq!(h.read(&mut k, STATUS, 4), 1);
+        assert_eq!(h.irq, IRQ_BIT);
+        h.write(&mut k, STATUS, 4, 1);
+        assert_eq!(
+            h.event,
+            Some(Some(h.now + SCAN_CYCLES)),
+            "scan {n} schedules"
+        );
+    }
+    // Decoded: the BSP masks scan-done again; the pending scan is the last one.
+    h.write(&mut k, MASK, 4, 2);
+    assert!(h.fire(&mut k));
+    assert_eq!(h.event, None);
+    assert_eq!(h.irq, 0, "scan-done is masked");
+}
+
+/// Unmasking scan-done with nothing pending starts the scanner.
+#[test]
+fn unmasking_scan_done_starts_scanning() {
+    let mut h = DevHarness::new();
+    let mut k = Keypad::new();
+    h.now = 5_000;
+    h.write(&mut k, MASK, 4, 1);
+    assert_eq!(h.event, Some(Some(5_000 + SCAN_CYCLES)));
+    assert!(h.fire(&mut k));
+    assert_eq!(h.irq, IRQ_BIT);
 }
 
 #[test]
@@ -189,26 +251,63 @@ fn system_reset_keeps_keys_and_relatches_key_down() {
 }
 
 #[test]
-fn key_names_follow_the_ce_layout() {
-    // code = (7 - row) * 8 + col + 1 (CE GetCSC numbering).
+fn key_names_follow_the_evo_layout() {
+    // code = (7 - row) * 8 + col + 1, the BSP's key code. The TI-84 Evo layout, not the CE's:
+    // TOGGLE at 0x0A pushes + - × ÷ one place on, ^ is where the CE has x⁻¹ and the fraction
+    // key where it has APPS (`docs/hardware/keypad.md` "Key map").
     let code = |k: Key| match k {
         Key::Matrix { row, col } => (7 - row) * 8 + col + 1,
         Key::On => 0,
     };
     for (name, code_want) in [
         ("down", 0x01),
+        ("left", 0x02),
+        ("right", 0x03),
         ("up", 0x04),
         ("enter", 0x09),
-        ("add", 0x0A),
+        ("toggle", 0x0A),
+        ("add", 0x0B),
+        ("sub", 0x0C),
+        ("mul", 0x0D),
+        ("div", 0x0E),
         ("clear", 0x0F),
+        ("chs", 0x11),
         ("3", 0x12),
+        ("6", 0x13),
+        ("9", 0x14),
+        ("rparen", 0x15),
+        ("tan", 0x16),
+        ("vars", 0x17),
+        ("decpnt", 0x19),
         ("2", 0x1A),
+        ("5", 0x1B),
+        ("8", 0x1C),
+        ("lparen", 0x1D),
+        ("cos", 0x1E),
+        ("prgm", 0x1F),
+        ("stat", 0x20),
         ("0", 0x21),
+        ("1", 0x22),
+        ("4", 0x23),
+        ("7", 0x24),
+        ("comma", 0x25),
         ("sin", 0x26),
+        ("frac", 0x27),
+        ("xton", 0x28),
+        ("sto", 0x2A),
         ("ln", 0x2B),
+        ("log", 0x2C),
+        ("square", 0x2D),
+        ("power", 0x2E),
+        ("math", 0x2F),
         ("alpha", 0x30),
         ("graph", 0x31),
+        ("trace", 0x32),
+        ("zoom", 0x33),
+        ("window", 0x34),
+        ("yequ", 0x35),
         ("2nd", 0x36),
+        ("mode", 0x37),
         ("del", 0x38),
     ] {
         let k = Key::from_name(name).unwrap_or_else(|| panic!("{name}"));
@@ -218,6 +317,13 @@ fn key_names_follow_the_ce_layout() {
     assert_eq!(Key::from_name("on"), Some(Key::On));
     assert_eq!(Key::from_name("ENTER"), Some(m(6, 0)), "case-insensitive");
     assert_eq!(Key::from_name("bogus"), None);
+    for ce_only in ["recip", "apps"] {
+        assert_eq!(
+            Key::from_name(ce_only),
+            None,
+            "the Evo has no {ce_only} key"
+        );
+    }
     assert_eq!(KEY_NAMES.len(), 50, "49 matrix keys and ON");
     let mut keys: Vec<Key> = KEY_NAMES.iter().map(|&(_, k)| k).collect();
     keys.sort_by_key(|k| format!("{k:?}"));

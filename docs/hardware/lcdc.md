@@ -51,7 +51,7 @@ read  +00..+0C tim | +10 upbase | +14 lpbase | +18 control | +1C imsc | +20 ris 
 write +00..+18 store | +1C imsc = v & 0x1E | +28 ris &= !v | +20/+24 ignore
 frame event every FRAME_CYCLES while control & 1 (LcdEn): ris |= 0x8 (VComp); optionally ris |= 0x4 (LNBU) once after an UPBASE write
 IRQ 14 (level) = (ris & imsc) != 0
-display: when control has bits 0 and 11 set, show 240x320 RGB565 from upbase; BGR=1 swaps the R and B fields
+display: when control has bits 0 and 11 set, show 240x320 RGB565 from upbase; red = bits 4:0 and blue = bits 15:11, swapped when BGR = 1 (the firmware sets it, so red = bits 15:11)
 ```
 
 FRAME_CYCLES: the pixel clock source is unknown. The geometry gives 273·372 = 101,556 pixel
@@ -81,15 +81,15 @@ released at 0x100b284c just before the first write (`security.md` §3).
   Secure SRAM alias 0x3xxx_xxxx is the same bytes as 0x2xxx_xxxx). It returns `None` unless
   LcdEn, LcdPwr and bpp = 6 are set and the whole buffer lies in SRAM. Working orientation
   (confirmed for orientation by Task 23, below): the output is LPP x PPL (320x240) and output
-  pixel (x, y) = buffer line x, pixel y; BGR = 1 swaps the R and B fields.
+  pixel (x, y) = buffer line x, pixel y. Colour order (below): BGR = 1 decodes red from bits
+  15:11 and blue from bits 4:0 (standard RGB565); BGR = 0 the other way round.
 - `Pwm` stores +0x00 and +0x04; `brightness()` = duty / period clamped to 0..=1, 0 for
   period 0. Other offsets are unhandled.
 
 ## Open questions
 
 1. The LCDC pixel clock and so the real frame rate.
-2. The colour order (CONTROL bit 8 BGR = 1 and the panel's MADCTL 0x28): the decode swaps R
-   and B; no boot image seen so far tells them apart (orientation: settled, below).
+2. Settled: the colour order (below).
 3. The PWM's real period and the meaning of the 0x000F_FFFF writes.
 
 ## Orientation and colours, checked against the boot logo (Task 23)
@@ -100,5 +100,35 @@ the M3 frame (`boot-flow.md` "M3 notes") shows the Texas Instruments wordmark up
 reading left to right, so the orientation is kept as it is: no change to `Lcdc::frame` or to
 `frame_decode`. The colour order is kept as a working assumption: the logo and spinner are
 grey and the charging animation's bars are pure-looking green, which look the same with or
-without the R/B swap. A boot screen with red or blue in it (e.g. a later OS screen) will
-settle it.
+without the R/B swap. The OS home screen settled it (below).
+
+## Colour order (fix wave Task 2)
+
+The old decode took red from bits 15:11 only when BGR = 0 and swapped it to bits 4:0 for the
+firmware's BGR = 1. On the OS app launcher this drew the selected tile orange; on hardware
+(the TI-84 Evo web emulator's screenshot) it is blue, with green elsewhere unchanged.
+
+The chain from framebuffer to glass:
+
+1. **Framebuffer.** OS image 1 picks the selected tile's colour at 0x004C_14E6:
+   `movw r0, #0xffff; cmp r4, #0; it ne; movwne r0, #0x35e` (white unless selected). The
+   launcher's framebuffer holds 0x035E in the selected tile and 0x5DC9 in the green graphics.
+   Read as standard RGB565 (red = bits 15:11), 0x035E is (0, 26/63, 30/31), a blue, and 0x5DC9
+   is (11/31, 46/63, 9/31), a green. Read with red in bits 4:0, 0x035E is orange.
+2. **PL111 CONTROL bit 8 (LcdBgr).** The PL111 TRM's 16 bpp 5:6:5 pixel format puts red in
+   bits 4:0 and blue in bits 15:11; LcdBgr = 1 swaps red and blue on the panel data bus. The
+   Linux PL111 DRM driver relies on the same: it sets BGR for DRM's RGB565 (red in the high
+   bits). The secure `panel_on` and the BSP write CONTROL = 0x312D: BGR = 1, so the panel
+   bus gets red from bits 15:11.
+3. **Panel MADCTL (0x36) = 0x28.** Bit 5 (MV) gives the landscape scan; bit 3 (BGR) selects the
+   panel's colour filter order. The emulator treats it as matching the glass (net no swap): a
+   swap there would make the selected tile orange again on hardware, against the screenshot.
+
+So `Lcdc::frame` decodes red from bits 15:11 when BGR = 1 and from bits 4:0 when BGR = 0, and
+ignores MADCTL bit 3. The RGB888 frame from `Machine::screen` (and so the CLI PNG and the GUI)
+gets the order from this one place.
+
+Checks: `frame_os_selection_colour_is_blue` (`crates/evo-hw/tests/lcdc.rs`, 0x035E decodes to
+RGB 0,105,247) and the real-OS `launcher_selection_is_blue` (milestones: 4206 pixels of that
+blue on the launcher, none of its swapped orange). The M3 logo frame's hash did not change:
+every pixel of it has equal red and blue fields, so the swap never showed there.
