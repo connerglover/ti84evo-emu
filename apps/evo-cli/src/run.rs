@@ -7,9 +7,11 @@ use std::net::{Ipv4Addr, TcpListener};
 use std::ops::{ControlFlow, Range};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use evo_core::{
     CPU_HZ, Frame, KeyAction, Machine, NvError, NvState, StopReason, UartPort, parse_key_script,
+    write_atomic,
 };
 use evo_image::{Bundle, Layout};
 
@@ -95,6 +97,30 @@ impl KeyTimeline {
 
 /// Exit status for a lockup (0 is a normal stop, 1 a host-side error).
 const EXIT_LOCKUP: u8 = 2;
+/// Exit status of a run ended by Ctrl-C (128 + SIGINT, as shells report it).
+const EXIT_INTERRUPTED: u8 = 130;
+
+/// Set by the Ctrl-C handler: the run stops at the end of the current slice.
+static INTERRUPT: AtomicBool = AtomicBool::new(false);
+
+/// Ctrl-C ends a headless run gracefully: the first one stops the run at the end of the
+/// current slice, and the outputs (--save-state, --flash-file, ...) are written as for any
+/// other stop; a second one exits at once, writing nothing. Not installed for --gdb: there
+/// GDB interrupts the target, and Ctrl-C on the stub ends the process as before.
+fn install_interrupt_handler() {
+    let res = ctrlc::set_handler(|| {
+        if INTERRUPT.swap(true, Ordering::SeqCst) {
+            eprintln!("evo-cli: interrupted again; exiting without writing outputs");
+            std::process::exit(i32::from(EXIT_INTERRUPTED));
+        }
+        eprintln!("evo-cli: interrupted; stopping the run (Ctrl-C again to quit at once)");
+    });
+    if let Err(e) = res {
+        eprintln!(
+            "evo-cli: cannot handle Ctrl-C ({e}); it will end the run without writing outputs"
+        );
+    }
+}
 
 /// The run goes in slices of at most this many cycles (10 ms of guest time); the UARTs are
 /// drained after each.
@@ -129,6 +155,14 @@ impl UartSink {
 }
 
 pub fn main(args: RunArgs) -> ExitCode {
+    if args.gdb.is_none() {
+        install_interrupt_handler();
+    }
+    run(args, &INTERRUPT)
+}
+
+/// `main` with the stop request `interrupt` (set by Ctrl-C; checked after every slice).
+fn run(args: RunArgs, interrupt: &AtomicBool) -> ExitCode {
     let bundle = match Bundle::open(&args.bundle) {
         Ok(b) => b,
         Err(e) => {
@@ -181,7 +215,7 @@ pub fn main(args: RunArgs) -> ExitCode {
     if let Some(bytes) = &uart_in {
         machine.inject_uart_rx(UartPort::Uart0, bytes);
     }
-    let code = run_machine(&mut machine, &args);
+    let code = run_machine(&mut machine, &args, interrupt);
     if machine.take_power_off() {
         eprintln!("power: off (GPIO pin 1 released)");
     }
@@ -209,17 +243,11 @@ pub fn main(args: RunArgs) -> ExitCode {
     }
 }
 
-/// `--save-state PATH`: write `bytes` through a temporary file next to `path`, so a failed write
-/// never leaves a half-written state under the final name.
+/// `--save-state PATH`: written atomically (`write_atomic`: a temporary file next to `path`,
+/// synced, then renamed), so a failed write never leaves a half-written state under the final
+/// name.
 fn write_state(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    let res = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
-    if res.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    res
+    write_atomic(path, bytes)
 }
 
 /// `--flash-file PATH`: the saved state, `None` (start erased) if there is no file yet. An
@@ -236,7 +264,7 @@ pub(crate) fn read_flash_file(path: &Path) -> Result<Option<NvState>, ()> {
 }
 
 /// Run the booted machine as `args` asks, report, and return the exit status.
-fn run_machine(machine: &mut Machine, args: &RunArgs) -> ExitCode {
+fn run_machine(machine: &mut Machine, args: &RunArgs, interrupt: &AtomicBool) -> ExitCode {
     // Breakpoints compare against the PC, whose bit 0 is always clear.
     machine
         .breakpoints
@@ -267,6 +295,8 @@ fn run_machine(machine: &mut Machine, args: &RunArgs) -> ExitCode {
         .and(args.after)
         .map(|n| start.saturating_add(n));
     let mut shot: Option<Option<Frame>> = None;
+    // Set when Ctrl-C ended the run.
+    let mut interrupted = false;
     let stop = loop {
         keys.apply_due(machine);
         if shot_at.is_some_and(|at| machine.sched.now >= at) {
@@ -286,9 +316,10 @@ fn run_machine(machine: &mut Machine, args: &RunArgs) -> ExitCode {
                 if range.contains(&m.cpu.regs.pc) {
                     stdout_err = writeln!(out, "{}", m.trace_line()).err();
                 }
-                match stdout_err {
-                    Some(_) => ControlFlow::Break(()),
-                    None => ControlFlow::Continue(()),
+                if stdout_err.is_some() || interrupt.load(Ordering::Relaxed) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
                 }
             })
         } else {
@@ -298,6 +329,10 @@ fn run_machine(machine: &mut Machine, args: &RunArgs) -> ExitCode {
             stdout_err = uarts.drain(machine, &mut out).err();
         }
         if stdout_err.is_some() {
+            break stop;
+        }
+        if interrupt.load(Ordering::Relaxed) {
+            interrupted = true;
             break stop;
         }
         // Asleep with nothing scheduled, but a key press is still to come within the budget:
@@ -327,7 +362,7 @@ fn run_machine(machine: &mut Machine, args: &RunArgs) -> ExitCode {
         shot = Some(machine.screen());
     }
     if stdout_err.is_none() {
-        stdout_err = summary(&mut out, machine, stop)
+        stdout_err = summary(&mut out, machine, stop, interrupted)
             .and_then(|()| out.flush())
             .err();
     }
@@ -346,6 +381,7 @@ fn run_machine(machine: &mut Machine, args: &RunArgs) -> ExitCode {
             eprintln!("evo-cli: {e}");
             ExitCode::FAILURE
         }
+        _ if interrupted => ExitCode::from(EXIT_INTERRUPTED),
         _ => exit_code(stop),
     }
 }
@@ -445,9 +481,15 @@ fn write_unmapped(path: Option<&Path>, m: &Machine) -> bool {
     }
 }
 
-/// The stop line, then the notes.
-fn summary(out: &mut impl Write, m: &Machine, stop: StopReason) -> io::Result<()> {
+/// The stop line (`interrupted` when Ctrl-C ended the run), then the notes.
+fn summary(
+    out: &mut impl Write,
+    m: &Machine,
+    stop: StopReason,
+    interrupted: bool,
+) -> io::Result<()> {
     let (reason, pc) = match stop {
+        _ if interrupted => ("interrupted", m.cpu.regs.pc),
         StopReason::CycleLimit => ("cycle-limit", m.cpu.regs.pc),
         StopReason::Idle => ("idle", m.cpu.regs.pc),
         // `run` reports neither; `Halted` only when the trace output is gone.
@@ -568,5 +610,45 @@ mod tests {
         assert_eq!(parse_count("0"), Ok(0));
         assert!(parse_count("0x10").is_err());
         assert!(parse_count("-1").is_err());
+    }
+
+    /// Ctrl-C (the stop request set before the run) ends the run after its first slice with
+    /// `stop: interrupted` and exit status 130, and the flash file and save state are still
+    /// written.
+    #[test]
+    fn interrupted_run_still_writes_outputs() {
+        // Reset handler: `adds r0, #1 ; b <start>`, forever.
+        let mut payload = vec![0u8; 0x400];
+        payload[0..4].copy_from_slice(&0x3000_0800u32.to_le_bytes());
+        payload[4..8].copy_from_slice(&(0x100B_0600u32 | 1).to_le_bytes());
+        payload[0x200..0x204].copy_from_slice(&[0x01, 0x30, 0xFD, 0xE7]);
+        let dir = std::env::temp_dir().join(format!("evo-cli-interrupt-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bundle = dir.join("loop.84b2");
+        fs::write(&bundle, evo_image::testutil::secure_image_bundle(payload)).unwrap();
+        let (flash, state) = (dir.join("nv.evoflash"), dir.join("out.state"));
+        let args = RunArgs {
+            bundle,
+            max_cycles: 20 * UART_SLICE,
+            trace: false,
+            trace_range: None,
+            breaks: Vec::new(),
+            unmapped_out: None,
+            gdb: None,
+            uart: false,
+            uart_in: None,
+            flash_file: Some(flash.clone()),
+            load_state: None,
+            save_state: Some(state.clone()),
+            screenshot: None,
+            after: None,
+            keys: Vec::new(),
+        };
+        let code = run(args, &AtomicBool::new(true));
+        assert_eq!(code, ExitCode::from(EXIT_INTERRUPTED));
+        assert!(NvState::read_file(&flash).is_ok(), "flash file written");
+        let saved = fs::read(&state).expect("save state written");
+        assert_eq!(&saved[..8], evo_core::STATE_MAGIC);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

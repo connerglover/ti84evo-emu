@@ -3,32 +3,48 @@
 //! A save state is
 //!
 //! ```text
-//! STATE_MAGIC (8 bytes) | STATE_VERSION (u32 LE) | bundle id (32 bytes) | postcard(MachineState)
+//! STATE_MAGIC (8 bytes) | STATE_VERSION (u32 LE) | bundle id (32 bytes)
+//!   | flash fingerprint (32 bytes) | body checksum (32 bytes) | body = postcard(MachineState)
 //! ```
 //!
 //! The bundle id is the machine's fingerprint of the OS it booted (SHA-256 over the package
 //! bytes and the two slot bases), so a state never lands on a machine running different code.
+//! The flash fingerprint is SHA-256(flash bytes ‖ NOR security registers) when the state was
+//! taken: the state holds RAM and device state that describe that flash (file systems, caches,
+//! the ITS), so it loads only on a machine whose non-volatile state is the same (see
+//! [`Machine::nv_fingerprint`]). The body checksum is SHA-256 of the body; a body that does not
+//! match it is [`StateError::Corrupt`].
+//!
 //! The state holds the CPU, the scheduler queue, SRAM, the unmapped log and every device's
 //! state. It does not hold the flash or the NOR security registers: those persist separately,
 //! in the flash file (spec §6.5; `Spif::save` skips the security registers). Breakpoints and
 //! the recent trace are host-side debugging aids and are not saved either.
+//!
+//! Version history: 1 had no flash fingerprint and no checksum (bundle id, then the body);
+//! version 1 states are rejected ([`StateError::Version`]).
 
 use armv8m::{Cpu, SleepKind};
-use evo_hw::soc::SRAM_BUFFER;
+use evo_hw::dev::spif::Spif;
+use evo_hw::nor::SECREGS_LEN;
+use evo_hw::soc::{FLASH_BUFFER, SRAM_BUFFER};
 use evo_hw::{DeviceState, StateError, UnmappedLog};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::Scheduler;
-use crate::machine::{Machine, RecentSteps};
+use crate::machine::{ERASED, Machine, RecentSteps};
 
 /// First bytes of every save state.
 pub const STATE_MAGIC: &[u8; 8] = b"EVOSTATE";
 /// Format version this build writes and reads.
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 
-/// Bytes before the postcard body: magic, version, bundle id.
-const HEADER_LEN: usize = 8 + 4 + 32;
+/// Header offsets: bundle id, flash fingerprint, body checksum, body.
+const ID_AT: usize = 8 + 4;
+const NV_AT: usize = ID_AT + 32;
+const SUM_AT: usize = NV_AT + 32;
+/// Bytes before the postcard body.
+const HEADER_LEN: usize = SUM_AT + 32;
 
 /// Everything a save state restores, in the order it is encoded.
 #[derive(Serialize, Deserialize)]
@@ -56,6 +72,24 @@ pub(crate) fn bundle_id(package: &[u8], secure_slot_base: u32, ns_slot_base: u32
 }
 
 impl Machine {
+    /// The fingerprint of the non-volatile state now: SHA-256(flash bytes ‖ NOR security
+    /// registers), the registers read as [`nv_state`](Self::nv_state) reads them. Equal
+    /// fingerprints mean equal [`nv_state`](Self::nv_state)s.
+    pub fn nv_fingerprint(&self) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(self.bus.region_bytes(FLASH_BUFFER).unwrap_or_default());
+        match self
+            .bus
+            .device::<Spif>("spif")
+            .map(|s| s.nor().secregs())
+            .filter(|r| r.len() == SECREGS_LEN)
+        {
+            Some(secregs) => h.update(secregs),
+            None => h.update([ERASED; SECREGS_LEN]),
+        }
+        h.finalize().into()
+    }
+
     /// The machine's state now, as a versioned save state (see the module docs).
     pub fn save_state(&self) -> Vec<u8> {
         let state = MachineState {
@@ -74,30 +108,39 @@ impl Machine {
             applied_irqs: self.applied_irqs,
             devices: self.bus.device_states(),
         };
-        let mut out = Vec::with_capacity(HEADER_LEN + state.sram.len() + 4096);
+        // Encoding plain data into a Vec cannot fail; an empty body would fail to load, loudly.
+        let body = postcard::to_stdvec(&state).unwrap_or_default();
+        let mut out = Vec::with_capacity(HEADER_LEN + body.len());
         out.extend_from_slice(STATE_MAGIC);
         out.extend_from_slice(&STATE_VERSION.to_le_bytes());
         out.extend_from_slice(&self.bundle_id);
-        // Encoding plain data into a Vec cannot fail; an empty body would fail to load, loudly.
-        out.extend(postcard::to_stdvec(&state).unwrap_or_default());
+        out.extend_from_slice(&self.nv_fingerprint());
+        out.extend_from_slice(&Sha256::digest(&body));
+        out.extend_from_slice(&body);
         out
     }
 
     /// Restore a state written by [`save_state`](Self::save_state) on a machine booted from
-    /// the same bundle. All or nothing: on error the machine is unchanged.
+    /// the same bundle, with the same flash and NOR security registers it had then. All or
+    /// nothing: on error the machine is unchanged.
     ///
     /// Checked in order: the magic ([`StateError::BadMagic`]), the version
-    /// ([`StateError::Version`]), the bundle id and then, after decoding the whole body, the
-    /// SRAM size and the device set ([`StateError::Mismatch`]); a truncated or corrupt body is
-    /// a [`StateError::Decode`]. A device that rejects its bytes leaves every device as it
-    /// was. Breakpoints are kept; the recent trace starts empty.
+    /// ([`StateError::Version`]), the body checksum ([`StateError::Corrupt`]; a header cut short
+    /// is a [`StateError::Decode`]), the bundle id and the flash fingerprint, then, after
+    /// decoding the whole body, the SRAM size and the device set ([`StateError::Mismatch`]); a
+    /// body that does not decode is a [`StateError::Decode`]. A device that rejects its bytes
+    /// leaves every device as it was. Breakpoints are kept; the recent trace starts empty.
+    ///
+    /// The flash is not in the state, so a state taken before the guest wrote flash no longer
+    /// loads after that write: rewinding a machine to an earlier state needs the flash of that
+    /// time too (e.g. a flash file saved with the state).
     pub fn load_state(&mut self, bytes: &[u8]) -> Result<(), StateError> {
         if bytes.len() < STATE_MAGIC.len() || &bytes[..STATE_MAGIC.len()] != STATE_MAGIC {
             return Err(StateError::BadMagic);
         }
         let truncated = || StateError::Decode(postcard::Error::DeserializeUnexpectedEnd);
         let version = bytes
-            .get(8..12)
+            .get(8..ID_AT)
             .and_then(|b| <[u8; 4]>::try_from(b).ok())
             .map(u32::from_le_bytes)
             .ok_or_else(truncated)?;
@@ -107,13 +150,26 @@ impl Machine {
                 expected: STATE_VERSION,
             });
         }
-        let id = bytes.get(12..HEADER_LEN).ok_or_else(truncated)?;
-        if id != self.bundle_id {
+        if bytes.len() < HEADER_LEN {
+            return Err(truncated());
+        }
+        let body = &bytes[HEADER_LEN..];
+        if Sha256::digest(body)[..] != bytes[SUM_AT..HEADER_LEN] {
+            return Err(StateError::Corrupt);
+        }
+        if bytes[ID_AT..NV_AT] != self.bundle_id {
             return Err(StateError::Mismatch(
                 "save state is from another bundle".into(),
             ));
         }
-        let (state, rest) = postcard::take_from_bytes::<MachineState>(&bytes[HEADER_LEN..])?;
+        if bytes[NV_AT..SUM_AT] != self.nv_fingerprint() {
+            return Err(StateError::Mismatch(
+                "save state was taken with other flash contents (flash file or security \
+                 registers changed since)"
+                    .into(),
+            ));
+        }
+        let (state, rest) = postcard::take_from_bytes::<MachineState>(body)?;
         if !rest.is_empty() {
             return Err(StateError::Mismatch(format!(
                 "{} trailing bytes after the save state",

@@ -650,8 +650,9 @@ clocking or QSPI drive.
    SPCTRL (emulator):** `evo_hw::dev::sysctl::{Cru, Spctrl}` keep every register across a
    System reset; a PowerOn reset restores the reset values (CRU `+0x04 = 0x0002_0001`,
    `+0x1C = 0x3433`, everything else 0). The CRU's read-only `+0x0C` UID_LO is `0x4556_4F31`
-   ("EVO1") and `+0x10` is 0. The LED pattern generator (§6) and the ICACHE (`spif-nor.md`
-   §7) are plain storage (`evo_hw::dev::storage::Storage`) that either reset clears to 0.
+   ("EVO1") and `+0x10` CHIPINFO is `0x0200_0000` (strap [29:25] = 1, see the CRU table).
+   The LED pattern generator (§6) and the ICACHE (`spif-nor.md` §7) are plain storage
+   (`evo_hw::dev::storage::Storage`) that either reset clears to 0.
 9. **QSPI drive strength.** The PSA service types 14/15 ("QSPI Drive Settings") reach a
    handler path at 0x100baf1c/0x100bb0b0 whose target block is not identified. It is not
    0x5020_2B00 (§6).

@@ -197,6 +197,9 @@ pub enum StateError {
     Version { found: u32, expected: u32 },
     #[error("save state does not fit this machine: {0}")]
     Mismatch(String),
+    /// The body does not match the checksum in the header: damaged, truncated or edited.
+    #[error("save state is corrupt (checksum mismatch)")]
+    Corrupt,
 }
 
 /// Encode a device's state (postcard).
