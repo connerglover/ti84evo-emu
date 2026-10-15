@@ -598,3 +598,19 @@ interactive session was possible, so no PC-keyboard typing was checked.
   held guest writes at 0x0009_1000..0x0009_3000 (the ITS/PS area), and reopening the bundle
   starts from that file. On that reboot the BSP still showed its Self-Test info screen. It is
   not yet known which flash state makes the BSP skip Self-Test.
+
+### GUI follow-ups after Plan 2b
+
+Checked 2026-10-14 with the fix wave merged (Evo keypad order, LCD red/blue, provisioning),
+headless with `egui_kittest`, the real `MachineBackend` and the 7.1 bundle (release build;
+`apps/evo-gui/tests/real_os.rs`).
+
+- **Keypad.** The GUI now draws the TI-84 Evo keypad (n/d where the CE has APPS, ^ where it
+  has x⁻¹, ÷ × − + one row up, TOGGLE where the CE has +) and presses the `evo_core` key of
+  each key's name (`KeyId::core_name`), so it keeps no matrix of its own. The 2nd legends of
+  ÷ × − + are still the CE's at the same place (π, e, [, ]), unverified.
+- **First run.** Opened with no flash file, the GUI provisions the unit on a worker thread
+  ("Preparing calculator…"), writes the flash file and lets the OS boot: the app launcher was
+  up at cycle 442 M after provisioning, with 4206 selection-blue (RGB 0, 105, 247) pixels.
+- **Typing.** Clicking `enter` opened the calculator; clicking `2` `+` `3` `enter` showed
+  `2+3` and the result `5`.
