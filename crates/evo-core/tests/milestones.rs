@@ -164,7 +164,9 @@ const KNOWN_UNMODELLED: &[(RangeInclusive<u32>, &str)] = &[
 const FATAL_STUB_IRQS: u64 = 1 << 7 | 1 << 8 | 1 << 10 | 1 << 17 | 1 << 22 | 1 << 23 | 1 << 26;
 
 /// The key source the secure image reads while it is unmapped (`boot-flow.md` §2): reads 0.
-const KEY_SOURCE: RangeInclusive<u32> = 0x1800_E000..=0x1800_E0FF;
+/// Its 4 KiB page: the offsets read depend on earlier data (with correct SHA-256 digests one
+/// 16-byte read moved to 0x1800_E0F4, past the first 256 bytes; `boot-flow.md` "M4 notes").
+const KEY_SOURCE: RangeInclusive<u32> = 0x1800_E000..=0x1800_EFFF;
 
 /// The first BSP instruction, where the secure image's `bxns` lands (`boot-flow.md` §2 step 12).
 const NS_ENTRY: u32 = 0x0011_6D50;
@@ -516,4 +518,87 @@ fn m3_boot_logo() {
         hash,
         "the boot is not deterministic"
     );
+}
+
+/// Image 1's reset handler (`boot-flow.md` §3.4): the BSP's launch code `blx`es to it.
+const IMAGE1_ENTRY: u32 = 0x0044_BC90;
+/// Where image 1's entry trampoline stores the BSP service table pointer (`boot-flow.md` §3.4).
+const OS_SERVICE_TABLE_PTR: u32 = 0x2009_B100;
+/// `m4_image1_launches` cycle budget: the measured launch cycle rounded up to the next 500 M.
+const M4_BUDGET: u64 = 1_000_000_000;
+/// Guest milliseconds to cycles.
+const fn ms(n: u64) -> u64 {
+    n * 156_000
+}
+
+impl Os {
+    /// Tap `key` at cycle `at` (absolute): run to `at`, press for 50 ms, release.
+    fn tap_at(&mut self, at: u64, key: &str) -> StopReason {
+        let key = evo_core::Key::from_name(key).expect("a key name");
+        let stop = self.run_until(at.saturating_sub(self.m.sched.now), |_| false);
+        if stop != StopReason::CycleLimit {
+            return stop;
+        }
+        self.m.set_key(key, true);
+        let stop = self.run_until(ms(50), |_| false);
+        self.m.set_key(key, false);
+        stop
+    }
+}
+
+/// M4: on a fresh unit (empty ITS) the BSP starts the Self-Test app; its menu's
+/// "0. Exit this menu" launches OS image 1 (`boot-flow.md` "M4 notes").
+#[test]
+fn m4_image1_launches() {
+    let Some(mut os) = Os::boot() else {
+        return;
+    };
+    os.m.breakpoints.insert(IMAGE1_ENTRY);
+    // The Self-Test app shows the unit info screen first; ENTER opens the menu, 0 exits it.
+    for (at, key) in [(ms(2500), "enter"), (ms(3100), "0")] {
+        let stop = os.tap_at(at, key);
+        assert_eq!(stop, StopReason::CycleLimit, "UART0:\n{}", os.uart_text());
+    }
+    let stop = os.run_until(M4_BUDGET - os.m.sched.now, |_| false);
+    println!(
+        "m4: image 1 entered at cycle {} ({} system resets)",
+        os.m.sched.now, os.m.resets
+    );
+    assert_eq!(
+        stop,
+        StopReason::Breakpoint(IMAGE1_ENTRY),
+        "UART0:\n{}",
+        os.uart_text()
+    );
+    assert_eq!(os.m.resets, 0);
+    // r0 is the BSP service table, which the OS entry trampoline stores at 0x2009_B100.
+    let table = os.m.cpu.regs.r[0];
+    println!("m4: BSP service table at {table:#010x}");
+
+    // What the OS does next: 500 M more cycles.
+    let before = os.m.bus.log.len();
+    let uart_before = os.uart0.len();
+    os.m.breakpoints.remove(&IMAGE1_ENTRY);
+    let stop = os.run_until(500_000_000, |_| false);
+    println!("m4: +500 M cycles: {stop:?} at cycle {}", os.m.sched.now);
+    assert_eq!(
+        os.m.bus.peek(OS_SERVICE_TABLE_PTR, 4),
+        Some(table),
+        "the OS did not store the BSP service table"
+    );
+    for (a, n) in os.m.bus.log.entries().skip(before).take(16) {
+        println!(
+            "m4: next unmapped: {} {:#010x} w{} {:x?} pc {:#010x} x{n}",
+            if a.write.is_some() { "write" } else { "read" },
+            a.addr,
+            a.width,
+            a.write,
+            a.pc
+        );
+    }
+    println!(
+        "m4: UART0 after the launch: {:?}",
+        String::from_utf8_lossy(&os.uart0[uart_before..])
+    );
+    assert_eq!(os.m.bus.irq_lines() & FATAL_STUB_IRQS, 0);
 }

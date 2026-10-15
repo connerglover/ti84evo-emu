@@ -21,8 +21,9 @@ partition. It then hands off to the Non-secure BSP:
 
 The BSP prints `Starting BSP 7.1.0.4413` and draws the TI logo into the framebuffer at
 0x2004_8000. The framebuffer is 240x320 RGB565, portrait, and the panel shows it rotated
-(`lcdc.md`). The BSP then idles in its RTOS idle thread (WFI loop at 0x00160b88) and never
-launches OS image 1 (§3.3, §5). A **SHA-256 engine** at 0x5000_2000 is also used
+(`lcdc.md`). With the board inputs, the product-ID strap, a correct SHA-256 engine and all
+ten package images placed (Task 24), the BSP validates OS image 1 and, on a fresh unit,
+starts the Self-Test app; leaving it launches image 1 (§3.3, "M4 notes"). A **SHA-256 engine** at 0x5000_2000 is also used
 (`crypto.md`). It must compute real SHA-256 for correctness but is not what stops the boot.
 The secure image never reaches a fatal error with these models (0 resets in 300 M cycles).
 
@@ -180,22 +181,37 @@ device). Handle 0x106 type 0xD returns -132. That service (0x100d79fc) reads 32 
 flash offset 0 (S 0x1000_0000) and expects the MCUboot magic 0x96F3_B83D there, probably the
 "Launcher" (BL2) image header for the version screen. The emulated flash has 0xFF there.
 
-### 3.3 Where the BSP stops
+### 3.3 After the logo: the launch decision (Task 24)
 
-After the logo the BSP creates a thread with entry 0x0015_1A55 (TCB 0x2004_4DC0) and signals
-object "LAUNCH" (0x2001_02B8) with 6 (0x0015_d538 -> 0x0011_8238). That thread never runs:
-no hit on 0x0015_1A54 in 300 M cycles. The OS validation path (0x0015_2BA8: "Validating
-OS...", called from 0x0010_bb82 and 0x0010_bce2) and the image-1 launch are never reached.
+The BSP's control logic is three table-driven state machines (LAUNCH 0x2001_02B8, POWER
+0x2001_0318, CHARGE 0x2001_01B8) run by one engine (thread body 0x001664d0); the LAUNCH
+thread waits on its own message queue. `discovery-log.md` §"Post-logo stall" has the state
+and event names and the trace. In order:
 
-NVIC at idle:
+1. POWER "Check State" (0x00152eb4) reads the charger status (GPIO pin 9) and the battery
+   comparator (pin 11 against thresholds on pins 5/7/12) and sends LAUNCH "Battery
+   Charging", "Battery Critical" or "Battery Good" (`gpio.md`).
+2. LAUNCH "Battery Good" (0x0015c958) dispatches on the boot target byte 0x2001_47A4, set by
+   the BSP init: 0 → state OS, 1 → Selftest (the diagnostic app), 2 → Install.
+3. The BSP init (0x0015d474..0x0015d4e0) chooses the target. Reset reason 8 (retained record
+   at 0x2017_DDD0; set at 0x0014f786, probably by the USB OS-install path before its reboot) first writes ITS UID
+   0x1F61E867_8CE70001 ("boot to OS") = 1. The target is 1 when that UID is missing or 0, or
+   when UID ..0004 (diagnostic-menu request) is nonzero; combo 8 (`2nd` + `del`) gives 2;
+   a nonzero answer from secure service 0x4000_0108 type 3 forces 0.
+4. State OS (0x00160364) asks secure service 0x4000_0107 type 0 (0x00114108) to validate
+   image 1; status 0 → the launch code below; 1 (invalid image) or 2 (bad header or a
+   missing image 2..9) throws 0x13/0x12 → OS Exit → OS Missing → Waiting Install ("Install
+   OS & Apps").
 
-- enabled = 0x1100_6181, that is IRQ 0 (OnKey), 7 (MPC), 8 (PPC), 13 (Keypad), 14 (LCDC),
-  24 (GPIO) and 28 (USBTC);
-- ITNS = 0xFFFF_FE7F (all NS except 7 and 8);
-- SysTick_NS = 1 ms (RVR 0x2615F at 156 MHz).
+The service validates like MCUboot over the slot at 0x0038_0000: SHA-256 TLV 0x10 over
+header + payload + protected TLVs (42,212 SHA blocks, about 35 M cycles), RSA-3072 TLVs
+0x01/0x23 (about 11 M cycles in software), security counter TLV 0x50 (0x0701_0000) against
+NV counter 3, and TI TLV 0xA0 (product ID 1) against the hardware product ID
+(`security.md`, CRU +0x10). It then requires an MCUboot header 0x40 bytes before each
+payload address in TLVs 0xB1..0xB8 (images 2..9).
 
-Pending IRQs 0, 13, 14, 24 or 28 every 16 ms without device status changes nothing. Which
-event or device status the BSP's state machine waits for is open; §5 lists the candidates.
+On a fresh unit (empty ITS) the target is 1: the BSP shows the unit info screen, then (after
+ENTER) the "Self-Test" menu; "0. Exit this menu" sends LAUNCH "OS" once.
 
 ### 3.4 How image 1 (the NS OS) is entered
 
@@ -213,7 +229,8 @@ reads the entry from image 1's MCUboot header:
 10152716: blx  r6
 ```
 
-The OS entry trampoline stores r0, the BSP's service table, to 0x2009_B100. It checks a
+The OS entry trampoline stores r0, the BSP's service table (0x0018_2024 in BSP 7.1.0.4413),
+to 0x2009_B100. It checks a
 compatibility pair (0x380aee: 0x380c6c vs 0x380c80; on mismatch it calls 0x380930(15) and
 then 0x44bce4), then jumps to 0x0038_0209.
 
@@ -253,22 +270,10 @@ previous boot.
 6. **CPU: CONTROL.SPSEL preserved across cross-state exceptions.** Done in `5fe119b`.
 7. **USB ID and soft reset at 0x4000_3000** (`usb.md`). Without them the BSP reports a
    `UHIL_swc` fatal error and resets.
-8. **The BSP launch gate (open).** The BSP sits idle after the TI logo, and the "LAUNCH"
-   thread 0x0015_1A55 never runs. Candidates, in the order to test them:
-   1. **LCDC VComp → IRQ 14** (the first candidate). The BSP LCD init
-      (0x0010_9b18..0x0010_9bd8) creates a display thread (handle at 0x2004_5080), clears
-      ICR bit 3, sets IMSC bit 3, then does NVIC ICPR/ISER for IRQ 14. The IRQ 14 handler
-      (0x0010_e2d0) masks NVIC 14 and posts event 0x800 to that thread; only the thread
-      re-arms the line. A one-shot pend therefore wakes the thread at most once, and pending
-      IRQ 14 every 16 ms achieves nothing more after that. A real model must latch RIS.VComp
-      once per frame (`lcdc.md`).
-   2. The keypad (`keypad.md`) and GPIO pin 9/11 interrupts (`gpio.md`).
-   3. The ON key and keypad presses.
-   4. USB-C attach (IRQ 28, 0x4010_C000; `usb.md`), only after the above are refuted.
-   5. RTC busy/status bits (`rtc.md`): refuted for the busy bits. Both +0x40 polls exit at
-      the first read with +0x40 = 0; the status bits stay open.
-   The next step in any case: trace the RTOS ready list or the "LAUNCH" object 0x2001_02B8
-   to see what the thread waits on.
+8. **The BSP launch gate (resolved, Task 24).** Board inputs on GPIO pins 9 and 11, the
+   CRU product-ID strap, the SHA-256 continue bit and the placement of images 2..9 (§3.3,
+   `discovery-log.md` §"Post-logo stall"). A fresh unit then needs the Self-Test menu's
+   "Exit" to launch the OS.
 9. Later: image 1 runs through the BSP service table (0x2009_B100), so NS OS hardware needs
    follow the BSP's drivers.
 
@@ -277,10 +282,12 @@ previous boot.
 - What is at 0x1800_E000 (16 B read twice, HUK/OTP?), and what does 0x5020_10C0 bits 4/6
   select (`security.md` §2)?
 - What should flash offset 0 hold? Service 0x106 type 0xD expects an MCUboot image (magic
-  0x96F3_B83D, the Launcher/BL2?) and returns -132 without it. Does the BSP's launch gate
-  depend on it?
-- The thread object at 0x2004_4DC0 does not look like an RTX5 TCB. Which RTOS does the BSP
-  use? The CMSIS-RTOS2 API names suggest a wrapper.
+  0x96F3_B83D, the Launcher/BL2?) and returns -132 without it. The launch does not depend
+  on it (Task 24); the info screen shows BL1/BL2 0.0.0.0.
+- How should an emulated unit get its factory ITS state (UID ..0001 "boot to OS")? Today a
+  fresh flash file boots into Self-Test every time.
+- Resolved: the BSP uses RTX5 (CMSIS-RTOS2). 0x2004_4DC0 is an RTX timer ("Animation"),
+  not a thread; the LAUNCH thread's control block is at 0x2003_9DD8.
 
 ## Milestones
 
@@ -292,7 +299,7 @@ counts are recorded here as each one passes.
 | M1 | `Booting TF-M v2.1.1` on UART0 (steps 1–3) | 81,955,780 (first UART0 byte, without a SPIF model: the 100 ms Read-ID timeout and the SPI-device delays come first; Task 10) |
 | M2 | secure boot completes; NS hand-off at 0x0011_6D50; `Starting BSP` on UART0 | hand-off 70,784,675 (first boot, 0 resets; 70,282,729 on the second power-on from the saved NV state); `Starting BSP` by 80,784,676 (the test checks UART0 every 10 M cycles, so this is an upper bound); Task 16 |
 | M3 | the boot logo on the emulated screen | 90,000,000 (the TI logo alone is on the screen from about 80 M to 100 M; Task 23, "M3 notes") |
-| M4 | OS image 1 entered at 0x0044_BC90 | not yet recorded |
+| M4 | OS image 1 entered at 0x0044_BC90 | 656,271,393 (fresh unit: ENTER at 2.5 s and 0 at 3.1 s in the Self-Test app; Task 24, "M4 notes") |
 
 The M1 banner now arrives by cycle 70,000,001 (same 10 M-cycle granularity): with the SPIF
 the Read-ID probe no longer times out.
@@ -349,3 +356,22 @@ the Read-ID probe no longer times out.
 - **Checks at 90 M:** the backlight PWM brightness is above 0; no SRAM access past 1.5 MiB;
   no fatal stub IRQ line; no unmapped access outside `KNOWN_UNMODELLED`; a second boot gives
   the same frame hash.
+
+### M4 notes (Task 24)
+
+- **What unblocked the launch:** four model fixes, each with its own test and commit:
+  GPIO pins 9/11 driven high by the board (`gpio.md`), CRU +0x10 strap = 1 (`security.md`),
+  SHA CTRL bit 2 = continue (`crypto.md`), images 2..9 placed after image 1
+  (`evo_image::Layout::place`). Then the Self-Test menu's "0. Exit this menu" (§3.3).
+- **Launch cycle:** 656,271,393 (budget 1,000 M in `m4_image1_launches`); 0 system resets.
+- **BSP → OS service table:** r0 = 0x0018_2024 at the entry; the OS stores it at
+  0x2009_B100 (checked by the test after 500 M more cycles). OS-to-BSP calls go through
+  `[[0x2009_B100] + n*4]` (stub 0x0044bc9e).
+- **After the entry (500 M cycles):** no new unmapped access, no UART0 output. The screen
+  shows the OS home screen (an app grid titled "CALCULATOR") by about 7.9 s of guest time.
+  The OS reaches hardware through the BSP, so the next work (keypad input, RTC, Plan 3)
+  follows the BSP's drivers.
+- **Key source.** With correct SHA-256 digests the secure image reads the unmapped OTP page
+  at 0x1800_E03C and 0x1800_E0F4 (16 bytes each, reads 0); the milestone tests accept the
+  whole 4 KiB page 0x1800_E000..0x1800_EFFF.
+- **M3** is unchanged: the logo frame at 90 M has the same hash.
