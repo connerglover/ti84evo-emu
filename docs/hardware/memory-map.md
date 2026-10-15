@@ -45,8 +45,13 @@ ITS at `0x000A_C000..0x000A_FFFF` (`boot-flow.md` §2), and a one-shot mailbox a
 | 0 | Secure | `0x0000_0000` | `0x400` | `0x000D_AEB8` | `0x000D_B4F3` | **`0x000B_0000`** | S alias `0x100B_0000` | `0x0018_B4F3` |
 | 1 | Non-secure | `0x0010_0000` | `0x200` | `0x0029_3678` | `0x0029_3A99` | **`0x0038_0000`** | NS alias `0x0038_0000` | `0x0061_3A99` |
 
-Images 2–9 (header `0x40`) are not placed yet; their roles and addresses are
-open (see below).
+Images 2–9 (header `0x40`) are placed at `ns_slot_base` (`0x0038_0000`) plus
+their package distance from image 1: flash offset = pkg offset − `0x10_0000` +
+`0x38_0000`. The OS image's protected TLVs 0xB1..0xB8 give the payload
+addresses of images 2..9, and the BSP's image-validation service requires an
+MCUboot header `0x40` bytes before each (`boot-flow.md` §3.3). For the 7.1
+bundle (package offsets `0x0039_A6D8..0x003F_495C`) they occupy
+`0x0061_A6D8..0x0067_495C`. Their roles are still open (see below).
 
 The package layout is not the flash layout. Image 1 sits at package offset
 `0x10_0000` but flash offset `0x38_0000`.
@@ -223,17 +228,19 @@ literal. The instructions from `0044bc9e` on belong to the next routine.
 ## Flash coverage
 
 - `Layout::place` copies header, payload and TLVs. Flash must therefore cover
-  offsets up to **`0x0061_3A99`** (header and payload alone end at
-  `0x0061_3878`). Both images fit in the first 8 MiB
-  (`real_bundle_fits_8_mib_flash_with_evo_7_1` checks this); the flash itself
-  is 16 MiB.
-- Occupied: `0x000B_0000..0x0018_B4F3` (image 0) and
-  `0x0038_0000..0x0061_3A99` (image 1).
+  offsets up to **`0x0067_495C`** (the end of image 9 with its TLVs). All ten
+  images fit in the first 8 MiB, below the mailbox at `0x00CF_0000`
+  (`real_bundle_fits_8_mib_flash_with_evo_7_1` checks this, including the
+  range of images 2..9); the flash itself is 16 MiB.
+- Occupied: `0x000B_0000..0x0018_B4F3` (image 0),
+  `0x0038_0000..0x0061_3A99` (image 1) and `0x0061_A6D8..0x0067_495C`
+  (images 2..9, at their package distance from image 1).
 - Used at run time: PS/ITS at `0x0009_0000..0x000A_FFFF` and the mailbox at
   `0x00CF_0000` (see "Memory").
 - Unknown: the rest of `0x0000_0000..0x000B_0000`,
-  `0x0018_B4F3..0x0038_0000` (about 1.96 MiB) and everything above
-  `0x0061_3A99`.
+  `0x0018_B4F3..0x0038_0000` (about 1.96 MiB), the gap
+  `0x0061_3A99..0x0061_A6D8` (between the package's images 1 and 2) and
+  everything above `0x0067_495C` except the mailbox.
 
 ## Open questions
 
@@ -248,8 +255,13 @@ literal. The instructions from `0044bc9e` on belong to the next routine.
    through the BSP idle loop saw no erase, program or blank check in this gap.
    It is left as erased flash. What `0x0018_F2C0` names is still open.
 3. **Where do images 2–9 go, and what are they?** The package does not say
-   and this scorer was not run on them. Their headers are `0x40` and none is
-   placed by `Layout::place`.
+   and this scorer was not run on them. Their headers are `0x40`.
+   **Answer (addresses, Task 24):** at `ns_slot_base` plus their package
+   distance from image 1, `0x0061_A6D8..0x0067_495C` for the 7.1 bundle. The
+   OS image's protected TLVs 0xB1..0xB8 give their payload addresses, and the
+   BSP's validation of image 1 requires an MCUboot header `0x40` bytes before
+   each (`boot-flow.md` §3.3). `Layout::place` places them there. What the
+   images are (their roles) is still open.
 4. **Does image 0 contain a part that runs Non-secure?** Its S-alias string
    references sit in its first `0x23000` bytes. Its NS-alias references sit
    in slot+`0x5A000..0xD6000`, and the strings they name include USB-stack

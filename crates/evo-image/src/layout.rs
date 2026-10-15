@@ -30,7 +30,7 @@ impl Layout {
     /// address `flash_base`: image 0 at `secure_slot_base`, image 1 at
     /// `ns_slot_base`, and each later image at `ns_slot_base` plus its package
     /// distance from image 1 (the OS image's protected TLVs 0xB1..0xB8 give
-    /// those addresses; `docs/hardware/boot-flow.md` §3.4). Each is copied
+    /// those addresses; `docs/hardware/boot-flow.md` §3.3). Each is copied
     /// whole (header, payload and TLV areas). A package with a single image
     /// places just that one.
     ///
@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn place_puts_later_images_after_image_1_as_in_the_package() {
-        // Images 2.. keep their package distance from image 1 (`boot-flow.md` §3.4: the OS
+        // Images 2.. keep their package distance from image 1 (`boot-flow.md` §3.3: the OS
         // image's protected TLVs 0xB1..0xB8 name their addresses that way).
         let (a, b, c) = (
             Img::filled(0x400, 0x300, 1),
@@ -281,7 +281,7 @@ mod tests {
         let mut flash = vec![FILL; 8 << 20];
         Layout::EVO_7_1
             .place(pkg, &mut flash, 0)
-            .expect("both images fit an 8 MiB flash at offset 0");
+            .expect("all images fit an 8 MiB flash at offset 0");
 
         let word = |at: usize| u32::from_le_bytes(flash[at..at + 4].try_into().expect("4 bytes"));
         let layout = Layout::EVO_7_1;
@@ -299,6 +299,25 @@ mod tests {
             let len = image.end_with_tlvs(&pkg.bytes) - image.pkg_offset;
             assert!(flash[base..base + len] == pkg.bytes[image.pkg_offset..][..len]);
         }
+        // Images 2..9 sit at `ns_slot_base` plus their package distance from
+        // image 1 and together occupy the range `memory-map.md` lists, which
+        // ends below the mailbox at flash offset 0x00CF_0000.
+        assert_eq!(pkg.images.len(), 10, "images 0..9");
+        let image1 = pkg.images[1].pkg_offset;
+        let (mut lo, mut hi) = (usize::MAX, 0);
+        for image in &pkg.images[2..] {
+            let base = layout.ns_slot_base as usize + (image.pkg_offset - image1);
+            let len = image.end_with_tlvs(&pkg.bytes) - image.pkg_offset;
+            assert_eq!(
+                word(base),
+                0x96f3_b83d,
+                "slot {base:#x} starts with its header"
+            );
+            assert!(flash[base..base + len] == pkg.bytes[image.pkg_offset..][..len]);
+            (lo, hi) = (lo.min(base), hi.max(base + len));
+        }
+        assert_eq!((lo, hi), (0x0061_A6D8, 0x0067_495C), "{lo:#x}..{hi:#x}");
+        assert!(hi < 0x00CF_0000);
         // Image 0's reset vector is a Secure-alias Thumb address in its slot.
         let secure = &pkg.images[0];
         let vtor = layout.secure_slot_base as usize + usize::from(secure.header_size);
