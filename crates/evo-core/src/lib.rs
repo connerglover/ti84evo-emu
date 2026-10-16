@@ -12,6 +12,7 @@ pub mod state;
 pub use evo_hw::StateError;
 pub use evo_hw::dev::lcdc::Frame;
 pub use evo_hw::nor::{NvError, NvState, write_atomic};
+pub use evo_hw::{AccessDir, BUS_RING_CAP, BusRecord, WatchError, WatchKinds, WatchRange};
 pub use host::UartPort;
 pub use keys::{Key, KeyAction, KeyScriptError, parse_key_script};
 pub use machine::{CPU_HZ, Machine, StopReason};

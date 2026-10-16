@@ -409,9 +409,11 @@ impl Debuggee<'_> {
                 SingleThreadStopReason::Signal(Signal::SIGSEGV)
             }
             // `CycleLimit` cannot happen: a continue has no budget.
-            StopReason::Idle | StopReason::Bkpt { .. } | StopReason::CycleLimit => {
-                SingleThreadStopReason::Signal(Signal::SIGTRAP)
-            }
+            StopReason::Idle
+            | StopReason::Bkpt { .. }
+            | StopReason::CycleLimit
+            | StopReason::Watchpoint { .. }
+            | StopReason::Goal { .. } => SingleThreadStopReason::Signal(Signal::SIGTRAP),
         }
     }
 }

@@ -215,6 +215,8 @@ impl Machine {
         self.bus.take_event_requests();
         self.bus.now = self.sched.now;
         self.stopped_at = None;
+        // A hit the replaced run matched belongs to it; the watchpoints stay set.
+        self.bus.take_watch_hit();
         self.recent = RecentSteps::default();
         Ok(())
     }

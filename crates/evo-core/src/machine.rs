@@ -38,6 +38,15 @@
 //! PC; three stores per step) and formats them only when asked
 //! ([`Machine::recent_trace`]), e.g. to show how the guest reached a lockup.
 //!
+//! # Watchpoints
+//!
+//! [`Machine::set_watchpoints`] passes read/write ranges to the memory map, which observes
+//! every guest data access; the access that matches stops `run` (and `step`) after the
+//! instruction that made it, with [`StopReason::Watchpoint`]. Exec ranges are checked by the
+//! machine before each step, like breakpoints: the run stops before the instruction and the
+//! next run executes it first. While anything is watched (or the bus monitor records),
+//! `run` takes the checked path instead of batches ([`Machine::batched_runs`]).
+//!
 //! # Save states
 //!
 //! [`Machine::save_state`] / [`Machine::load_state`] (in [`crate::state`]): CPU, scheduler,
@@ -53,7 +62,10 @@ use armv8m::{Cpu, Sec, SleepKind, StepResult, decode16, decode32, disasm};
 use evo_hw::dev::spif::Spif;
 use evo_hw::nor::{NvState, SECREGS_LEN};
 use evo_hw::soc::{self, FLASH_BUFFER, SRAM_BUFFER};
-use evo_hw::{DevCtx, Device, MemoryMap, ResetKind, UnmappedAccess, UnmappedKind};
+use evo_hw::{
+    AccessDir, DevCtx, Device, MemoryMap, ResetKind, UnmappedAccess, UnmappedKind, WatchError,
+    WatchHit, WatchRange,
+};
 use evo_image::{Bundle, ImageError, Layout};
 use serde::{Deserialize, Serialize};
 
@@ -147,6 +159,18 @@ pub enum StopReason {
     Lockup { pc: u32 },
     /// The guest executed `BKPT #imm` at `pc` (the PC stays on it).
     Bkpt { pc: u32, imm: u8 },
+    /// A watchpoint ([`Machine::set_watchpoints`]) matched. Read/write: the instruction at
+    /// `pc` accessed `addr` (`value` read or written) and has completed. Exec: the next
+    /// instruction is at `addr` = `pc` in an exec range and has not run (`value` 0); the next
+    /// run executes it first, as for a breakpoint.
+    Watchpoint {
+        addr: u32,
+        dir: AccessDir,
+        value: u32,
+        pc: u32,
+    },
+    /// A run goal was reached; the next instruction is at `pc` and has not run.
+    Goal { pc: u32 },
 }
 
 /// GPIO inputs the board drives high at power-on (`docs/hardware/gpio.md`, "Pin roles"):
@@ -191,6 +215,13 @@ pub struct Machine {
     /// a restore keeps it.
     #[serde(skip)]
     pub(crate) unbatched: bool,
+    /// The exec ranges of [`set_watchpoints`](Self::set_watchpoints); the bus holds all the
+    /// ranges and checks the read/write ones. Debugger setting: not saved; a restore keeps it.
+    #[serde(skip)]
+    pub(crate) exec_watch: Vec<WatchRange>,
+    /// `run_batch` calls since power-on. Statistics only: not saved.
+    #[serde(skip)]
+    pub(crate) batched: u64,
 }
 
 impl Machine {
@@ -242,8 +273,8 @@ impl Machine {
     /// Switch the calculator off and on again: the machine becomes what
     /// [`from_bundle_nv`](Self::from_bundle_nv) builds from [`nv_state`](Self::nv_state) (the
     /// bundle's images are already in that flash). Flash and the NOR security registers are
-    /// kept; the CPU, SRAM, devices, time, `resets`, breakpoints, held keys and host inputs
-    /// start over as at power-on.
+    /// kept; the CPU, SRAM, devices, time, `resets`, breakpoints, watchpoints (and any pending
+    /// hit), the bus monitor, held keys and host inputs start over as at power-on.
     pub fn power_cycle(&mut self) {
         let nv = self.nv_state();
         let unbatched = self.unbatched;
@@ -282,6 +313,8 @@ impl Machine {
             bundle_id,
             awake_cycles: 0,
             unbatched: false,
+            exec_watch: Vec::new(),
+            batched: 0,
         };
         if let Some(secregs) = secregs {
             m.with_dev("spif", |s: &mut Spif, _| s.nor_mut().set_secregs(secregs));
@@ -411,12 +444,13 @@ impl Machine {
 
     /// Run for up to `max_cycles` cycles from now.
     ///
-    /// Stops before an instruction at a breakpoint (a run that starts on the breakpoint the
-    /// previous run stopped at executes it first), on lockup, on a guest `BKPT`, when the
-    /// budget is used up, or when the CPU is asleep with nothing left to wake it
-    /// ([`StopReason::Idle`]).
+    /// Stops before an instruction at a breakpoint or in an exec watchpoint (a run that starts
+    /// where the previous run stopped this way executes it first), after an instruction that
+    /// matched a read/write watchpoint, on lockup, on a guest `BKPT`, when the budget is used
+    /// up, or when the CPU is asleep with nothing left to wake it ([`StopReason::Idle`]).
     ///
-    /// While no breakpoint is set, the CPU steps in batches that end at the next due event, when
+    /// While no breakpoint or watchpoint is set and the bus monitor is off, the CPU steps in
+    /// batches that end at the next due event, when
     /// a device runs, or when the CPU sleeps; each step does exactly what it does one at a
     /// time, so the result is the same as [`set_batching(false)`](Self::set_batching).
     pub fn run(&mut self, max_cycles: u64) -> StopReason {
@@ -434,7 +468,7 @@ impl Machine {
                 }
                 continue;
             }
-            let stop = if self.breakpoints.is_empty() && self.stopped_at.is_none() {
+            let stop = if !self.needs_checks() {
                 self.run_batch(end)
             } else {
                 self.checked_step(&mut |_| ControlFlow::Continue(()))
@@ -443,6 +477,70 @@ impl Machine {
                 return stop;
             }
         }
+    }
+
+    /// Whether `run` must check every step: a breakpoint or watchpoint is set, the bus
+    /// monitor records, or the last run stopped on an instruction it has to step over.
+    #[inline]
+    fn needs_checks(&self) -> bool {
+        !self.breakpoints.is_empty()
+            || self.stopped_at.is_some()
+            || !self.exec_watch.is_empty()
+            || self.bus.watching()
+    }
+
+    /// Replace the watchpoints (read, write and exec ranges). Every range is validated first;
+    /// on `Err` nothing changes. An empty set turns watching off.
+    pub fn set_watchpoints(&mut self, ranges: Vec<WatchRange>) -> Result<(), WatchError> {
+        let exec = ranges.iter().filter(|r| r.kinds.exec).copied().collect();
+        self.bus.set_watchpoints(ranges)?;
+        self.exec_watch = exec;
+        Ok(())
+    }
+
+    /// The watchpoints as last set.
+    pub fn watchpoints(&self) -> Vec<WatchRange> {
+        self.bus.watchpoints()
+    }
+
+    /// How many batches `run` stepped since power-on (statistics, e.g. to see that watching
+    /// turns batching off). Not saved; a restore keeps the count going.
+    pub fn batched_runs(&self) -> u64 {
+        self.batched
+    }
+
+    /// The exec watchpoint stop for an instruction at `pc`, if an exec range holds `pc`.
+    #[cold]
+    #[inline(never)]
+    fn exec_stop(&self, pc: u32) -> Option<StopReason> {
+        self.exec_watch
+            .iter()
+            .any(|r| r.overlaps(pc, 1))
+            .then_some(StopReason::Watchpoint {
+                addr: pc,
+                dir: AccessDir::Exec,
+                value: 0,
+                pc,
+            })
+    }
+
+    /// The outcome of the step at `pc` that returned `stop`: a lockup or `BKPT` wins, else a
+    /// read/write watchpoint the step matched. The pending hit is taken either way.
+    #[inline(always)]
+    fn with_data_hit(&mut self, pc: u32, stop: Option<StopReason>) -> Option<StopReason> {
+        let hit = self.bus.take_watch_hit();
+        stop.or_else(|| {
+            hit.map(
+                |WatchHit {
+                     addr, dir, value, ..
+                 }| StopReason::Watchpoint {
+                    addr,
+                    dir,
+                    value,
+                    pc,
+                },
+            )
+        })
     }
 
     /// Whether [`run`](Self::run) steps in batches (the default). Off, it checks breakpoints,
@@ -464,6 +562,7 @@ impl Machine {
     /// syncing the bus was a no-op, and no event was due, so advancing time fired nothing.
     fn run_batch(&mut self, end: u64) -> Option<StopReason> {
         self.stopped_at = None;
+        self.batched += 1;
         let start = self.sched.now;
         let limit = self.sched.next_deadline().map_or(end, |d| d.min(end));
         let recent = &mut self.recent;
@@ -502,8 +601,9 @@ impl Machine {
         stop
     }
 
-    /// One step of `run_with` on the awake CPU: stop at a breakpoint (unless it is the one the
-    /// last run stopped at), call `before_step`, step.
+    /// One step of `run_with` on the awake CPU: stop at a breakpoint or exec watchpoint (unless
+    /// the last run stopped there), call `before_step`, step, then stop if the step matched a
+    /// read/write watchpoint.
     #[inline(always)]
     fn checked_step(
         &mut self,
@@ -515,6 +615,13 @@ impl Machine {
             self.stopped_at = Some(pc);
             return Some(StopReason::Breakpoint(pc));
         }
+        if !resumed
+            && !self.exec_watch.is_empty()
+            && let Some(stop) = self.exec_stop(pc)
+        {
+            self.stopped_at = Some(pc);
+            return Some(stop);
+        }
         if before_step(self).is_break() {
             // Still on the breakpoint this run resumed from: the next run steps over it.
             if resumed {
@@ -522,7 +629,8 @@ impl Machine {
             }
             return Some(StopReason::Halted);
         }
-        self.step_cpu()
+        let stop = self.step_cpu();
+        self.with_data_hit(pc, stop)
     }
 
     /// [`run`](Self::run), calling `before_step` with the machine before each CPU step (not
@@ -551,10 +659,11 @@ impl Machine {
     }
 
     /// Execute one CPU step (one instruction, or the entry to a pending exception), ignoring
-    /// breakpoints. While asleep, wake if a wake-up is due (and then step), else jump to the
-    /// next wake-up time without stepping. Returns `Stepped` unless the step locked up or hit
-    /// a guest `BKPT`, or the CPU is asleep with nothing left to wake it (`Idle`: nothing
-    /// changes).
+    /// breakpoints and exec watchpoints. While asleep, wake if a wake-up is due (and then
+    /// step), else jump to the next wake-up time without stepping. Returns `Stepped` unless the
+    /// step locked up, hit a guest `BKPT` or matched a read/write watchpoint
+    /// ([`StopReason::Watchpoint`]), or the CPU is asleep with nothing left to wake it (`Idle`:
+    /// nothing changes).
     pub fn step(&mut self) -> StopReason {
         if self.asleep() {
             if let Some(stop) = self.idle(u64::MAX) {
@@ -564,7 +673,9 @@ impl Machine {
                 return StopReason::Stepped;
             }
         }
-        self.step_cpu().unwrap_or(StopReason::Stepped)
+        let pc = self.cpu.regs.pc;
+        let stop = self.step_cpu();
+        self.with_data_hit(pc, stop).unwrap_or(StopReason::Stepped)
     }
 
     /// One trace line for the instruction at the PC, which is about to execute:
