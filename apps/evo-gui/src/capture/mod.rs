@@ -1,8 +1,10 @@
 //! Capture: Copy screen, animated PNG and MP4 recording.
 
 mod apng;
+mod mp4;
 mod sampler;
 
+pub use self::mp4::{Mp4Recorder, scale2x_rgb};
 pub use apng::{APNG_MAX_FRAMES, ApngRecorder, CaptureError};
 pub use sampler::{FrameSampler, LCD_FRAME_CYCLES};
 
@@ -21,6 +23,8 @@ pub const COPIED: &str = "Screen copied";
 pub const NO_FRAME: &str = "no display frame to capture";
 /// Toast when an animated PNG recording starts.
 pub const RECORDING_APNG: &str = "Recording animated PNG…";
+/// Toast when an MP4 recording starts.
+pub const RECORDING_MP4: &str = "Recording MP4…";
 /// Toast when a recording stops before any frame was taken.
 pub const NOTHING_RECORDED: &str = "Nothing was recorded";
 /// Toast when one kind of recording is asked for while the other runs.
@@ -36,24 +40,28 @@ pub enum RecordKind {
 /// The encoder of the recording in progress.
 enum Recorder {
     Apng(ApngRecorder),
+    Mp4(Box<Mp4Recorder>),
 }
 
 impl Recorder {
     fn kind(&self) -> RecordKind {
         match self {
             Recorder::Apng(_) => RecordKind::Apng,
+            Recorder::Mp4(_) => RecordKind::Mp4,
         }
     }
 
     fn push(&mut self, frame: &Frame, ticks: u32) -> Result<(), CaptureError> {
         match self {
             Recorder::Apng(r) => r.push(frame, ticks),
+            Recorder::Mp4(r) => r.push(frame, ticks),
         }
     }
 
     fn finish(self) -> Result<Option<PathBuf>, CaptureError> {
         match self {
             Recorder::Apng(r) => r.finish(),
+            Recorder::Mp4(r) => r.finish(),
         }
     }
 }
@@ -105,10 +113,6 @@ impl Capture {
 
     /// Creates `{data_dir}/recordings/` and starts a recording there; on failure nothing starts.
     fn start(&mut self, kind: RecordKind, cx: &mut FeatureCtx<'_>) {
-        // Task C3 adds the MP4 recorder; `RecordVideo` is not routed here before then.
-        if kind == RecordKind::Mp4 {
-            return;
-        }
         let path = match recording_path(cx.data_dir, kind) {
             Ok(p) => p,
             Err(e) => {
@@ -117,7 +121,13 @@ impl Capture {
                 return;
             }
         };
-        let (recorder, toast) = (Recorder::Apng(ApngRecorder::new(path)), RECORDING_APNG);
+        let (recorder, toast) = match kind {
+            RecordKind::Apng => (Recorder::Apng(ApngRecorder::new(path)), RECORDING_APNG),
+            RecordKind::Mp4 => (
+                Recorder::Mp4(Box::new(Mp4Recorder::new(path))),
+                RECORDING_MP4,
+            ),
+        };
         self.rec = Some(Recording {
             recorder,
             sampler: FrameSampler::new(cx.backend.cycles()),
@@ -141,11 +151,28 @@ impl Capture {
         }
     }
 
-    /// Ends the recording after `push` refused a frame: the frames so far are written.
+    /// Ends the recording after `push` refused a frame: the frames so far are written. When
+    /// nothing can be written (no frame yet, or the error broke the file) the one toast says
+    /// why it stopped.
     fn stop_after(&mut self, err: CaptureError, cx: &mut FeatureCtx<'_>) {
-        cx.toasts
-            .push(format!("Recording stopped: {err}"), ToastKind::Error);
-        self.stop(cx);
+        let first = format!("Recording stopped: {err}");
+        cx.toasts.push(first.clone(), ToastKind::Error);
+        let Some(rec) = self.rec.take() else {
+            return;
+        };
+        match rec.recorder.finish() {
+            Ok(Some(p)) => cx.toasts.push(
+                format!("Recording saved to {}", p.display()),
+                ToastKind::Info,
+            ),
+            Ok(None) => {}
+            Err(e) => {
+                let again = format!("Recording stopped: {e}");
+                if again != first {
+                    cx.toasts.push(again, ToastKind::Error);
+                }
+            }
+        }
     }
 }
 
@@ -173,6 +200,10 @@ impl Feature for Capture {
             }
             Action::RecordApng => {
                 self.toggle(RecordKind::Apng, cx);
+                true
+            }
+            Action::RecordVideo => {
+                self.toggle(RecordKind::Mp4, cx);
                 true
             }
             _ => false,
