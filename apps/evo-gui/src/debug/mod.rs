@@ -3,11 +3,14 @@
 //! calls.
 
 mod breakpoints;
+mod busmon;
 mod control;
 mod disasm;
 mod memory;
+mod peripherals;
 mod regs;
 mod search;
+mod stacks;
 mod uart;
 mod unmapped;
 mod visualizer;
@@ -15,10 +18,12 @@ mod watchpoints;
 
 use egui::{Button, ScrollArea, Sense};
 
+pub use busmon::{BUS_SHOWN, bus_line};
 pub use control::cycle_text;
 pub use disasm::{DISASM_LINES, format_disasm};
 pub use memory::{DEFAULT_MEM_ADDR, MAX_VIEWS};
 pub use search::{SEARCH_CHUNK, SEARCH_CHUNKS_PER_FRAME, Search, find, parse_pattern};
+pub use stacks::{STACK_WORDS, stack_rows};
 pub use uart::{UART_CAP, UartConsole};
 pub use visualizer::{DEFAULT_VIS_ADDR, PixelFormat, VIS_MAX, parse_size, render};
 pub use watchpoints::watch_text;
@@ -118,11 +123,6 @@ impl DebugTab {
     }
 }
 
-/// The body of a tab a later task fills in.
-fn not_yet(ui: &mut egui::Ui) {
-    ui.weak("Not available yet.");
-}
-
 /// What the run controls asked for this frame; the app applies it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DebugOutput {
@@ -148,6 +148,7 @@ pub struct DebugPanel {
     visualizer: visualizer::VisualizerState,
     breakpoints: breakpoints::BreakpointsState,
     watchpoints: watchpoints::WatchpointsState,
+    busmon: busmon::BusState,
     uart: UartConsole,
     uart2: UartConsole,
     /// The newest log lines, at most [`LOG_CAP`].
@@ -255,7 +256,9 @@ impl DebugPanel {
             DebugTab::Watchpoints => {
                 watchpoints::show(ui, &mut self.watchpoints, backend, paused, &mut out.notes);
             }
-            DebugTab::Peripherals | DebugTab::BusMonitor | DebugTab::Stacks => not_yet(ui),
+            DebugTab::Peripherals => peripherals::show(ui, backend),
+            DebugTab::BusMonitor => busmon::show(ui, &mut self.busmon, backend),
+            DebugTab::Stacks => stacks::show(ui, backend),
         }
         out
     }

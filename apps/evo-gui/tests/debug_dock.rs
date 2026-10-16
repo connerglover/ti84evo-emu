@@ -1,6 +1,6 @@
 //! The debug dock: tab registry, run row, the Control tab, register editing, the
-//! Memory tab (views, editing, search), the Visualizer and the Breakpoints and Watchpoints
-//! tabs, on `FakeBackend`.
+//! Memory tab (views, editing, search), the Visualizer, the Breakpoints and Watchpoints
+//! tabs and the Peripherals, Bus monitor and Stacks tabs, on `FakeBackend`.
 
 mod common;
 
@@ -8,13 +8,14 @@ use common::{TempDir, harness_with, test_options};
 use egui::accesskit::Role;
 use egui::{Key, Modifiers};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use evo_gui::app::{AppOptions, EvoApp};
 use evo_gui::backend::fake::FakeBackend;
-use evo_gui::backend::{AccessDir, EmuBackend, Goal, RunStatus, WatchKinds, Watchpoint};
+use evo_gui::backend::{AccessDir, BusRecord, EmuBackend, Goal, RunStatus, WatchKinds, Watchpoint};
 use evo_gui::debug::{
-    DebugTab, MAX_VIEWS, PixelFormat, SEARCH_CHUNK, SEARCH_CHUNKS_PER_FRAME, Search, VIS_MAX,
-    cycle_text, find, parse_pattern, parse_size, parse_value, render, watch_text,
+    BUS_SHOWN, DebugTab, MAX_VIEWS, PixelFormat, SEARCH_CHUNK, SEARCH_CHUNKS_PER_FRAME,
+    STACK_WORDS, Search, VIS_MAX, bus_line, cycle_text, find, parse_pattern, parse_size,
+    parse_value, render, stack_rows, watch_text,
 };
 use evo_gui::platform::FakePlatform;
 
@@ -1120,4 +1121,229 @@ fn breakpoint_thumb_bit_is_dropped() {
     set_field(&mut h, 0, "0x10000301");
     click(&mut h, "Add");
     assert_eq!(h.state().backend().breakpoints(), [0x1000_0300]);
+}
+
+#[test]
+fn bus_line_format() {
+    let r = BusRecord {
+        addr: 0x2000_0100,
+        width: 4,
+        dir: AccessDir::Write,
+        value: 0x2A,
+        pc: 0x1000_0200,
+        cycle: 7,
+    };
+    assert_eq!(bus_line(&r), "           7 10000200 W 20000100 4 0000002a");
+}
+
+#[test]
+fn bus_line_widths_and_dirs() {
+    let r = BusRecord {
+        addr: 0x4010_1030,
+        width: 1,
+        dir: AccessDir::Read,
+        value: 0x1FF,
+        pc: 0x1000_0004,
+        cycle: 123_456_789_012,
+    };
+    // The value is cut to the access width.
+    assert_eq!(bus_line(&r), "123456789012 10000004 R 40101030 1 ff");
+    let r = BusRecord {
+        width: 2,
+        dir: AccessDir::Exec,
+        value: 0xBEEF,
+        ..r
+    };
+    assert_eq!(bus_line(&r), "123456789012 10000004 X 40101030 2 beef");
+}
+
+#[test]
+fn peripherals_tab_lists_devices() {
+    let (h, _dir) = dock_on(FakeBackend::new(), "Peripherals");
+    h.get_by_label("timer @ 0x40101000");
+    h.get_by_label("nvic @ 0xe000e100");
+    h.get_by_label("ctrl");
+    h.get_by_label("+0x030");
+    h.get_by_label("+0x00d");
+    assert!(h.get_all_by_label("0x00000001").count() >= 2);
+    h.get_by_label("enabled");
+}
+
+#[test]
+fn peripherals_not_fetched_when_hidden() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = dock(fake);
+    assert_eq!(h.state().debug().tab(), DebugTab::Registers);
+    h.run_steps(10);
+    click(&mut h, "Continue");
+    h.run_steps(10);
+    assert_eq!(probe.inspect_calls(), 0);
+    click(&mut h, "Peripherals");
+    let shown = probe.inspect_calls();
+    assert!(shown > 0);
+    h.run_steps(10);
+    assert!(probe.inspect_calls() > shown);
+    // Leaving the tab stops the reads.
+    click(&mut h, "Stacks");
+    let left = probe.inspect_calls();
+    h.run_steps(10);
+    assert_eq!(probe.inspect_calls(), left);
+}
+
+/// Starts the bus monitor from the tab's fields.
+fn monitor(h: &mut Harness<'static, EvoApp>, start: &str, len: &str) {
+    set_field(h, 0, start);
+    set_field(h, 1, len);
+    click(h, "Monitor");
+}
+
+/// How each of the fake's bus records ends.
+const FAKE_LINE_END: &str = "W 20000100 4 0000002a";
+
+#[test]
+fn bus_monitor_tab_records_runs() {
+    let (mut h, _dir) = dock_on(FakeBackend::new(), "Bus monitor");
+    for label in ["Start", "Length", "Monitor", "Stop", "Clear"] {
+        h.get_by_label(label);
+    }
+    h.get_by_label("No records");
+    monitor(&mut h, "0x20000000", "0x10000");
+    click(&mut h, "Continue");
+    h.run_steps(5);
+    click(&mut h, "Pause");
+    // A label's text is its accessible value.
+    let lines: Vec<String> = h
+        .query_all_by_label_contains(FAKE_LINE_END)
+        .filter_map(|n| n.accesskit_node().label().or_else(|| n.value()))
+        .collect();
+    assert!(!lines.is_empty());
+    for l in &lines {
+        assert!(l.ends_with(FAKE_LINE_END), "{l}");
+    }
+    // The newest shown line is the backend's newest record as `bus_line` formats it.
+    let recs = h.state().backend().bus_records();
+    let last = bus_line(recs.last().expect("a record"));
+    h.get_by_label(&last);
+}
+
+#[test]
+fn bus_monitor_outside_range_records_nothing() {
+    let (mut h, _dir) = dock_on(FakeBackend::new(), "Bus monitor");
+    monitor(&mut h, "0x20001000", "#16");
+    h.get_by_label("Monitoring 0x20001000..0x2000100f");
+    click(&mut h, "Continue");
+    h.run_steps(5);
+    click(&mut h, "Pause");
+    assert!(h.state().backend().bus_records().is_empty());
+    h.get_by_label("No records");
+}
+
+#[test]
+fn bus_monitor_stop_and_clear() {
+    let (mut h, _dir) = dock_on(FakeBackend::new(), "Bus monitor");
+    monitor(&mut h, "0x20000000", "0x10000");
+    h.get_by_label("Monitoring 0x20000000..0x2000ffff");
+    click(&mut h, "Continue");
+    h.run_steps(5);
+    click(&mut h, "Stop");
+    h.get_by_label("Not monitoring");
+    let n = h.state().backend().bus_records().len();
+    assert!(n > 0);
+    // Stopped: the records are kept and no new ones arrive.
+    h.run_steps(5);
+    assert_eq!(h.state().backend().bus_records().len(), n);
+    assert!(h.query_all_by_label_contains(FAKE_LINE_END).count() > 0);
+    click(&mut h, "Clear");
+    assert!(h.state().backend().bus_records().is_empty());
+    h.get_by_label("No records");
+    assert_eq!(h.query_all_by_label_contains(FAKE_LINE_END).count(), 0);
+}
+
+#[test]
+fn bus_monitor_invalid_range() {
+    let (mut h, _dir) = dock_on(FakeBackend::new(), "Bus monitor");
+    for (start, len) in [
+        ("zz", "4"),
+        ("0x20000000", "0"),
+        ("0x20000000", "zz"),
+        ("0xffffff00", "0x200"),
+    ] {
+        monitor(&mut h, start, len);
+        h.get_by_label("Invalid range");
+        h.get_by_label("Not monitoring");
+    }
+    click(&mut h, "Continue");
+    h.run_steps(5);
+    assert!(h.state().backend().bus_records().is_empty());
+    // An edit clears the message.
+    set_field(&mut h, 1, "4");
+    assert!(h.query_by_label("Invalid range").is_none());
+}
+
+#[test]
+fn bus_monitor_shows_the_newest() {
+    let mut fake = FakeBackend::new();
+    fake.set_bus_monitor(Some((0x2000_0000, 0x1_0000)));
+    let total = BUS_SHOWN + 500;
+    for _ in 0..total {
+        fake.run_for(10);
+    }
+    assert_eq!(fake.bus_records().len(), total);
+    let (h, _dir) = dock_on(fake, "Bus monitor");
+    h.get_by_label(&format!("Newest {BUS_SHOWN} of {total} records"));
+}
+
+#[test]
+fn bus_monitor_fields_take_keys_from_calculator() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = dock_on(fake, "Bus monitor");
+    set_field(&mut h, 0, "0x20000000");
+    set_field(&mut h, 1, "0x10000");
+    press(&mut h, Key::Enter);
+    // Enter in a field starts the monitor and stays away from the calculator.
+    h.get_by_label("Monitoring 0x20000000..0x2000ffff");
+    assert!(probe.key_log().is_empty(), "{:?}", probe.key_log());
+}
+
+#[test]
+fn stack_rows_read_words() {
+    let fake = FakeBackend::new();
+    assert_eq!(stack_rows(&fake, 0x2000_8000, 1), ["20008000  8d8c8b8a"]);
+    assert_eq!(stack_rows(&fake, 0x3000_0800, 1), ["30000800  ????????"]);
+    let rows = stack_rows(&fake, 0x2000_8000, STACK_WORDS);
+    assert_eq!(rows.len(), STACK_WORDS);
+    assert_eq!(rows[1], "20008004  91908f8e");
+    // A word partly outside memory is unreadable.
+    assert_eq!(stack_rows(&fake, 0x2000_fffe, 1), ["2000fffe  ????????"]);
+    // Rows stop at the top of the address space.
+    assert_eq!(
+        stack_rows(&fake, 0xffff_fff8, 4),
+        ["fffffff8  ????????", "fffffffc  ????????"]
+    );
+    assert!(stack_rows(&fake, 0x2000_8000, 0).is_empty());
+}
+
+#[test]
+fn stacks_tab_sections() {
+    let (h, _dir) = dock_on(FakeBackend::new(), "Stacks");
+    h.get_by_label("sp 0x20008000");
+    h.get_by_label("msp_s 0x30000800");
+    h.get_by_label("msp_ns 0x20093000");
+    h.get_by_label("20008000  8d8c8b8a");
+    h.get_by_label("30000800  ????????");
+    assert_eq!(h.query_all_by_label_contains("  ").count(), 3 * STACK_WORDS);
+}
+
+#[test]
+fn stacks_follow_register_edits() {
+    let mut fake = FakeBackend::new();
+    fake.set_core_reg(13, 0x2000_0010).unwrap();
+    fake.set_banked_reg("msp_ns", 0x2000_0100).unwrap();
+    let (h, _dir) = dock_on(fake, "Stacks");
+    h.get_by_label("sp 0x20000010");
+    h.get_by_label("20000010  13121110");
+    h.get_by_label("msp_ns 0x20000100");
+    h.get_by_label("20000100  08070605");
 }
