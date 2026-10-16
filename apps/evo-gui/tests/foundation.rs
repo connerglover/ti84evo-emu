@@ -614,20 +614,23 @@ fn click_release_lands_at_min_hold() {
 
 #[test]
 fn requests_from_action_and_ui_apply_in_the_same_frame() {
+    // Lane E owns KeyHistory now; this needs an action no built-in feature claims yet
+    // (ReportBug until Lane F lands). Once every action has an owner, the merger must give
+    // this test a durable hook (see the Lane E task E2 report).
     let (mut h, _dir) = request_harness("sameframe", FakeBackend::new(), false);
     h.state_mut().push_feature(Box::new(TestFeature {
-        owns: Some(Action::KeyHistory),
+        owns: Some(Action::ReportBug),
         on_action_push: vec![AppRequest::SetPaused(true)],
         ui_push_compact_once: true,
         ..TestFeature::default()
     }));
-    h.state_mut().run_action(Action::KeyHistory);
+    h.state_mut().run_action(Action::ReportBug);
     assert!(h.state().paused());
     h.step();
     assert!(h.state().compact());
     // The feature took the action: no "not available" toast.
     assert!(
-        h.query_by_label(&not_available(Action::KeyHistory))
+        h.query_by_label(&not_available(Action::ReportBug))
             .is_none()
     );
 }
