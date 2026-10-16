@@ -1561,6 +1561,27 @@ fn run_core(case: &Case, mem: &Memory, batch_steps: Option<usize>) -> State {
     x.ge = case.ge;
     let mut trouble = None;
     if let Some(steps) = batch_steps {
+        // Populate decoded code through real instruction fetches, then reset architectural
+        // inputs without discarding those hints. This makes the second run exercise compact
+        // blocks, rather than comparing two cold runs which both use the fallback executor.
+        let regs = cpu.regs.clone();
+        for _ in 0..steps.min(MAX_STEPS) {
+            if !matches!(cpu.step(&mut bus), StepResult::Executed { .. })
+                || cpu.regs.xpsr.exception != 0
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            &bus.code[..mem.code.len()],
+            &mem.code,
+            "generated stores must stay in RAM"
+        );
+        cpu.regs = regs;
+        cpu.event = false;
+        cpu.exclusive = None;
+        cpu.scs = Default::default();
+        bus.ram[..mem.ram.len()].copy_from_slice(&mem.ram);
         let mut n = 0;
         let end = cpu.run_steps(
             &mut bus,

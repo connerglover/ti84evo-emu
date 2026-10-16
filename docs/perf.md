@@ -2,6 +2,9 @@
 
 The guest CPU runs at 156 MHz, so real time is 156 M emulated cycles per host second.
 
+Latest result: [Round 4](#round-4-compact-decoded-blocks) reaches 160.7–163.0 M cycles/s on
+the never-sleeping benchmark and 164.5 M cycles/s on the OS boot workload.
+
 ## Benchmarks
 
 `crates/evo-core/tests/bench.rs`, ignored by default, release only:
@@ -453,3 +456,48 @@ Experiments discarded in this round: forcing the full executor inline was slower
 up to 16 already-decoded instructions into a local sequential trace was approximately neutral.
 That trace still dispatched every instruction through the large generic executor, so it did
 not remove the remaining dispatch overhead.
+
+## Round 4: compact decoded blocks
+
+The never-sleeping benchmark now reaches the 156 MHz target on the development machine
+(AMD Ryzen 7 5800X3D, Windows, standard MSVC release profile; no native-CPU flags or JIT).
+This is a measured result for `busy_loop`, not a guarantee for every guest program or host.
+
+| Wall-time measurement | Starting build (`f533622`) | Compact blocks |
+|---|---|---|
+| `busy_loop`, three 1-billion-cycle runs | 57.9–58.4 M cycles/s | 160.7–163.0 M cycles/s (103–104%) |
+| `boot_to_self_test`, 390 M cycles | 144.0 M cycles/s | 164.5 M cycles/s (105%) |
+
+Busy runs use `BENCH_CYCLES=1000000000`, `BENCH_REPEAT=1`, three fresh processes; all three
+exceed 156 M cycles/s, with no sleep credit. The median is about 2.8 times the starting build.
+The boot comparison also includes the concurrent USB fixes, which change its awake count
+from 138,149,424 to 138,132,362; the same-build batched/unbatched checkpoint test is the
+correctness comparison. Host contention can still pull throughput below real time.
+
+The quiet interpreter lowers up to 32 already-fetched instructions into a compact, local
+block. It walks that block directly instead of repeating the PC-to-instruction-cache lookup
+and full instruction dispatch. Common unbanked register operations, immediate loads/stores
+and direct branches have dedicated operations. Unsupported operands, IT blocks and system
+instructions use the ordinary executor. Active SysTick counters keep the ordinary step path.
+
+Every instruction still updates the architectural PC, calls the host hook, checks the code
+epoch after that hook, and checks the budget, stop callback and PPB/reset state. A hook or
+store that modifies code forces the current instruction through fetch again, with exactly
+one hook call. Faults and PPB/SAU changes leave the local block before another instruction
+runs. The block is built only from valid decoded cache entries: it never reads future guest
+memory speculatively. Loads/stores share the original attribution, alignment, privilege,
+fault and bus/watchpoint paths.
+
+`ArrayVec` holds the bounded block on the stack. A heap-backed prototype improved busy code
+but regressed the OS boot; sampling showed allocation/free traffic in short MMIO batches.
+Removing those allocations restored boot performance. Cache hits for data attribution are
+inlined while the SAU cache fill stays cold. Checked memory helpers are inlined as well.
+The only new unchecked access is the private compact executor's r0-r12 accessor; every
+register operand is checked when lowering, and no outside code can construct its operations.
+
+Validation: 20,000 generated cases per Unicorn instruction family (80,000 total), comparing
+ordinary execution and warmed compact execution against Unicorn; CPU batch/step equality
+across timer/exception transitions; exact hooks and cycles for hook/guest code mutation;
+SAU attribution changing beneath warmed code; and 17 full-state, UART and screen checkpoints
+through 400 M real-OS cycles. Hardware tests include bus monitors and watchpoints. Crate
+clippy checks pass with warnings denied.

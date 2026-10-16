@@ -23,6 +23,7 @@ enum Request {
     Out { endpoint: u8, bytes: Vec<u8> },
     In { endpoint: u8 },
     Run { cycles: u64 },
+    Key { name: String, pressed: bool },
     Quit {},
 }
 
@@ -60,6 +61,12 @@ fn request(machine: &mut Machine, req: Request) -> Result<Value, String> {
                 return Err(format!("guest stopped: {stop:?}"));
             }
             json!({"cycles": machine.sched.now, "stop": format!("{stop:?}")})
+        }
+        Request::Key { name, pressed } => {
+            let key = evo_core::Key::from_name(&name)
+                .ok_or_else(|| format!("unknown calculator key: {name}"))?;
+            machine.set_key(key, pressed);
+            json!({})
         }
         Request::Quit {} => unreachable!("handled by serve"),
     };
@@ -109,15 +116,20 @@ pub fn main(bundle: &Path, flash: Option<&Path>, provision: bool) -> ExitCode {
         let interrupted = Arc::new(AtomicBool::new(false));
         let signal = interrupted.clone();
         ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))?;
-        let bundle = Bundle::open(bundle)?;
+        let fresh_machine = || -> Result<Machine, Box<dyn std::error::Error>> {
+            Ok(Machine::from_bundle(
+                &Bundle::open(bundle)?,
+                &Layout::EVO_7_1,
+            )?)
+        };
         let mut machine = if let Some(path) = flash {
             let nv = super::run::read_flash_file(path).map_err(|()| "cannot read flash")?;
             match nv {
                 Some(nv) => Machine::from_nv(nv, &Layout::EVO_7_1)?,
-                None => Machine::from_bundle(&bundle, &Layout::EVO_7_1)?,
+                None => fresh_machine()?,
             }
         } else {
-            Machine::from_bundle(&bundle, &Layout::EVO_7_1)?
+            fresh_machine()?
         };
         if provision {
             evo_core::provision(&mut machine)?;

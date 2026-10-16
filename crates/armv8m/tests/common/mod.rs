@@ -1,6 +1,12 @@
 #![allow(dead_code)]
 
 use armv8m::{Access, Bus, BusError, Cpu, StepResult};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+fn code_epoch() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 pub const CODE_BASE: u32 = 0x0000_0000;
 pub const RAM_BASE: u32 = 0x2000_0000;
@@ -10,8 +16,8 @@ const SIZE: u32 = 0x1_0000;
 pub struct FlatBus {
     pub code: Vec<u8>,
     pub ram: Vec<u8>,
-    /// Let the core cache decoded code (`Bus::cache_code`): every bus write starts a new code
-    /// epoch. Direct changes to `code` are not seen, so only tests that never patch code
+    /// Let the core cache decoded code (`Bus::cache_code`): writes to the code window start a
+    /// new code epoch. Direct changes to `code` are not seen, so only tests that never patch code
     /// between steps turn this on.
     pub cache: bool,
     epoch: u64,
@@ -23,7 +29,7 @@ impl FlatBus {
             code: vec![0; SIZE as usize],
             ram: vec![0; SIZE as usize],
             cache: false,
-            epoch: 1,
+            epoch: code_epoch(),
         }
     }
 
@@ -45,7 +51,9 @@ impl FlatBus {
     }
 
     fn write(&mut self, addr: u32, v: u32, n: u32) -> Result<(), BusError> {
-        self.epoch += 1;
+        if addr < SIZE {
+            self.epoch = code_epoch();
+        }
         for i in 0..n {
             *self.slot(addr.wrapping_add(i))? = (v >> (8 * i)) as u8;
         }

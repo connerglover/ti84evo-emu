@@ -9,6 +9,7 @@ license.workspace = true
 difftest = ["dep:unicorn-engine"]
 
 [dependencies]
+arrayvec = "0.7"
 serde.workspace = true
 log.workspace = true
 unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_arm"], optional = true }

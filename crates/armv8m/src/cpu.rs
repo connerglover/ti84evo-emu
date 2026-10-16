@@ -316,6 +316,7 @@ impl Cpu {
     }
 
     /// [`security_of`](Self::security_of) through the attribution cache.
+    #[inline]
     pub(crate) fn attr_of(&mut self, addr: u32) -> Attr {
         let block = addr & !0x1F;
         let index = (addr >> 5) as usize % ATTR_CACHE;
@@ -325,6 +326,11 @@ impl Cpu {
         {
             return ATTRS[(slot & 3) as usize];
         }
+        self.fill_attr(addr, block, index)
+    }
+
+    #[cold]
+    fn fill_attr(&mut self, addr: u32, block: u32, index: usize) -> Attr {
         let attr = self.scs.sau.check(addr, self.idau.get()).attr;
         if self.attr_cache.0.is_empty() {
             self.attr_cache.0 = vec![0; ATTR_CACHE];
@@ -592,54 +598,95 @@ impl Cpu {
             // completion on the normal path, but avoid repeating the idle checks.
             if quiet_run {
                 self.pend_check = false;
-                loop {
+                // Short MMIO batches must not allocate/free a heap block on every run.
+                let mut block = arrayvec::ArrayVec::<crate::fast::Entry, 32>::new();
+                let mut epoch = 0;
+                'quiet: loop {
                     let pc = self.regs.pc;
-                    before(bus, pc, self.regs.sec == Sec::Secure, cycles);
-                    let (n, sleep) = match self.execute_one(bus) {
-                        Exec::Done { cycles, sleep } => (cycles, sleep),
-                        Exec::Bkpt(imm) => {
-                            return RunEnd {
-                                cycles,
-                                last: StepResult::Bkpt(imm),
-                                pc,
-                            };
+                    if !self.regs.xpsr.t || self.regs.xpsr.it != 0 {
+                        block.clear();
+                    } else if epoch != bus.code_epoch() || block.first().is_none_or(|e| e.pc != pc)
+                    {
+                        epoch = bus.code_epoch();
+                        self.lower_block(pc, epoch, &mut block);
+                    }
+                    if !block.is_empty() {
+                        let mut invalidated = false;
+                        // A lowered block cannot change Thumb/IT/security state. Reuse a
+                        // loop back to its first entry; each hook still checks the epoch.
+                        loop {
+                            for &entry in &block {
+                                let pc = entry.pc;
+                                before(bus, pc, self.regs.sec == Sec::Secure, cycles);
+                                let exec = if bus.code_epoch() != epoch {
+                                    // The hook or an earlier store changed code. Run exactly this
+                                    // instruction through fetch again; do not call its hook twice.
+                                    invalidated = true;
+                                    self.execute_one(bus)
+                                } else {
+                                    self.sp_violation = false;
+                                    match entry.execute(self, bus) {
+                                        Flow::Next => Exec::Done {
+                                            cycles: 1,
+                                            sleep: None,
+                                        },
+                                        Flow::Branched => Exec::Done {
+                                            cycles: 2,
+                                            sleep: None,
+                                        },
+                                        Flow::Fault(f) => self.fault(f),
+                                        _ => unreachable!(
+                                            "compact operations cannot sleep or return"
+                                        ),
+                                    }
+                                };
+                                let last = self.finish_quiet(bus, exec);
+                                let StepResult::Executed { cycles: n } = last else {
+                                    return RunEnd { cycles, last, pc };
+                                };
+                                cycles += u64::from(n);
+                                if cycles >= budget
+                                    || stop(bus)
+                                    || self.has_ppb_misses()
+                                    || self.sysreset_requested()
+                                {
+                                    return RunEnd { cycles, last, pc };
+                                }
+                                if self.pend_check {
+                                    break 'quiet;
+                                }
+                                if invalidated {
+                                    break;
+                                }
+                            }
+                            if invalidated || self.regs.pc != block[0].pc {
+                                break;
+                            }
                         }
-                        Exec::Lockup => {
-                            return RunEnd {
-                                cycles,
-                                last: StepResult::Lockup,
-                                pc,
-                            };
-                        }
-                    };
-                    let mut n = n;
-                    let last = if self.pend_check {
-                        self.tick_systick(n);
-                        if self.take_pending(bus) {
-                            n += ENTRY_CYCLES;
-                            self.entry_result(n)
-                        } else {
-                            sleep.map_or(StepResult::Executed { cycles: n }, StepResult::Sleep)
+                        if invalidated {
+                            block.clear();
                         }
                     } else {
-                        sleep.map_or(StepResult::Executed { cycles: n }, StepResult::Sleep)
-                    };
-                    let StepResult::Executed { cycles: n } = last else {
-                        return RunEnd { cycles, last, pc };
-                    };
-                    cycles += u64::from(n);
-                    if cycles >= budget
-                        || stop(bus)
-                        || self.has_ppb_misses()
-                        || self.sysreset_requested()
-                    {
-                        return RunEnd { cycles, last, pc };
-                    }
-                    if self.pend_check {
-                        quiet_run = self.quiet_run_possible();
-                        break;
+                        before(bus, pc, self.regs.sec == Sec::Secure, cycles);
+                        let exec = self.execute_one(bus);
+                        let last = self.finish_quiet(bus, exec);
+                        let StepResult::Executed { cycles: n } = last else {
+                            return RunEnd { cycles, last, pc };
+                        };
+                        cycles += u64::from(n);
+                        if cycles >= budget
+                            || stop(bus)
+                            || self.has_ppb_misses()
+                            || self.sysreset_requested()
+                        {
+                            return RunEnd { cycles, last, pc };
+                        }
+                        if self.pend_check {
+                            break;
+                        }
                     }
                 }
+                quiet_run = self.quiet_run_possible();
                 continue;
             }
             let pc = self.regs.pc;
@@ -658,6 +705,53 @@ impl Cpu {
                 quiet_run = self.quiet_run_possible();
             }
         }
+    }
+
+    /// Lower only instructions previously fetched from side-effect-free cacheable code.
+    /// No speculative reads, and every attribution check is repeated for the block's state.
+    fn lower_block(
+        &self,
+        pc: u32,
+        epoch: u64,
+        block: &mut arrayvec::ArrayVec<crate::fast::Entry, 32>,
+    ) {
+        block.clear();
+        let mut next = pc;
+        while !block.is_full() {
+            let Some(e) = self.icache.get(next, epoch) else {
+                break;
+            };
+            if Self::fetch_security(self.regs.sec, e.attr).is_err()
+                || Self::nsc_entry(self.regs.sec, e.attr, &e.instr).is_err()
+            {
+                break;
+            }
+            let Some(entry) = crate::fast::Entry::lower(e.instr, e.pc, e.len) else {
+                break;
+            };
+            block.push(entry);
+            if entry.ends_block() {
+                break;
+            }
+            next = entry.next;
+        }
+    }
+
+    #[inline(always)]
+    fn finish_quiet(&mut self, bus: &mut impl Bus, exec: Exec) -> StepResult {
+        let (mut cycles, sleep) = match exec {
+            Exec::Done { cycles, sleep } => (cycles, sleep),
+            Exec::Bkpt(imm) => return StepResult::Bkpt(imm),
+            Exec::Lockup => return StepResult::Lockup,
+        };
+        if self.pend_check {
+            self.tick_systick(cycles);
+            if self.take_pending(bus) {
+                cycles += ENTRY_CYCLES;
+                return self.entry_result(cycles);
+            }
+        }
+        sleep.map_or(StepResult::Executed { cycles }, StepResult::Sleep)
     }
 
     fn quiet_run_possible(&mut self) -> bool {
@@ -817,7 +911,12 @@ mod tests {
     use super::*;
 
     /// A flat RAM bus at address 0 that lets the core cache all of it.
-    struct Ram(Vec<u8>);
+    struct Ram(Vec<u8>, u64);
+
+    fn test_epoch() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
 
     impl Bus for Ram {
         fn read8(&mut self, addr: u32, _a: Access) -> Result<u8, crate::bus::BusError> {
@@ -832,21 +931,24 @@ mod tests {
             Ok(u32::from_le_bytes(self.0[a..a + 4].try_into().unwrap()))
         }
         fn write8(&mut self, addr: u32, v: u8, _a: Access) -> Result<(), crate::bus::BusError> {
+            self.1 = test_epoch();
             self.0[addr as usize] = v;
             Ok(())
         }
         fn write16(&mut self, addr: u32, v: u16, _a: Access) -> Result<(), crate::bus::BusError> {
+            self.1 = test_epoch();
             let a = addr as usize;
             self.0[a..a + 2].copy_from_slice(&v.to_le_bytes());
             Ok(())
         }
         fn write32(&mut self, addr: u32, v: u32, _a: Access) -> Result<(), crate::bus::BusError> {
+            self.1 = test_epoch();
             let a = addr as usize;
             self.0[a..a + 4].copy_from_slice(&v.to_le_bytes());
             Ok(())
         }
         fn code_epoch(&self) -> u64 {
-            1
+            self.1
         }
         fn cache_code(&mut self, _addr: u32, _len: u32) -> bool {
             true
@@ -855,7 +957,7 @@ mod tests {
 
     /// A CPU that has run a few `movs r0, #1` from address 0x100 (vector table at 0).
     fn warm_cpu() -> (Cpu, Ram) {
-        let mut ram = Ram(vec![0; 0x1000]);
+        let mut ram = Ram(vec![0; 0x1000], test_epoch());
         ram.0[0..4].copy_from_slice(&0x800u32.to_le_bytes());
         ram.0[4..8].copy_from_slice(&0x101u32.to_le_bytes());
         for i in 0..8 {
@@ -902,7 +1004,7 @@ mod tests {
 
     /// A RAM image whose reset handler at 0x100 runs `code`.
     fn program(code: &[u16]) -> (Cpu, Ram) {
-        let mut ram = Ram(vec![0; 0x1000]);
+        let mut ram = Ram(vec![0; 0x1000], test_epoch());
         ram.0[0..4].copy_from_slice(&0x800u32.to_le_bytes());
         ram.0[4..8].copy_from_slice(&0x101u32.to_le_bytes());
         for (i, hw) in code.iter().enumerate() {
@@ -988,6 +1090,7 @@ mod tests {
             (&[0x6008, 0x3001, 0xE7FD], 0xE000_E100, 1), // enable pending IRQ0
             (&[0x6008, 0x3001, 0xE7FD], 0xE000_ED04, 1 << 28), // pend PendSV
             (&[0x6008, 0x3001, 0xE7FD], 0xE000_ED0C, 0x05FA_0004), // system reset
+            (&[0x6008, 0x3001, 0xE7FD], 0xE000_EDD0, 1), // enable SAU: code becomes NS
             (&[0xDF00, 0x3001, 0xE7FD], 0, 0),           // SVC then exception return
             (&[0xDE00], 0, 0),                           // UsageFault escalated to HardFault
             (&[0xBF08, 0x3001, 0xBF30], 0, 0),           // IT, suppressed flags, WFI
@@ -998,13 +1101,18 @@ mod tests {
             a.regs.r[1] = addr;
             a.scs.systick.s.rvr = 3;
             a.scs.nvic.set_pending(0, true);
+            a.ppb_write32(0xE000_EDD8, 0x100);
+            a.ppb_write32(0xE000_EDDC, 0x121);
             // The handlers return to the interrupted instruction stream.
             for vector in [3, 6, 11, 14, 15, 16] {
                 ram_a.0[vector * 4..vector * 4 + 4].copy_from_slice(&0x201u32.to_le_bytes());
             }
             ram_a.0[0x200..0x202].copy_from_slice(&0x4770u16.to_le_bytes());
+            for i in 0..code.len() {
+                let _ = a.fetch(&mut ram_a, 0x100 + 2 * i as u32);
+            }
             let mut b = a.clone();
-            let mut ram_b = Ram(ram_a.0.clone());
+            let mut ram_b = Ram(ram_a.0.clone(), test_epoch());
             let mut seen = Vec::new();
             let mut count = 0;
             let end = a.run_steps(
@@ -1036,6 +1144,48 @@ mod tests {
             assert_eq!(seen, expected, "every hook sees the same PC and cycle");
             assert_eq!(a, b);
             assert_eq!(ram_a.0, ram_b.0);
+        }
+    }
+
+    #[test]
+    fn compact_blocks_refetch_code_changed_by_a_hook_or_store() {
+        for guest_store in [false, true] {
+            let code = if guest_store {
+                [0x8008, 0x3201, 0xE7FC]
+            } else {
+                [0x3201, 0x3201, 0xE7FC]
+            };
+            let (mut cpu, mut ram) = program(&code);
+            cpu.regs.r[0] = 0x3209;
+            cpu.regs.r[1] = 0x102;
+            for i in 0..3 {
+                cpu.fetch(&mut ram, 0x100 + 2 * i).unwrap();
+            }
+            let mut seen = Vec::new();
+            let end = cpu.run_steps(
+                &mut ram,
+                3,
+                |bus, pc, secure, elapsed| {
+                    seen.push((pc, secure, elapsed));
+                    if !guest_store && elapsed == 1 {
+                        bus.write16(
+                            0x102,
+                            0x3209,
+                            Access {
+                                kind: AccessKind::Write,
+                                secure: true,
+                                privileged: true,
+                            },
+                        )
+                        .unwrap();
+                    }
+                },
+                |_| false,
+            );
+            assert_eq!(cpu.regs.r[2], if guest_store { 9 } else { 10 });
+            assert_eq!(seen, [(0x100, true, 0), (0x102, true, 1), (0x104, true, 2)]);
+            assert_eq!(end.cycles, 4);
+            assert_eq!(cpu.regs.pc, 0x100);
         }
     }
 }

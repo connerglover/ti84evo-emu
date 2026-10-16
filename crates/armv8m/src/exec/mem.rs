@@ -69,6 +69,7 @@ fn read(cpu: &mut Cpu, bus: &mut impl Bus, addr: u32, size: MemSize) -> Result<u
     read_as(cpu, acc, bus, addr, size)
 }
 
+#[inline(always)]
 fn read_as(
     cpu: &mut Cpu,
     acc: Access,
@@ -120,6 +121,7 @@ fn write(
     write_as(cpu, acc, bus, addr, v, size)
 }
 
+#[inline(always)]
 fn write_as(
     cpu: &mut Cpu,
     acc: Access,
@@ -162,6 +164,30 @@ fn extend(v: u32, size: MemSize, signed: bool) -> u32 {
         (MemSize::Half, true) => v as u16 as i16 as i32 as u32,
         _ => v,
     }
+}
+
+#[inline(always)]
+pub(crate) fn simple_read(
+    cpu: &mut Cpu,
+    bus: &mut impl Bus,
+    addr: u32,
+    size: MemSize,
+    signed: bool,
+) -> Result<u32, Flow> {
+    read(cpu, bus, addr, size)
+        .map(|v| extend(v, size, signed))
+        .map_err(fault)
+}
+
+#[inline(always)]
+pub(crate) fn simple_write(
+    cpu: &mut Cpu,
+    bus: &mut impl Bus,
+    addr: u32,
+    value: u32,
+    size: MemSize,
+) -> Result<(), Flow> {
+    write(cpu, bus, addr, value, size).map_err(fault)
 }
 
 /// Write a loaded value; a PC destination is a `LoadWritePC` interworking branch.

@@ -7,6 +7,7 @@ pub mod decode;
 pub mod disasm;
 mod exception;
 mod exec;
+mod fast;
 pub mod instr;
 pub mod regs;
 pub mod scs;

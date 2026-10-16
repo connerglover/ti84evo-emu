@@ -6,6 +6,8 @@ mod dsp;
 mod mem;
 mod sys;
 
+pub(crate) use mem::{simple_read, simple_write};
+
 use crate::bus::Bus;
 use crate::cpu::{Cpu, SleepKind};
 use crate::exception::Fault;

@@ -215,7 +215,7 @@ impl MemoryMap {
     /// The bytes of a RAM/ROM access of `width` bytes at `addr` that lies inside one whole
     /// page of the page table (and, for `write`, not in ROM); `None` sends it down the
     /// general path.
-    #[inline]
+    #[inline(always)]
     fn page_bytes(&mut self, addr: u32, width: u32, write: bool) -> Option<&mut [u8]> {
         let page = self.pages.get((addr >> PAGE_BITS) as usize)?.0;
         let in_page = addr & (PAGE_SIZE - 1);
