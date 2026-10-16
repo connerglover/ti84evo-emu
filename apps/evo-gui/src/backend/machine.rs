@@ -140,7 +140,7 @@ struct Board {
     charger_line: bool,
     /// GPIO 11 level.
     battery_ok: bool,
-    /// USB-C CC1 attached.
+    /// USB-C attached in either orientation.
     usb_attached: bool,
 }
 
@@ -164,7 +164,7 @@ impl Board {
         }
     }
 
-    /// The conditions `m` has now: the levels of pins 9 and 11, and whether CC1 is attached.
+    /// The conditions `m` has now: the levels of pins 9 and 11, and whether either CC is attached.
     /// A device that `m` does not have keeps the value in `self`.
     fn read(self, m: &Machine) -> Self {
         let gpio = m.bus.device::<Gpio>("gpio");
@@ -172,7 +172,7 @@ impl Board {
         Self {
             charger_line: gpio.map_or(self.charger_line, |g| g.pin_level(PIN_CHARGER)),
             battery_ok: gpio.map_or(self.battery_ok, |g| g.pin_level(PIN_BATTERY)),
-            usb_attached: usb.map_or(self.usb_attached, |u| u.cc().0 != 0),
+            usb_attached: usb.map_or(self.usb_attached, |u| u.cc() != (0, 0)),
         }
     }
 }

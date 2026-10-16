@@ -915,6 +915,28 @@ fn load_state_is_a_pure_restore_and_the_panel_follows_it() {
 }
 
 #[test]
+fn loaded_usb_attachment_recognizes_either_cable_orientation() {
+    let bytes = bundle_bytes(&keypad_reader(0xC01C));
+    let bundle = evo_image::Bundle::from_bytes(&bytes).unwrap();
+    let mut machine = evo_core::Machine::from_bundle(&bundle, &evo_image::Layout::EVO_7_1).unwrap();
+    let mut b = backend(&keypad_reader(0xC01C));
+
+    for (cc1, cc2, attached) in [(3, 0, true), (0, 2, true), (0, 0, false)] {
+        machine.set_usb_cc(cc1, cc2);
+        b.load_state(&machine.save_state()).unwrap();
+        assert_eq!(b.hardware().usb_attached, attached, "CC=({cc1},{cc2})");
+        b.run_for(1000);
+        assert_eq!(b.cpu().core[0] >> 8 & 0xF, u32::from(cc1 | cc2 << 2));
+        b.reset();
+        assert_eq!(
+            b.hardware().usb_attached,
+            attached,
+            "reset CC=({cc1},{cc2})"
+        );
+    }
+}
+
+#[test]
 fn rtc_set_reads_back() {
     let mut b = backend(&COUNTER);
     let t = 12 * 3600 + 34 * 60 + 56;
