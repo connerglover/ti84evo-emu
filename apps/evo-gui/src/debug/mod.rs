@@ -1,17 +1,33 @@
-//! The debug panels: run controls, then one tab of registers, disassembly,
-//! memory, UART output or unmapped accesses.
+//! The debug dock: the run row (continue/pause, step, step over, step out), then one tab
+//! of [`DebugTab::ALL`]. Only the selected tab is drawn, so hidden tabs make no backend
+//! calls.
 
+mod breakpoints;
+mod busmon;
+mod console;
+mod control;
 mod disasm;
 mod memory;
+mod peripherals;
 mod regs;
+mod search;
+mod stacks;
 mod uart;
 mod unmapped;
+mod visualizer;
+mod watchpoints;
 
 use egui::{Button, ScrollArea, Sense};
 
+pub use busmon::{BUS_SHOWN, bus_line};
+pub use control::cycle_text;
 pub use disasm::{DISASM_LINES, format_disasm};
-pub use memory::DEFAULT_MEM_ADDR;
+pub use memory::{DEFAULT_MEM_ADDR, MAX_VIEWS};
+pub use search::{SEARCH_CHUNK, SEARCH_CHUNKS_PER_FRAME, Search, find, parse_pattern};
+pub use stacks::{STACK_WORDS, stack_rows};
 pub use uart::{UART_CAP, UartConsole};
+pub use visualizer::{DEFAULT_VIS_ADDR, PixelFormat, VIS_MAX, parse_size, render};
+pub use watchpoints::watch_text;
 
 use crate::backend::{EmuBackend, Goal, UartId};
 use crate::logbuf::LOG_CAP;
@@ -39,34 +55,70 @@ pub fn parse_addr(s: &str) -> Option<u32> {
     u32::from_str_radix(&digits, 16).ok()
 }
 
-/// The debug panel's tabs.
+/// Parses a register value: hex by the [`parse_addr`] rules, or decimal after a
+/// leading `#` (`#10` is 10; `_` separators are ignored, nothing may sit between `#`
+/// and the digits). `None` for anything else, including values above `u32::MAX`.
+pub fn parse_value(s: &str) -> Option<u32> {
+    let s = s.trim();
+    let Some(dec) = s.strip_prefix('#') else {
+        return parse_addr(s);
+    };
+    let digits: String = dec.chars().filter(|&c| c != '_').collect();
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The debug dock's tabs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DebugTab {
+    Control,
     #[default]
     Registers,
     Disassembly,
     Memory,
-    Uart,
+    Visualizer,
+    Breakpoints,
+    Watchpoints,
+    Peripherals,
+    BusMonitor,
+    Stacks,
+    Console,
     Unmapped,
 }
 
 impl DebugTab {
     /// Every tab, in selector order.
-    pub const ALL: [DebugTab; 5] = [
+    pub const ALL: [DebugTab; 12] = [
+        DebugTab::Control,
         DebugTab::Registers,
         DebugTab::Disassembly,
         DebugTab::Memory,
-        DebugTab::Uart,
+        DebugTab::Visualizer,
+        DebugTab::Breakpoints,
+        DebugTab::Watchpoints,
+        DebugTab::Peripherals,
+        DebugTab::BusMonitor,
+        DebugTab::Stacks,
+        DebugTab::Console,
         DebugTab::Unmapped,
     ];
 
     /// The selector label.
     pub fn label(self) -> &'static str {
         match self {
+            DebugTab::Control => "Control",
             DebugTab::Registers => "Registers",
             DebugTab::Disassembly => "Disassembly",
             DebugTab::Memory => "Memory",
-            DebugTab::Uart => "UART",
+            DebugTab::Visualizer => "Visualizer",
+            DebugTab::Breakpoints => "Breakpoints",
+            DebugTab::Watchpoints => "Watchpoints",
+            DebugTab::Peripherals => "Peripherals",
+            DebugTab::BusMonitor => "Bus monitor",
+            DebugTab::Stacks => "Stacks",
+            DebugTab::Console => "Console",
             DebugTab::Unmapped => "Unmapped",
         }
     }
@@ -80,6 +132,8 @@ pub struct DebugOutput {
     /// `Step` was clicked (only possible while paused).
     pub step: bool,
     /// A debugger goal to start (only while paused): the app calls `begin_goal`.
+    /// "Step over", "Step out", the Control tab's "Run" and the Disassembly tab's
+    /// "Run to here" set it.
     pub goal: Option<Goal>,
     /// Errors to show as Error toasts.
     pub notes: Vec<String>,
@@ -89,8 +143,15 @@ pub struct DebugOutput {
 #[derive(Clone, Debug, Default)]
 pub struct DebugPanel {
     tab: DebugTab,
+    control: control::ControlState,
+    regs: regs::RegsState,
     disasm: disasm::DisasmState,
     memory: memory::MemoryState,
+    visualizer: visualizer::VisualizerState,
+    breakpoints: breakpoints::BreakpointsState,
+    watchpoints: watchpoints::WatchpointsState,
+    busmon: busmon::BusState,
+    console: console::ConsoleState,
     uart: UartConsole,
     uart2: UartConsole,
     /// The newest log lines, at most [`LOG_CAP`].
@@ -150,10 +211,17 @@ impl DebugPanel {
         paused: bool,
     ) -> DebugOutput {
         let mut out = DebugOutput::default();
-        ui.horizontal(|ui| {
+        // Wraps in a narrow dock instead of pushing the panel past its width cap.
+        ui.horizontal_wrapped(|ui| {
             let run = if paused { "Continue" } else { "Pause" };
             out.toggle_pause = button(ui, true, Button::new(run));
             out.step = button(ui, paused, Button::new("Step"));
+            if button(ui, paused, Button::new("Step over")) {
+                out.goal = Some(Goal::StepOver);
+            }
+            if button(ui, paused, Button::new("Step out")) {
+                out.goal = Some(Goal::StepOut);
+            }
         });
         ui.horizontal_wrapped(|ui| {
             for tab in DebugTab::ALL {
@@ -164,18 +232,47 @@ impl DebugPanel {
         });
         ui.separator();
         match self.tab {
+            DebugTab::Control => {
+                if let Some(goal) = control::show(ui, &mut self.control, backend, paused) {
+                    out.goal = Some(goal);
+                }
+            }
             DebugTab::Registers => {
                 // Scrolls instead of widening the panel past its cap.
-                let cpu = backend.cpu();
                 ScrollArea::both()
                     .id_salt("evo-regs-scroll")
                     .auto_shrink([false, false])
-                    .show(ui, |ui| regs::show(ui, &cpu));
+                    .show(ui, |ui| {
+                        regs::show(ui, &mut self.regs, backend, paused, &mut out.notes);
+                    });
             }
-            DebugTab::Disassembly => disasm::show(ui, &mut self.disasm, backend),
-            DebugTab::Memory => memory::show(ui, &mut self.memory, backend),
-            DebugTab::Uart => uart::show(ui, &mut self.uart),
+            DebugTab::Disassembly => {
+                if let Some(goal) = disasm::show(ui, &mut self.disasm, backend, paused) {
+                    out.goal = Some(goal);
+                }
+            }
+            DebugTab::Memory => {
+                memory::show(ui, &mut self.memory, backend, paused, &mut out.notes);
+            }
+            DebugTab::Console => {
+                let src = console::Sources {
+                    uart0: &mut self.uart,
+                    uart2: &mut self.uart2,
+                    log: &mut self.log,
+                };
+                console::show(ui, &mut self.console, src, backend);
+            }
             DebugTab::Unmapped => unmapped::show(ui, &backend.unmapped()),
+            DebugTab::Visualizer => visualizer::show(ui, &mut self.visualizer, backend),
+            DebugTab::Breakpoints => {
+                breakpoints::show(ui, &mut self.breakpoints, backend, paused);
+            }
+            DebugTab::Watchpoints => {
+                watchpoints::show(ui, &mut self.watchpoints, backend, paused, &mut out.notes);
+            }
+            DebugTab::Peripherals => peripherals::show(ui, backend),
+            DebugTab::BusMonitor => busmon::show(ui, &mut self.busmon, backend),
+            DebugTab::Stacks => stacks::show(ui, backend),
         }
         out
     }

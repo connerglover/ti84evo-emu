@@ -8,6 +8,10 @@ fn constants() {
     assert_eq!(UART_CAP, 256 * 1024);
     assert_eq!(DEBUG_W, 420.0);
     assert_eq!(DebugTab::default(), DebugTab::Registers);
+    assert_eq!(DebugTab::ALL.len(), 12);
+    assert_eq!(DebugTab::ALL[0], DebugTab::Control);
+    assert_eq!(DebugTab::Console.label(), "Console");
+    assert_eq!(DebugTab::BusMonitor.label(), "Bus monitor");
 }
 
 #[test]

@@ -683,7 +683,20 @@ fn debug_toggle_shows_registers() {
     h.get_by_label("Thread");
     h.get_by_label("msp_ns");
     h.get_by_label("0x20093000");
-    for tab in ["Registers", "Disassembly", "Memory", "UART", "Unmapped"] {
+    for tab in [
+        "Control",
+        "Registers",
+        "Disassembly",
+        "Memory",
+        "Visualizer",
+        "Breakpoints",
+        "Watchpoints",
+        "Peripherals",
+        "Bus monitor",
+        "Stacks",
+        "Console",
+        "Unmapped",
+    ] {
         h.get_by_label(tab);
     }
     click(&mut h, "Debug panels");
@@ -711,13 +724,20 @@ fn debug_keeps_calculator_usable() {
     assert_eq!(probe.key_log(), [(KeyId::Enter, true)]);
 }
 
+/// The first memory view's address field: the Memory tab draws its Find field first.
+fn memory_address_field<'a>(h: &'a Harness<'static, EvoApp>) -> egui_kittest::Node<'a> {
+    h.get_all_by_role(egui::accesskit::Role::TextInput)
+        .nth(1)
+        .expect("memory address field")
+}
+
 #[test]
 fn typing_in_memory_address_does_not_press_keys() {
     let fake = FakeBackend::new();
     let probe = fake.probe();
     let mut h = debug_harness(fake);
     click(&mut h, "Memory");
-    h.get_by_role(egui::accesskit::Role::TextInput).click();
+    memory_address_field(&h).click();
     h.run_steps(2);
     h.key_down(Key::Num5);
     h.key_up(Key::Num5);
@@ -740,22 +760,21 @@ fn memory_tab_shows_hex_dump() {
 fn memory_tab_shows_unreadable_bytes() {
     let mut h = debug_harness(FakeBackend::new());
     click(&mut h, "Memory");
-    h.get_by_role(egui::accesskit::Role::TextInput).click();
+    memory_address_field(&h).click();
     h.run_steps(2);
     h.key_press_modifiers(egui::Modifiers::COMMAND, Key::A);
     h.run_steps(1);
-    h.get_by_role(egui::accesskit::Role::TextInput)
-        .type_text("0x1fff_fff8");
+    memory_address_field(&h).type_text("0x1fff_fff8");
     h.run_steps(3);
     h.get_by_label("1ffffff8  ?? ?? ?? ?? ?? ?? ?? ?? 00 01 02 03 04 05 06 07  |................|");
 }
 
 #[test]
-fn uart_tab_shows_output() {
+fn console_tab_shows_uart_output() {
     let mut fake = FakeBackend::new();
     fake.run_for(100_000_000);
     let mut h = debug_harness(fake);
-    click(&mut h, "UART");
+    click(&mut h, "Console");
     h.get_by_label_contains("fake: 100 Mcycles");
     click(&mut h, "Clear");
     assert!(h.query_by_label_contains("fake: 100 Mcycles").is_none());

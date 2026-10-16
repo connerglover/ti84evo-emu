@@ -1,6 +1,4 @@
-//! The UART tab: a bounded text console over the guest's serial output.
-
-use egui::{RichText, ScrollArea, Sense};
+//! A bounded text console over a UART's output; the Console tab shows it.
 
 /// The most bytes of text the console keeps.
 pub const UART_CAP: usize = 256 * 1024;
@@ -64,22 +62,4 @@ impl UartConsole {
         self.text.clear();
         self.pending.clear();
     }
-}
-
-/// The UART tab body.
-pub(super) fn show(ui: &mut egui::Ui, console: &mut UartConsole) {
-    if ui
-        .add(egui::Button::new("Clear").sense(Sense::CLICK))
-        .clicked()
-    {
-        console.clear();
-    }
-    ui.separator();
-    ScrollArea::vertical()
-        .id_salt("evo-uart")
-        .auto_shrink([false, false])
-        .stick_to_bottom(true)
-        .show(ui, |ui| {
-            ui.label(RichText::new(console.text()).monospace());
-        });
 }
