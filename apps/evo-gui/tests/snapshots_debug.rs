@@ -196,3 +196,22 @@ fn snapshot_debug_stacks() {
     let mut h = dock_on("Stacks");
     h.snapshot("debug_stacks");
 }
+
+#[test]
+#[cfg_attr(
+    not(feature = "snapshots"),
+    ignore = "golden images: cargo test -p evo-gui --features snapshots"
+)]
+fn snapshot_debug_console() {
+    let _gpu = gpu_lock();
+    let mut h = dock_on("Console");
+    // Two fake UART lines and an echoed input line.
+    h.state_mut().backend_mut().run_for(200_000_000);
+    h.state_mut()
+        .backend_mut()
+        .send_uart(evo_gui::backend::UartId::Uart0, b"hello\r\n");
+    h.run_steps(3);
+    h.hover_at(egui::pos2(300.0, 950.0));
+    h.run_steps(10);
+    h.snapshot("debug_console");
+}

@@ -1,6 +1,7 @@
 //! The debug dock: tab registry, run row, the Control tab, register editing, the
 //! Memory tab (views, editing, search), the Visualizer, the Breakpoints and Watchpoints
-//! tabs and the Peripherals, Bus monitor and Stacks tabs, on `FakeBackend`.
+//! tabs, the Peripherals, Bus monitor and Stacks tabs, the Console and run to cursor, on
+//! `FakeBackend`.
 
 mod common;
 
@@ -11,7 +12,9 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use evo_gui::app::{AppOptions, EvoApp};
 use evo_gui::backend::fake::FakeBackend;
-use evo_gui::backend::{AccessDir, BusRecord, EmuBackend, Goal, RunStatus, WatchKinds, Watchpoint};
+use evo_gui::backend::{
+    AccessDir, BusRecord, EmuBackend, Goal, RunStatus, UartId, WatchKinds, Watchpoint,
+};
 use evo_gui::debug::{
     BUS_SHOWN, DebugTab, MAX_VIEWS, PixelFormat, SEARCH_CHUNK, SEARCH_CHUNKS_PER_FRAME,
     STACK_WORDS, Search, VIS_MAX, bus_line, cycle_text, find, parse_pattern, parse_size,
@@ -1346,4 +1349,164 @@ fn stacks_follow_register_edits() {
     h.get_by_label("20000010  13121110");
     h.get_by_label("msp_ns 0x20000100");
     h.get_by_label("20000100  08070605");
+}
+
+#[test]
+fn console_shows_uart0_by_default() {
+    let mut fake = FakeBackend::new();
+    fake.run_for(100_000_000);
+    let (h, _dir) = dock_on(fake, "Console");
+    for label in ["UART0", "UART2", "Log", "Clear", "Send"] {
+        h.get_by_label(label);
+    }
+    h.get_by_label_contains("fake: 100 Mcycles");
+}
+
+#[test]
+fn console_sends_line_with_cr() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = dock_on(fake, "Console");
+    set_field(&mut h, 0, "hi");
+    click(&mut h, "Send");
+    assert_eq!(probe.uart_sent(), [(UartId::Uart0, b"hi\r".to_vec())]);
+    // The fake echoes what it receives; the console drops the `\r`.
+    h.get_by_label("hi");
+    assert_eq!(h.state().debug().console(UartId::Uart0).text(), "hi");
+    // The field is cleared.
+    let field = h.get_by_role(Role::TextInput);
+    assert_eq!(field.value().as_deref().unwrap_or(""), "");
+}
+
+#[test]
+fn console_enter_sends_and_keeps_keys_from_calculator() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = dock_on(fake, "Console");
+    set_field(&mut h, 0, "ab");
+    press(&mut h, Key::Enter);
+    assert_eq!(probe.uart_sent(), [(UartId::Uart0, b"ab\r".to_vec())]);
+    assert!(probe.key_log().is_empty(), "{:?}", probe.key_log());
+    // The field keeps focus, so a second line goes out the same way.
+    h.get_by_role(Role::TextInput).type_text("cd");
+    h.run_steps(2);
+    press(&mut h, Key::Enter);
+    assert_eq!(
+        probe.uart_sent(),
+        [
+            (UartId::Uart0, b"ab\r".to_vec()),
+            (UartId::Uart0, b"cd\r".to_vec())
+        ]
+    );
+    assert!(probe.key_log().is_empty(), "{:?}", probe.key_log());
+}
+
+#[test]
+fn console_empty_line_sends_cr() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = dock_on(fake, "Console");
+    click(&mut h, "Send");
+    assert_eq!(probe.uart_sent(), [(UartId::Uart0, b"\r".to_vec())]);
+}
+
+#[test]
+fn console_uart2_and_log_sources() {
+    let mut fake = FakeBackend::new();
+    fake.run_for(100_000_000);
+    fake.send_uart(UartId::Uart2, b"two\r\n");
+    let probe = fake.probe();
+    let (mut h, _dir) = dock_on(fake, "Console");
+    click(&mut h, "UART2");
+    h.get_by_label_contains("two");
+    assert!(h.query_by_label_contains("fake: 100 Mcycles").is_none());
+    set_field(&mut h, 0, "x");
+    click(&mut h, "Send");
+    assert_eq!(
+        probe.uart_sent().last(),
+        Some(&(UartId::Uart2, b"x\r".to_vec()))
+    );
+    assert_eq!(h.state().debug().console(UartId::Uart2).text(), "two\nx");
+    h.get_by_label("two\nx");
+
+    click(&mut h, "Log");
+    assert!(h.query_by_label_contains("two").is_none());
+    // The Log source has no input line.
+    assert!(h.query_by_role(Role::TextInput).is_none());
+    assert!(h.query_by_label("Send").is_none());
+    // The log ring is global to the test process and every running app drains it, so
+    // record until this app's console has the line.
+    let line = "INFO debug_dock: console log line";
+    for _ in 0..200 {
+        if h.state().debug().log_lines().iter().any(|l| l == line) {
+            break;
+        }
+        evo_gui::logbuf::record(line.to_owned());
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+    h.get_by_label_contains(line);
+    click(&mut h, "UART0");
+    h.get_by_label_contains("fake: 100 Mcycles");
+    assert!(h.query_by_label_contains(line).is_none());
+}
+
+#[test]
+fn console_clear_clears_the_shown_source() {
+    let mut fake = FakeBackend::new();
+    fake.run_for(100_000_000);
+    fake.send_uart(UartId::Uart2, b"two");
+    let (mut h, _dir) = dock_on(fake, "Console");
+    click(&mut h, "UART2");
+    click(&mut h, "Clear");
+    assert_eq!(h.state().debug().console(UartId::Uart2).text(), "");
+    assert_eq!(
+        h.state().debug().console(UartId::Uart0).text(),
+        "fake: 100 Mcycles\n"
+    );
+    click(&mut h, "UART0");
+    click(&mut h, "Clear");
+    assert_eq!(h.state().debug().console(UartId::Uart0).text(), "");
+}
+
+/// Opens the Disassembly tab and the context menu of the first line containing `addr`.
+fn disasm_menu(h: &mut Harness<'static, EvoApp>, addr: &str) {
+    click(h, "Disassembly");
+    h.get_all_by_label_contains(addr)
+        .next()
+        .expect("disassembly line")
+        .click_secondary();
+    h.run_steps(3);
+}
+
+#[test]
+fn run_to_here_from_disassembly() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = dock(fake);
+    disasm_menu(&mut h, "10000202");
+    h.get_by_label("Run to here").click();
+    h.run_steps(1);
+    assert_eq!(probe.goals(), [Goal::RunTo(0x1000_0202)]);
+    // A secondary click toggles no breakpoint.
+    assert!(h.state().backend().breakpoints().is_empty());
+    h.run_steps(3);
+    h.get_by_label("Stopped at 0x10000202");
+    assert!(h.state().paused());
+}
+
+#[test]
+fn run_to_here_only_while_paused() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = dock(fake);
+    click(&mut h, "Continue");
+    disasm_menu(&mut h, "10000202");
+    // The menu item is there but disabled.
+    let item = h.get_by_label("Run to here");
+    assert!(item.accesskit_node().is_disabled());
+    item.click();
+    h.run_steps(3);
+    assert!(probe.goals().is_empty());
+    assert!(!h.state().paused());
 }

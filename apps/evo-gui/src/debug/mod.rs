@@ -4,6 +4,7 @@
 
 mod breakpoints;
 mod busmon;
+mod console;
 mod control;
 mod disasm;
 mod memory;
@@ -131,7 +132,8 @@ pub struct DebugOutput {
     /// `Step` was clicked (only possible while paused).
     pub step: bool,
     /// A debugger goal to start (only while paused): the app calls `begin_goal`.
-    /// "Step over", "Step out" and the Control tab's "Run" set it.
+    /// "Step over", "Step out", the Control tab's "Run" and the Disassembly tab's
+    /// "Run to here" set it.
     pub goal: Option<Goal>,
     /// Errors to show as Error toasts.
     pub notes: Vec<String>,
@@ -149,6 +151,7 @@ pub struct DebugPanel {
     breakpoints: breakpoints::BreakpointsState,
     watchpoints: watchpoints::WatchpointsState,
     busmon: busmon::BusState,
+    console: console::ConsoleState,
     uart: UartConsole,
     uart2: UartConsole,
     /// The newest log lines, at most [`LOG_CAP`].
@@ -243,11 +246,22 @@ impl DebugPanel {
                         regs::show(ui, &mut self.regs, backend, paused, &mut out.notes);
                     });
             }
-            DebugTab::Disassembly => disasm::show(ui, &mut self.disasm, backend),
+            DebugTab::Disassembly => {
+                if let Some(goal) = disasm::show(ui, &mut self.disasm, backend, paused) {
+                    out.goal = Some(goal);
+                }
+            }
             DebugTab::Memory => {
                 memory::show(ui, &mut self.memory, backend, paused, &mut out.notes);
             }
-            DebugTab::Console => uart::show(ui, &mut self.uart),
+            DebugTab::Console => {
+                let src = console::Sources {
+                    uart0: &mut self.uart,
+                    uart2: &mut self.uart2,
+                    log: &mut self.log,
+                };
+                console::show(ui, &mut self.console, src, backend);
+            }
             DebugTab::Unmapped => unmapped::show(ui, &backend.unmapped()),
             DebugTab::Visualizer => visualizer::show(ui, &mut self.visualizer, backend),
             DebugTab::Breakpoints => {

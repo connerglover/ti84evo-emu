@@ -2,8 +2,8 @@
 
 use egui::{Button, RichText, ScrollArea, Sense, TextEdit};
 
-use super::parse_addr;
-use crate::backend::{DisasmLine, EmuBackend};
+use super::{button, parse_addr};
+use crate::backend::{DisasmLine, EmuBackend, Goal};
 
 /// How many lines the tab shows.
 pub const DISASM_LINES: usize = 32;
@@ -41,8 +41,14 @@ impl Default for DisasmState {
     }
 }
 
-/// The Disassembly tab body. Clicking a line toggles a breakpoint there.
-pub(super) fn show(ui: &mut egui::Ui, st: &mut DisasmState, backend: &mut dyn EmuBackend) {
+/// The Disassembly tab body. Clicking a line toggles a breakpoint there; its context menu's
+/// "Run to here" returns a [`Goal::RunTo`] that line (enabled only while paused).
+pub(super) fn show(
+    ui: &mut egui::Ui,
+    st: &mut DisasmState,
+    backend: &mut dyn EmuBackend,
+    paused: bool,
+) -> Option<Goal> {
     let pc = backend.cpu().core[15];
     ui.horizontal_wrapped(|ui| {
         ui.checkbox(&mut st.follow_pc, "Follow PC");
@@ -63,6 +69,7 @@ pub(super) fn show(ui: &mut egui::Ui, st: &mut DisasmState, backend: &mut dyn Em
     let lines = backend.disasm(start, DISASM_LINES);
     let bps = backend.breakpoints();
     let mut toggle = None;
+    let mut goal = None;
     ui.separator();
     ScrollArea::both()
         .id_salt("evo-disasm")
@@ -78,9 +85,16 @@ pub(super) fn show(ui: &mut egui::Ui, st: &mut DisasmState, backend: &mut dyn Em
                 if resp.clicked() {
                     toggle = Some(l.addr);
                 }
+                resp.context_menu(|ui| {
+                    if button(ui, paused, Button::new("Run to here")) {
+                        goal = Some(Goal::RunTo(l.addr));
+                        ui.close();
+                    }
+                });
             }
         });
     if let Some(a) = toggle {
         backend.toggle_breakpoint(a);
     }
+    goal.filter(|_| paused)
 }
