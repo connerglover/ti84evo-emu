@@ -1539,7 +1539,7 @@ fn memory(case: &Case, prog: &[Line]) -> Memory {
     }
 }
 
-fn run_core(case: &Case, mem: &Memory) -> State {
+fn run_core(case: &Case, mem: &Memory, batch_steps: Option<usize>) -> State {
     let mut bus = FlatBus::new();
     // The decoded-instruction cache is on, so stores into the code window exercise it too.
     bus.cache = true;
@@ -1560,15 +1560,31 @@ fn run_core(case: &Case, mem: &Memory) -> State {
     );
     x.ge = case.ge;
     let mut trouble = None;
-    for _ in 0..MAX_STEPS {
-        if cpu.regs.pc == mem.end || cpu.regs.xpsr.exception != 0 {
-            break;
+    if let Some(steps) = batch_steps {
+        let mut n = 0;
+        let end = cpu.run_steps(
+            &mut bus,
+            u64::MAX,
+            |_, _, _, _| {},
+            |_| {
+                n += 1;
+                n >= steps.min(MAX_STEPS)
+            },
+        );
+        if !matches!(end.last, StepResult::Executed { .. }) {
+            trouble = Some(format!("{:?} at {:#x}", end.last, cpu.regs.pc));
         }
-        if let r @ (StepResult::Lockup | StepResult::Bkpt(_) | StepResult::Sleep(_)) =
-            cpu.step(&mut bus)
-        {
-            trouble = Some(format!("{r:?} at {:#x}", cpu.regs.pc));
-            break;
+    } else {
+        for _ in 0..MAX_STEPS {
+            if cpu.regs.pc == mem.end || cpu.regs.xpsr.exception != 0 {
+                break;
+            }
+            if let r @ (StepResult::Lockup | StepResult::Bkpt(_) | StepResult::Sleep(_)) =
+                cpu.step(&mut bus)
+            {
+                trouble = Some(format!("{r:?} at {:#x}", cpu.regs.pc));
+                break;
+            }
         }
     }
     let x = cpu.regs.xpsr;
@@ -1800,8 +1816,18 @@ fn check(
         }
     }
     let mem = memory(case, &prog);
-    let core = run_core(case, &mem);
+    let core = run_core(case, &mem, None);
     let uc = run_unicorn(case, &mem);
+    let batched = run_core(case, &mem, Some(prog.len()));
+    if batched != uc || batched.trouble.is_some() {
+        return Err(TestCaseError::fail(report(
+            &format!("{name} batched"),
+            &prog,
+            case,
+            &batched,
+            &uc,
+        )));
+    }
     if core == uc && core.trouble.is_none() {
         Ok(())
     } else {

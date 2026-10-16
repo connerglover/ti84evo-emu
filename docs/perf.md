@@ -12,7 +12,8 @@ cargo test --release -p evo-core --test bench -- --ignored --nocapture --test-th
 
 - `busy_loop`: a synthetic program (no TI code), a 7-instruction loop of SRAM load, add,
   store, ALU work and a branch, running from flash in Secure state. No sleep, no device
-  traffic: this is the "busy guest code" number. `BENCH_CYCLES` sets the budget (default 1 G).
+  traffic: this is the "busy guest code" number. `BENCH_CYCLES` sets the budget (default 300 M),
+  and `BENCH_REPEAT` selects the number of fresh-machine runs (default 3).
 - `boot_to_self_test`: the user's bundle from `EVO_OS_IMAGE`, from power-on to the Self-Test
   info screen (390 M cycles = 2.5 s of guest time on a fresh unit). Prints `skipping:` without
   `EVO_OS_IMAGE`.
@@ -309,6 +310,12 @@ Decision: the epoch stays one value per map, so an instruction-cache hit is stil
 compare; only the trigger is per page. A true per-page epoch would add a dependent load to
 every fetch to save work that, in the real boot, never happens any more.
 
+This is a workload-based choice, not a claim that a global epoch is always best. Programs
+that repeatedly rewrite executable RAM or flash can still invalidate unrelated instructions.
+Revisit per-page epochs if profiling such a workload shows that their saved decodes outweigh
+the extra lookup on every cache hit. The current invariant remains conservative: no cached
+instruction survives a possible write to its backing code page.
+
 | | Before | After |
 |---|---|---|
 | `boot_to_self_test`, code-epoch changes | 12 253 | 0 |
@@ -407,3 +414,42 @@ structural change that breaks that chain: decoded basic blocks walked by index (
 entry's load no longer waits for the previous instruction's PC write), with the PC
 materialized only at block exits, exceptions and device accesses. This is a larger project
 than the levers of this round.
+
+## Round 3: quiet interpreter batches and review follow-ups
+
+`Cpu::run_steps` now specializes runs with no live pending exception and both SysTick counters
+disabled. Those runs still execute every instruction, call the host hook before each step,
+check the cycle budget and device activity after each step, and perform the same fetch,
+security and memory checks. They omit repeated idle NVIC/SysTick checks until an instruction
+sets `pend_check`. The instruction which enables a counter, pends an exception, faults or
+returns from an exception completes with the usual timer and exception handling immediately.
+Runs with active SysTick counters keep the ordinary step path.
+
+On the development machine, Windows release, 300 M never-sleeping cycles (best of three wall
+times): the starting build ran at **56.7 M cycles/s**, and the quiet-loop build at **66.5 M
+cycles/s** (about 17% faster, **43% of the 156 MHz real-time target**). Other samples ranged
+from 66 to 69 M cycles/s with host load varying. This is an improvement, not attainment of
+the busy-code real-time target. Further block execution work is still needed.
+
+The five outstanding review notes were handled:
+
+- The global/per-page epoch tradeoff above now states the workloads that would justify
+  revisiting it.
+- The SPIF test comment correctly says status-register writes do not alter array bytes.
+- The 16 KiB attribution cache is allocated on first use, outside the CPU's inline footprint,
+  and is empty in clones and restored CPUs. It remains excluded from serialized state.
+- `MemoryMap::call` and `device_activity` document the batching invariant: every device entry
+  point marks activity, and the host must synchronize IRQs/events before clearing it.
+- Flash-file capture and fingerprints consume the same normalized flash chunks and security
+  registers. Padding/truncation has one implementation, without allocating 16 MiB to hash it.
+
+Validation includes CPU batch-vs-step comparisons across enabling SysTick, enabling a pending
+IRQ, PendSV, system reset, SVC/return, faults and IT/WFI; the Unicorn harness now compares both
+ordinary steps and batched execution (2,000 cases per instruction family); and real-OS
+`batching_is_invisible` compares 17 full-state/UART/screen checkpoints through 400 M cycles.
+Flash fingerprint tests cover absent, short, page-boundary and oversized backing buffers.
+
+Experiments discarded in this round: forcing the full executor inline was slower; copying
+up to 16 already-decoded instructions into a local sequential trace was approximately neutral.
+That trace still dispatched every instruction through the large generic executor, so it did
+not remove the remaining dispatch overhead.

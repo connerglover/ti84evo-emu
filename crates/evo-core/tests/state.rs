@@ -518,3 +518,28 @@ fn nv_fingerprint_hashes_the_nv_state_bytes() {
     let want: [u8; 32] = h.finalize().into();
     assert_eq!(m.nv_fingerprint(), want);
 }
+
+#[test]
+fn nv_fingerprint_and_state_share_flash_padding_and_truncation() {
+    use evo_core::machine::FLASH_SIZE;
+    use evo_hw::MemoryMap;
+    use sha2::{Digest, Sha256};
+
+    let mut m = counter_uart().boot();
+    for len in [0, 1, 4095, 4096, 4097, FLASH_SIZE as usize + 1] {
+        m.bus = MemoryMap::new();
+        if len != 0 {
+            m.bus.add_rom(FLASH_BUFFER, vec![0x42; len], &[0x1000_0000]);
+        }
+        let nv = m.nv_state();
+        assert_eq!(nv.flash().len(), FLASH_SIZE as usize);
+        let used = len.min(FLASH_SIZE as usize);
+        assert!(nv.flash()[..used].iter().all(|&b| b == 0x42));
+        assert!(nv.flash()[used..].iter().all(|&b| b == 0xFF));
+        let mut h = Sha256::new();
+        h.update(nv.flash());
+        h.update(nv.secregs());
+        let want: [u8; 32] = h.finalize().into();
+        assert_eq!(m.nv_fingerprint(), want, "flash length {len}");
+    }
+}

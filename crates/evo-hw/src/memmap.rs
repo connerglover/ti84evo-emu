@@ -340,6 +340,8 @@ impl MemoryMap {
     // ---- device runtime ----
 
     /// Run `f` on slot `id` with a context. `None` if there is no such slot.
+    /// Every device entry point must pass here: CPU batching stops on `device_activity`
+    /// before another instruction, so newly queued events cannot miss their deadline.
     fn call<R>(
         &mut self,
         id: usize,
@@ -449,7 +451,8 @@ impl MemoryMap {
         std::mem::take(&mut self.device_activity)
     }
 
-    /// [`take_device_activity`](Self::take_device_activity) without clearing it.
+    /// [`take_device_activity`](Self::take_device_activity) without clearing it. CPU batches
+    /// stop when this is true; clearing it before the host syncs IRQs and events is unsafe.
     #[inline]
     pub fn device_activity(&self) -> bool {
         self.device_activity

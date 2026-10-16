@@ -160,12 +160,14 @@ const ATTR_VALID: u32 = 1 << 3;
 /// Direct-mapped cache of `Cpu::security_of` by 32-byte block (the attribution granule:
 /// SAU regions are 32-byte aligned, and `Idau` implementations must be constant per block).
 /// An entry is the block address, `ATTR_VALID` and the attribution in bits 0..3; 0 is empty.
-#[derive(Clone, Debug)]
-struct AttrCache([u32; ATTR_CACHE]);
+/// Allocated on first use, kept off the CPU's stack footprint. Like decoded code, a clone
+/// starts empty: save states should not copy a 16 KiB performance hint.
+#[derive(Debug, Default)]
+struct AttrCache(Vec<u32>);
 
-impl Default for AttrCache {
-    fn default() -> Self {
-        Self([0; ATTR_CACHE])
+impl Clone for AttrCache {
+    fn clone(&self) -> Self {
+        Self::default()
     }
 }
 
@@ -316,12 +318,18 @@ impl Cpu {
     /// [`security_of`](Self::security_of) through the attribution cache.
     pub(crate) fn attr_of(&mut self, addr: u32) -> Attr {
         let block = addr & !0x1F;
-        let slot = &mut self.attr_cache.0[(addr >> 5) as usize % ATTR_CACHE];
-        if *slot & !0x1F == block && *slot & ATTR_VALID != 0 {
-            return ATTRS[(*slot & 3) as usize];
+        let index = (addr >> 5) as usize % ATTR_CACHE;
+        if let Some(&slot) = self.attr_cache.0.get(index)
+            && slot & !0x1F == block
+            && slot & ATTR_VALID != 0
+        {
+            return ATTRS[(slot & 3) as usize];
         }
         let attr = self.scs.sau.check(addr, self.idau.get()).attr;
-        self.attr_cache.0[(addr >> 5) as usize % ATTR_CACHE] = block | ATTR_VALID | attr_code(attr);
+        if self.attr_cache.0.is_empty() {
+            self.attr_cache.0 = vec![0; ATTR_CACHE];
+        }
+        self.attr_cache.0[index] = block | ATTR_VALID | attr_code(attr);
         attr
     }
 
@@ -577,7 +585,63 @@ impl Cpu {
         mut stop: impl FnMut(&B) -> bool,
     ) -> RunEnd {
         let mut cycles = 0u64;
+        let mut quiet_run = self.quiet_run_possible();
         loop {
+            // With no pending exception and both counters disabled, only instructions
+            // which set pend_check can change the exception/timer state. Keep their
+            // completion on the normal path, but avoid repeating the idle checks.
+            if quiet_run {
+                self.pend_check = false;
+                loop {
+                    let pc = self.regs.pc;
+                    before(bus, pc, self.regs.sec == Sec::Secure, cycles);
+                    let (n, sleep) = match self.execute_one(bus) {
+                        Exec::Done { cycles, sleep } => (cycles, sleep),
+                        Exec::Bkpt(imm) => {
+                            return RunEnd {
+                                cycles,
+                                last: StepResult::Bkpt(imm),
+                                pc,
+                            };
+                        }
+                        Exec::Lockup => {
+                            return RunEnd {
+                                cycles,
+                                last: StepResult::Lockup,
+                                pc,
+                            };
+                        }
+                    };
+                    let mut n = n;
+                    let last = if self.pend_check {
+                        self.tick_systick(n);
+                        if self.take_pending(bus) {
+                            n += ENTRY_CYCLES;
+                            self.entry_result(n)
+                        } else {
+                            sleep.map_or(StepResult::Executed { cycles: n }, StepResult::Sleep)
+                        }
+                    } else {
+                        sleep.map_or(StepResult::Executed { cycles: n }, StepResult::Sleep)
+                    };
+                    let StepResult::Executed { cycles: n } = last else {
+                        return RunEnd { cycles, last, pc };
+                    };
+                    cycles += u64::from(n);
+                    if cycles >= budget
+                        || stop(bus)
+                        || self.has_ppb_misses()
+                        || self.sysreset_requested()
+                    {
+                        return RunEnd { cycles, last, pc };
+                    }
+                    if self.pend_check {
+                        quiet_run = self.quiet_run_possible();
+                        break;
+                    }
+                }
+                continue;
+            }
             let pc = self.regs.pc;
             before(bus, pc, self.regs.sec == Sec::Secure, cycles);
             let last = self.step_inline(bus);
@@ -588,7 +652,18 @@ impl Cpu {
             if cycles >= budget || stop(bus) || self.has_ppb_misses() || self.sysreset_requested() {
                 return RunEnd { cycles, last, pc };
             }
+            // A timer/control write, fault or exception return may have made the fast
+            // loop eligible again. An ordinary instruction cannot change this predicate.
+            if self.pend_check {
+                quiet_run = self.quiet_run_possible();
+            }
         }
+    }
+
+    fn quiet_run_possible(&mut self) -> bool {
+        self.lockup.is_none()
+            && self.nothing_pending()
+            && (self.scs.systick.s.csr | self.scs.systick.ns.csr) & 1 == 0
     }
 
     #[inline(always)]
@@ -809,6 +884,22 @@ mod tests {
         assert_eq!(copy.regs.pc, 0x10A);
     }
 
+    #[test]
+    fn attribution_cache_is_lazy_and_not_copied() {
+        let mut cpu = Cpu::new();
+        assert!(cpu.attr_cache.0.is_empty());
+        let expected = cpu.security_of(0x1000_0040);
+        assert_eq!(cpu.attr_of(0x1000_0040), expected);
+        assert_eq!(cpu.attr_cache.0.len(), ATTR_CACHE);
+        let mut copy = cpu.clone();
+        assert!(copy.attr_cache.0.is_empty());
+        assert_eq!(copy, cpu);
+        assert_eq!(copy.attr_of(0x1000_0040), expected);
+        copy.flush_attr_cache();
+        assert!(copy.attr_cache.0.is_empty());
+        assert_eq!(copy.attr_of(0x1000_0040), expected);
+    }
+
     /// A RAM image whose reset handler at 0x100 runs `code`.
     fn program(code: &[u16]) -> (Cpu, Ram) {
         let mut ram = Ram(vec![0; 0x1000]);
@@ -886,5 +977,65 @@ mod tests {
             "a zero budget still runs one step"
         );
         assert_eq!(end.pc, 0x106);
+    }
+
+    /// Match the reference step loop at every boundary where the quiet run can cease to be
+    /// quiet. Includes the instruction that enables SysTick: it must tick in that same step.
+    #[test]
+    fn quiet_runs_match_steps_across_exception_and_timer_changes() {
+        let cases: &[(&[u16], u32, u32)] = &[
+            (&[0x6008, 0x3001, 0xE7FD], 0xE000_E010, 3), // enable SysTick
+            (&[0x6008, 0x3001, 0xE7FD], 0xE000_E100, 1), // enable pending IRQ0
+            (&[0x6008, 0x3001, 0xE7FD], 0xE000_ED04, 1 << 28), // pend PendSV
+            (&[0x6008, 0x3001, 0xE7FD], 0xE000_ED0C, 0x05FA_0004), // system reset
+            (&[0xDF00, 0x3001, 0xE7FD], 0, 0),           // SVC then exception return
+            (&[0xDE00], 0, 0),                           // UsageFault escalated to HardFault
+            (&[0xBF08, 0x3001, 0xBF30], 0, 0),           // IT, suppressed flags, WFI
+        ];
+        for &(code, addr, value) in cases {
+            let (mut a, mut ram_a) = program(code);
+            a.regs.r[0] = value;
+            a.regs.r[1] = addr;
+            a.scs.systick.s.rvr = 3;
+            a.scs.nvic.set_pending(0, true);
+            // The handlers return to the interrupted instruction stream.
+            for vector in [3, 6, 11, 14, 15, 16] {
+                ram_a.0[vector * 4..vector * 4 + 4].copy_from_slice(&0x201u32.to_le_bytes());
+            }
+            ram_a.0[0x200..0x202].copy_from_slice(&0x4770u16.to_le_bytes());
+            let mut b = a.clone();
+            let mut ram_b = Ram(ram_a.0.clone());
+            let mut seen = Vec::new();
+            let mut count = 0;
+            let end = a.run_steps(
+                &mut ram_a,
+                100,
+                |_, pc, secure, elapsed| seen.push((pc, secure, elapsed)),
+                |_| {
+                    count += 1;
+                    count == 20
+                },
+            );
+            let mut expected = Vec::new();
+            let mut cycles = 0;
+            let mut count = 0;
+            let reference = loop {
+                let pc = b.regs.pc;
+                expected.push((pc, b.regs.sec == Sec::Secure, cycles));
+                let last = b.step(&mut ram_b);
+                let StepResult::Executed { cycles: n } = last else {
+                    break RunEnd { cycles, last, pc };
+                };
+                cycles += u64::from(n);
+                count += 1;
+                if cycles >= 100 || count == 20 || b.has_ppb_misses() || b.sysreset_requested() {
+                    break RunEnd { cycles, last, pc };
+                }
+            };
+            assert_eq!(end, reference, "code {code:x?}, address {addr:#x}");
+            assert_eq!(seen, expected, "every hook sees the same PC and cycle");
+            assert_eq!(a, b);
+            assert_eq!(ram_a.0, ram_b.0);
+        }
     }
 }

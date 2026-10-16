@@ -343,24 +343,39 @@ impl Machine {
     /// [`load_state`](Self::load_state) this is the same as before it. (Were the part to hold no
     /// registers, they would read as erased; the SoC's part always holds them.)
     pub fn nv_state(&self) -> NvState {
-        let mut flash = self
-            .bus
-            .region_bytes(FLASH_BUFFER)
-            .map(<[u8]>::to_vec)
-            .unwrap_or_default();
-        // The map always holds `FLASH_SIZE` bytes of flash; this only keeps `new` infallible.
-        flash.resize(FLASH_SIZE as usize, ERASED);
-        let secregs = self
-            .bus
-            .device::<Spif>("spif")
-            .map(|s| s.nor().secregs())
-            .filter(|r| r.len() == SECREGS_LEN)
-            .map_or_else(|| vec![ERASED; SECREGS_LEN], <[u8]>::to_vec);
+        let mut flash = Vec::with_capacity(FLASH_SIZE as usize);
+        for chunk in self.nv_flash_chunks() {
+            flash.extend_from_slice(chunk);
+        }
+        let secregs = self.nv_secregs().to_vec();
         NvState::new(flash, secregs).unwrap_or_else(|e| {
             // Unreachable: both lengths are fixed above.
             log::error!("nv_state: {e}");
             NvState::erased()
         })
+    }
+
+    /// Canonical flash bytes for both persistence and its fingerprint, without allocating.
+    /// Short or absent buffers read as erased; oversized buffers are cut at the chip size.
+    pub(crate) fn nv_flash_chunks(&self) -> impl Iterator<Item = &[u8]> {
+        const ERASED_PAGE: [u8; 4096] = [ERASED; 4096];
+        let flash = self.bus.region_bytes(FLASH_BUFFER).unwrap_or_default();
+        let size = FLASH_SIZE as usize;
+        let pad = size.saturating_sub(flash.len());
+        std::iter::once(&flash[..flash.len().min(size)])
+            .chain(std::iter::repeat_n(
+                ERASED_PAGE.as_slice(),
+                pad / ERASED_PAGE.len(),
+            ))
+            .chain(std::iter::once(&ERASED_PAGE[..pad % ERASED_PAGE.len()]))
+    }
+
+    pub(crate) fn nv_secregs(&self) -> &[u8] {
+        self.bus
+            .device::<Spif>("spif")
+            .map(|s| s.nor().secregs())
+            .filter(|r| r.len() == SECREGS_LEN)
+            .unwrap_or(&[ERASED; SECREGS_LEN])
     }
 
     /// Run `f` on the device called `name`, if it is a `T`: the only way host APIs reach a

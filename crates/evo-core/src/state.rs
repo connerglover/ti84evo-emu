@@ -24,15 +24,13 @@
 //! version 1 states are rejected ([`StateError::Version`]).
 
 use armv8m::{Cpu, SleepKind};
-use evo_hw::dev::spif::Spif;
-use evo_hw::nor::SECREGS_LEN;
-use evo_hw::soc::{FLASH_BUFFER, SRAM_BUFFER};
+use evo_hw::soc::SRAM_BUFFER;
 use evo_hw::{DeviceState, StateError, UnmappedLog};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::Scheduler;
-use crate::machine::{ERASED, FLASH_SIZE, Machine, RecentSteps};
+use crate::machine::{Machine, RecentSteps};
 
 /// First bytes of every save state.
 pub const STATE_MAGIC: &[u8; 8] = b"EVOSTATE";
@@ -74,30 +72,14 @@ pub(crate) fn bundle_id(package: &[u8], secure_slot_base: u32, ns_slot_base: u32
 impl Machine {
     /// The fingerprint of the non-volatile state now: SHA-256(flash bytes ‖ NOR security
     /// registers), both read as [`nv_state`](Self::nv_state) reads them (flash cut or padded
-    /// with erased bytes to [`FLASH_SIZE`]). It hashes exactly the bytes `nv_state` returns,
+    /// with erased bytes to [`FLASH_SIZE`](crate::machine::FLASH_SIZE)). It hashes exactly the bytes `nv_state` returns,
     /// so equal fingerprints mean equal [`nv_state`](Self::nv_state)s.
     pub fn nv_fingerprint(&self) -> [u8; 32] {
         let mut h = Sha256::new();
-        let flash = self.bus.region_bytes(FLASH_BUFFER).unwrap_or_default();
-        let size = FLASH_SIZE as usize;
-        h.update(&flash[..flash.len().min(size)]);
-        // The map always holds `FLASH_SIZE` bytes of flash; this pads like `nv_state` would.
-        let erased = [ERASED; 4096];
-        let mut pad = size.saturating_sub(flash.len());
-        while pad > 0 {
-            let n = pad.min(erased.len());
-            h.update(&erased[..n]);
-            pad -= n;
+        for chunk in self.nv_flash_chunks() {
+            h.update(chunk);
         }
-        match self
-            .bus
-            .device::<Spif>("spif")
-            .map(|s| s.nor().secregs())
-            .filter(|r| r.len() == SECREGS_LEN)
-        {
-            Some(secregs) => h.update(secregs),
-            None => h.update([ERASED; SECREGS_LEN]),
-        }
+        h.update(self.nv_secregs());
         h.finalize().into()
     }
 

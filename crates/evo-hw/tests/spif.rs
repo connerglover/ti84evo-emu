@@ -342,8 +342,8 @@ fn soc_attaches_spif() {
 }
 
 /// Code the CPU cached from flash (`Bus::cache_code`) stays valid across SPIF commands that
-/// only read the part: just erases, programs and status-register writes may change bytes, and
-/// only those change the code epoch.
+/// only read the part. Only erases and program data that touch cached array bytes change the
+/// code epoch; status-register writes do not modify the flash array.
 #[test]
 fn only_commands_that_change_flash_end_cached_code() {
     use armv8m::{Access, AccessKind, Bus};
