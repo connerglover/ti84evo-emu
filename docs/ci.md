@@ -25,5 +25,5 @@ after inspecting an intentional UI change.
 
 Arm `.bin` files are data, so the build script normalizes their mode to `0644`;
 byte comparisons and untracked-output detection remain enabled. The toast layout
-regression uses a deliberately long fixture path on every OS rather than relying
-on the length of the runner's temporary directory.
+regression checks growth beyond the preceding short message rather than assuming
+an exact label width from the runner's temporary-directory path.

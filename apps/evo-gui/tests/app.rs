@@ -579,21 +579,23 @@ fn screenshot_button_writes_png() {
 
 #[test]
 fn long_toast_after_a_short_one_stays_wide() {
-    // Use a long fixture path on every OS. Linux's /tmp path otherwise produces
-    // a legitimately narrower label than Windows's user-specific temp folder.
-    let dir = fresh_dir("toastwidth-deliberately-long-calculator-directory");
+    let dir = fresh_dir("toastwidth");
     let mut h = harness_in(FakeBackend::new(), true, dir.to_path_buf());
     h.run_steps(1);
     open_action(&mut h, Action::SaveState);
     click(&mut h, "Slot 2");
-    h.get_by_label("Saved slot 2");
+    let short_width = h.get_by_label("Saved slot 2").rect().width();
     h.run_steps(10);
     open_action(&mut h, Action::Screenshot);
     h.run_steps(2);
     let r = h.get_by_label_contains("Screenshot saved to").rect();
-    // The 520 pt window leaves room for a 360 pt toast: the path wraps to a few lines, not
-    // to the width of "Saved slot 2".
-    assert!(r.width() >= 300.0, "toast {r:?}");
+    // The label shrink-wraps its lines, whose lengths depend on the OS temp path.
+    // Check the regression: it must grow beyond the earlier short toast instead
+    // of inheriting that toast's narrow width and becoming a tall strip.
+    assert!(
+        r.width() > short_width * 2.0,
+        "toast {r:?}, short width {short_width}"
+    );
     assert!(r.height() <= 80.0, "toast {r:?}");
     assert!(r.left() >= 0.0 && r.right() <= 520.0, "toast {r:?}");
 }
