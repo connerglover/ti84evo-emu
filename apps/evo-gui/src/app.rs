@@ -75,10 +75,6 @@ pub fn debug_max_width(window_w: f32) -> f32 {
     (window_w - reserved).max(0.0)
 }
 
-/// The toast shown when no bundle was given and the demo backend runs.
-pub const DEMO_NOTICE: &str =
-    "No OS bundle given: running the demo backend. Usage: evo-gui <bundle.84b2>";
-
 /// The progress message (and header status) while the machine is provisioned.
 pub const PROVISION_NOTICE: &str = "Preparing calculator\u{2026}";
 /// The toast after provisioning succeeded.
@@ -94,21 +90,58 @@ type ProvisionResult = (Box<dyn EmuBackend>, Result<(), BackendError>);
 /// Which backend `main` starts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Choice {
-    /// The fake backend; `notice` shows [`DEMO_NOTICE`] because no bundle was found.
-    Demo { notice: bool },
-    /// The emulated machine, booted from this bundle.
+    /// The fake backend (`--demo`).
+    Demo,
+    /// The emulated machine, booted from this bundle (argument or `EVO_OS_IMAGE`).
     Bundle(PathBuf),
+    /// The bundle linked in the preferences, else no ROM and the ROM Setup Wizard
+    /// (see [`start_backend`]).
+    FromPrefs,
 }
 
 /// Picks the backend: `--demo`, else the bundle argument, else `EVO_OS_IMAGE` (`env`; empty
-/// counts as unset), else the demo with a notice.
+/// counts as unset), else [`Choice::FromPrefs`].
 pub fn choose_backend(bundle_arg: Option<PathBuf>, demo: bool, env: Option<OsString>) -> Choice {
     if demo {
-        return Choice::Demo { notice: false };
+        return Choice::Demo;
     }
     match bundle_arg.or_else(|| env.filter(|e| !e.is_empty()).map(PathBuf::from)) {
         Some(path) => Choice::Bundle(path),
-        None => Choice::Demo { notice: true },
+        None => Choice::FromPrefs,
+    }
+}
+
+/// What [`start_backend`] decided.
+pub struct StartUp {
+    pub backend: Box<dyn EmuBackend>,
+    /// Shown as an Info toast on the first frame.
+    pub notice: Option<String>,
+    /// Open the ROM Setup Wizard.
+    pub open_wizard: bool,
+}
+
+/// The [`Choice::FromPrefs`] decision: the bundle linked in `prefs`, opened with its flash in
+/// `dir/flash`. Without a linked bundle, or when it does not open (with a notice saying why),
+/// the backend is [`Placeholder::no_rom`] and the ROM Setup Wizard opens.
+pub fn start_backend(prefs: &Prefs, platform: &PlatformRef, dir: &Path) -> StartUp {
+    let Some(path) = &prefs.bundle else {
+        return StartUp {
+            backend: Box::new(Placeholder::no_rom()),
+            notice: None,
+            open_wizard: true,
+        };
+    };
+    match platform.open_backend(path, &dir.join("flash")) {
+        Ok(backend) => StartUp {
+            backend,
+            notice: None,
+            open_wizard: false,
+        },
+        Err(e) => StartUp {
+            backend: Box::new(Placeholder::no_rom()),
+            notice: Some(format!("Cannot open {}: {e}", path.display())),
+            open_wizard: true,
+        },
     }
 }
 

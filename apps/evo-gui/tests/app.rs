@@ -843,17 +843,15 @@ fn grown_window_gives_the_panel_its_default_width() {
 }
 
 #[test]
-fn choose_backend_rules() {
+fn choose_backend_cases() {
     use evo_gui::app::{Choice, choose_backend};
     use std::ffi::OsString;
     use std::path::PathBuf;
     let arg = || Some(PathBuf::from("arg.84b2"));
     let env = || Some(OsString::from("env.84b2"));
     // --demo wins over everything.
-    assert_eq!(
-        choose_backend(arg(), true, env()),
-        Choice::Demo { notice: false }
-    );
+    assert_eq!(choose_backend(arg(), true, env()), Choice::Demo);
+    assert_eq!(choose_backend(None, true, None), Choice::Demo);
     // Then the argument, over the environment.
     assert_eq!(
         choose_backend(arg(), false, env()),
@@ -864,36 +862,13 @@ fn choose_backend_rules() {
         choose_backend(None, false, env()),
         Choice::Bundle(PathBuf::from("env.84b2"))
     );
-    // Else the demo, with the notice.
-    assert_eq!(
-        choose_backend(None, false, None),
-        Choice::Demo { notice: true }
-    );
+    // Else the bundle linked in the preferences (or the ROM Setup Wizard).
+    assert_eq!(choose_backend(None, false, None), Choice::FromPrefs);
     // An empty EVO_OS_IMAGE counts as unset.
     assert_eq!(
         choose_backend(None, false, Some(OsString::new())),
-        Choice::Demo { notice: true }
+        Choice::FromPrefs
     );
-}
-
-#[test]
-fn notice_is_shown_as_a_toast() {
-    use evo_gui::app::DEMO_NOTICE;
-    assert_eq!(
-        DEMO_NOTICE,
-        "No OS bundle given: running the demo backend. Usage: evo-gui <bundle.84b2>"
-    );
-    let opts = AppOptions {
-        start_paused: true,
-        notice: Some(DEMO_NOTICE.to_owned()),
-        ..test_options(&data_dir(), FakePlatform::shared())
-    };
-    let mut h = Harness::builder()
-        .with_size([520.0, 960.0])
-        .with_pixels_per_point(1.0)
-        .build_eframe(|cc| EvoApp::new(&cc.egui_ctx, Box::new(FakeBackend::new()), opts));
-    h.run_steps(1);
-    h.get_by_label(DEMO_NOTICE);
 }
 
 // ---------------------------------------------------------------------------

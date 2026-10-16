@@ -726,3 +726,79 @@ fn instance_stub_dirs() {
     assert_eq!(lock.dir, base.join("instances").join("a"));
     assert!(lock.dir.is_dir());
 }
+
+// ---------------------------------------------------------------------------
+// Task 0.5b: start-up without a ROM.
+
+#[test]
+fn start_backend_cases() {
+    use evo_gui::app::start_backend;
+    let dir = Path::new("data-dir");
+
+    // No bundle linked: no ROM, no notice, the wizard opens.
+    let p = FakePlatform::shared();
+    let platform: PlatformRef = p.clone();
+    let s = start_backend(&Prefs::default(), &platform, dir);
+    assert_eq!(s.backend.name(), "No ROM");
+    assert_eq!(s.notice, None);
+    assert!(s.open_wizard);
+    assert!(p.opened().is_empty());
+
+    // A linked bundle that does not open: no ROM, a notice, the wizard opens.
+    let prefs = Prefs {
+        bundle: Some(PathBuf::from("os.84b2")),
+        ..Prefs::default()
+    };
+    let p = FakePlatform::shared();
+    p.set_backend_factory(Box::new(|_, _| Err("bad".to_owned())));
+    let platform: PlatformRef = p.clone();
+    let s = start_backend(&prefs, &platform, dir);
+    assert_eq!(s.backend.name(), "No ROM");
+    assert_eq!(s.notice.as_deref(), Some("Cannot open os.84b2: bad"));
+    assert!(s.open_wizard);
+
+    // A linked bundle that opens: that backend, no wizard; flash lives in `dir/flash`.
+    let p = FakePlatform::shared();
+    let seen = Arc::new(Mutex::new(None));
+    let seen2 = seen.clone();
+    p.set_backend_factory(Box::new(move |bundle, nv| {
+        *seen2.lock().unwrap() = Some((bundle.to_path_buf(), nv.to_path_buf()));
+        Ok(Box::new(FakeBackend::new().named("opened")) as Box<dyn EmuBackend>)
+    }));
+    let platform: PlatformRef = p.clone();
+    let s = start_backend(&prefs, &platform, dir);
+    assert_eq!(s.backend.name(), "opened");
+    assert_eq!(s.notice, None);
+    assert!(!s.open_wizard);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some((PathBuf::from("os.84b2"), dir.join("flash")))
+    );
+}
+
+#[test]
+fn start_up_notice_is_shown_as_a_toast() {
+    use evo_gui::app::start_backend;
+    let prefs = Prefs {
+        bundle: Some(PathBuf::from("os.84b2")),
+        ..Prefs::default()
+    };
+    let p = FakePlatform::shared();
+    p.set_backend_factory(Box::new(|_, _| Err("bad".to_owned())));
+    let platform: PlatformRef = p.clone();
+    let dir = TempDir::new("evo-gui-foundation-startnotice", false);
+    let s = start_backend(&prefs, &platform, &dir);
+    let opts = AppOptions {
+        start_paused: true,
+        notice: s.notice.clone(),
+        open_wizard: s.open_wizard,
+        ..test_options(&dir, platform)
+    };
+    let mut h = Harness::builder()
+        .with_size([520.0, 960.0])
+        .with_pixels_per_point(1.0)
+        .build_eframe(|cc| EvoApp::new(&cc.egui_ctx, s.backend, opts));
+    h.run_steps(1);
+    h.get_by_label("Cannot open os.84b2: bad");
+    assert_eq!(h.state().backend().name(), "No ROM");
+}
