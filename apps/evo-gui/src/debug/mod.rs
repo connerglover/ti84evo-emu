@@ -6,6 +6,7 @@ mod control;
 mod disasm;
 mod memory;
 mod regs;
+mod search;
 mod uart;
 mod unmapped;
 
@@ -13,7 +14,8 @@ use egui::{Button, ScrollArea, Sense};
 
 pub use control::cycle_text;
 pub use disasm::{DISASM_LINES, format_disasm};
-pub use memory::DEFAULT_MEM_ADDR;
+pub use memory::{DEFAULT_MEM_ADDR, MAX_VIEWS};
+pub use search::{SEARCH_CHUNK, SEARCH_CHUNKS_PER_FRAME, Search, find, parse_pattern};
 pub use uart::{UART_CAP, UartConsole};
 
 use crate::backend::{EmuBackend, Goal, UartId};
@@ -233,7 +235,9 @@ impl DebugPanel {
                     });
             }
             DebugTab::Disassembly => disasm::show(ui, &mut self.disasm, backend),
-            DebugTab::Memory => memory::show(ui, &mut self.memory, backend),
+            DebugTab::Memory => {
+                memory::show(ui, &mut self.memory, backend, paused, &mut out.notes);
+            }
             DebugTab::Console => uart::show(ui, &mut self.uart),
             DebugTab::Unmapped => unmapped::show(ui, &backend.unmapped()),
             DebugTab::Visualizer

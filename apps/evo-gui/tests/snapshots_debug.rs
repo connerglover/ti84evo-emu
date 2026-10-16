@@ -49,3 +49,21 @@ fn snapshot_debug_registers_editing() {
     h.run_steps(10);
     h.snapshot("debug_registers_editing");
 }
+
+#[test]
+#[cfg_attr(
+    not(feature = "snapshots"),
+    ignore = "golden images: cargo test -p evo-gui --features snapshots"
+)]
+fn snapshot_debug_memory_two_views() {
+    let _gpu = gpu_lock();
+    let mut h = dock_on("Memory");
+    h.get_by_label("Add view").click();
+    h.run_steps(3);
+    // The second view shows words.
+    h.get_all_by_label("Words").nth(1).unwrap().click();
+    h.run_steps(3);
+    h.hover_at(egui::pos2(300.0, 950.0));
+    h.run_steps(10);
+    h.snapshot("debug_memory_two_views");
+}

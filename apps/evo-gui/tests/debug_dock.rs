@@ -1,5 +1,5 @@
-//! The debug dock: tab registry, run row, the Control tab and register editing, on
-//! `FakeBackend`.
+//! The debug dock: tab registry, run row, the Control tab, register editing and the
+//! Memory tab (views, editing, search), on `FakeBackend`.
 
 mod common;
 
@@ -10,8 +10,11 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use evo_gui::app::{AppOptions, EvoApp};
 use evo_gui::backend::fake::FakeBackend;
-use evo_gui::backend::{Goal, RunStatus};
-use evo_gui::debug::{DebugTab, cycle_text, parse_value};
+use evo_gui::backend::{EmuBackend, Goal, RunStatus};
+use evo_gui::debug::{
+    DebugTab, MAX_VIEWS, SEARCH_CHUNK, SEARCH_CHUNKS_PER_FRAME, Search, cycle_text, find,
+    parse_pattern, parse_value,
+};
 use evo_gui::platform::FakePlatform;
 
 /// Every tab label, in selector order.
@@ -385,4 +388,313 @@ fn edit_closes_when_run_starts() {
     click(&mut h, "Pause");
     // The cancelled edit does not come back.
     assert!(h.query_by_role(Role::TextInput).is_none());
+}
+
+// ---- Memory tab ----
+
+/// How many text fields show: the Find field, each view's address field, and an open
+/// edit field, in that drawing order.
+fn inputs(h: &Harness<'static, EvoApp>) -> usize {
+    h.query_all_by_role(Role::TextInput).count()
+}
+
+/// Types `text` into text field `index` (drawing order), replacing what it held.
+fn set_field(h: &mut Harness<'static, EvoApp>, index: usize, text: &str) {
+    h.get_all_by_role(Role::TextInput)
+        .nth(index)
+        .expect("text field")
+        .click();
+    h.run_steps(2);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.run_steps(1);
+    h.get_all_by_role(Role::TextInput)
+        .nth(index)
+        .expect("text field")
+        .type_text(text);
+    h.run_steps(3);
+}
+
+/// The value of text field `index` (drawing order).
+fn field_value(h: &Harness<'static, EvoApp>, index: usize) -> Option<String> {
+    h.get_all_by_role(Role::TextInput)
+        .nth(index)
+        .expect("text field")
+        .value()
+}
+
+/// Presses and releases the primary button at `pos`.
+fn click_at(h: &mut Harness<'static, EvoApp>, pos: egui::Pos2) {
+    h.hover_at(pos);
+    h.run_steps(1);
+    h.drag_at(pos);
+    h.drop_at(pos);
+    h.run_steps(3);
+}
+
+/// Clicks character `col` of the dump row whose text starts with `row_prefix`.
+fn click_row_char(h: &mut Harness<'static, EvoApp>, row_prefix: &str, col: usize) {
+    let node = h.get_by_label_contains(row_prefix);
+    // A label keeps its text in its AccessKit value.
+    let text = node.value().expect("row text");
+    let rect = node.rect();
+    let cw = rect.width() / text.chars().count() as f32;
+    let pos = egui::pos2(rect.left() + (col as f32 + 0.5) * cw, rect.center().y);
+    click_at(h, pos);
+}
+
+/// Column of the first hex digit of byte `j` (0..16) in a Bytes row.
+fn byte_col(j: usize) -> usize {
+    10 + 3 * j
+}
+
+/// Types `text` into the open edit field (the last text field) and presses Enter.
+fn type_edit(h: &mut Harness<'static, EvoApp>, text: &str) {
+    h.get_all_by_role(Role::TextInput)
+        .last()
+        .expect("edit field")
+        .type_text(text);
+    h.run_steps(2);
+    press(h, Key::Enter);
+}
+
+#[test]
+fn parse_pattern_cases() {
+    assert_eq!(parse_pattern("de ad"), Some(vec![0xDE, 0xAD]));
+    assert_eq!(parse_pattern("dead"), Some(vec![0xDE, 0xAD]));
+    assert_eq!(parse_pattern("  DE  ad  "), Some(vec![0xDE, 0xAD]));
+    assert_eq!(parse_pattern("\"ab\""), Some(b"ab".to_vec()));
+    assert_eq!(parse_pattern("\"a b\""), Some(b"a b".to_vec()));
+    for bad in [
+        "xyz",
+        "",
+        "   ",
+        "dea",
+        "d ead",
+        "\"\"",
+        "\"ab",
+        "0xde",
+        "\"\u{e9}\"",
+    ] {
+        assert_eq!(parse_pattern(bad), None, "{bad:?}");
+    }
+}
+
+#[test]
+fn find_in_fake_memory() {
+    let fake = FakeBackend::new();
+    let regions = fake.memory_regions();
+    assert_eq!(
+        find(&fake, &regions, 0x2000_0000, &[5, 6, 7]),
+        Some(0x2000_0005)
+    );
+    // The fake's bytes repeat every 251: the next match is at 251 + 5 = 0x100.
+    assert_eq!(
+        find(&fake, &regions, 0x2000_0006, &[5, 6, 7]),
+        Some(0x2000_0100)
+    );
+    // No match from 0x2000_fff0 to the region's end: the search wraps to its start.
+    assert_eq!(
+        find(&fake, &regions, 0x2000_FFF0, &[5, 6, 7]),
+        Some(0x2000_0005)
+    );
+    assert_eq!(find(&fake, &regions, 0x2000_0000, &[7, 6, 5]), None);
+    assert_eq!(find(&fake, &regions, 0x2000_0000, &[]), None);
+    // A start past every region: only the wrap finds it.
+    assert_eq!(
+        find(&fake, &regions, 0x3000_0000, &[5, 6, 7]),
+        Some(0x2000_0005)
+    );
+}
+
+#[test]
+fn find_across_chunk_boundary() {
+    let mut fake = FakeBackend::new();
+    fake.poke(0x2000_3FFF, &[0xAB, 0xCD, 0xEF]).unwrap();
+    let regions = fake.memory_regions();
+    assert_eq!(SEARCH_CHUNK, 0x4000);
+    assert_eq!(
+        find(&fake, &regions, 0x2000_0000, &[0xAB, 0xCD, 0xEF]),
+        Some(0x2000_3FFF)
+    );
+}
+
+#[test]
+fn search_steps_are_bounded() {
+    assert_eq!(SEARCH_CHUNKS_PER_FRAME * SEARCH_CHUNK, 4 << 20);
+    let fake = FakeBackend::new();
+    let mut s = Search::new(fake.memory_regions(), 0x2000_0000, vec![7, 6, 5]);
+    // One 0x4000-byte chunk of the 0x1_0000-byte region per call.
+    assert_eq!(s.step(&fake, 1), None);
+    let mut done = None;
+    for _ in 0..4 {
+        if let Some(r) = s.step(&fake, 1) {
+            done = Some(r);
+            break;
+        }
+    }
+    assert_eq!(done, Some(None));
+}
+
+#[test]
+fn memory_tab_has_one_view_and_find_row() {
+    let (mut h, _dir) = dock(FakeBackend::new());
+    click(&mut h, "Memory");
+    assert_eq!(MAX_VIEWS, 4);
+    for label in ["Find", "Next", "Add view", "Bytes", "Words"] {
+        h.get_by_label(label);
+    }
+    // A single view cannot be closed.
+    assert!(h.query_by_label("Close").is_none());
+    assert_eq!(inputs(&h), 2);
+    h.get_by_label_contains("20000000  00 01 02 03");
+}
+
+#[test]
+fn edit_byte_pokes() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = dock(fake);
+    click(&mut h, "Memory");
+    click_row_char(&mut h, "20000000  ", byte_col(3));
+    assert_eq!(inputs(&h), 3);
+    assert_eq!(field_value(&h, 2).as_deref(), Some("03"));
+    type_edit(&mut h, "aa");
+    assert_eq!(probe.pokes(), [(0x2000_0003, vec![0xAA])]);
+    assert_eq!(inputs(&h), 2);
+    h.get_by_label_contains("20000000  00 01 02 aa 04");
+    // The field had the keyboard: no calculator key was pressed.
+    assert!(probe.key_log().is_empty(), "{:?}", probe.key_log());
+}
+
+#[test]
+fn edit_word_pokes_little_endian() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = dock(fake);
+    click(&mut h, "Memory");
+    click(&mut h, "Words");
+    h.get_by_label_contains("20000000  03020100 07060504");
+    // The second word's first digit.
+    click_row_char(&mut h, "20000000  ", 10 + 9);
+    assert_eq!(field_value(&h, 2).as_deref(), Some("07060504"));
+    type_edit(&mut h, "deadbeef");
+    assert_eq!(probe.pokes(), [(0x2000_0004, vec![0xEF, 0xBE, 0xAD, 0xDE])]);
+    h.get_by_label_contains("20000000  03020100 deadbeef");
+}
+
+#[test]
+fn unparsable_byte_keeps_field() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = dock(fake);
+    click(&mut h, "Memory");
+    click_row_char(&mut h, "20000000  ", byte_col(3));
+    type_edit(&mut h, "zz");
+    h.get_by_label("Not a value");
+    assert_eq!(inputs(&h), 3);
+    press(&mut h, Key::Escape);
+    click_row_char(&mut h, "20000000  ", byte_col(3));
+    // Too big for a byte.
+    type_edit(&mut h, "#300");
+    h.get_by_label("Not a value");
+    press(&mut h, Key::Escape);
+    assert_eq!(inputs(&h), 2);
+    assert!(probe.pokes().is_empty());
+    // Escape is the calculator's CLEAR; the field kept it.
+    assert!(probe.key_log().is_empty(), "{:?}", probe.key_log());
+}
+
+#[test]
+fn edit_outside_notes_error() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = dock(fake);
+    click(&mut h, "Memory");
+    set_field(&mut h, 1, "0x1fff_fff8");
+    click_row_char(&mut h, "1ffffff8  ", byte_col(0));
+    type_edit(&mut h, "aa");
+    assert!(probe.pokes().is_empty());
+    h.get_by_label_contains("Cannot write 0x1ffffff8");
+    h.get_by_label_contains("1ffffff8  ?? ?? ??");
+}
+
+#[test]
+fn no_memory_edit_while_running() {
+    let (mut h, _dir) = dock(FakeBackend::new());
+    click(&mut h, "Memory");
+    click(&mut h, "Continue");
+    click_row_char(&mut h, "20000000  ", byte_col(3));
+    assert_eq!(inputs(&h), 2);
+    click(&mut h, "Pause");
+    click_row_char(&mut h, "20000000  ", byte_col(3));
+    assert_eq!(inputs(&h), 3);
+}
+
+#[test]
+fn add_and_close_views() {
+    let (mut h, _dir) = dock(FakeBackend::new());
+    click(&mut h, "Memory");
+    for n in 2..=MAX_VIEWS {
+        click(&mut h, "Add view");
+        assert_eq!(h.get_all_by_label("Close").count(), n);
+        assert_eq!(inputs(&h), n + 1);
+    }
+    // At the cap "Add view" is disabled.
+    click(&mut h, "Add view");
+    assert_eq!(h.get_all_by_label("Close").count(), MAX_VIEWS);
+    set_field(&mut h, 2, "0x20000100");
+    h.get_by_label_contains("20000100  05 06 07");
+    // Closing the first view keeps the others.
+    h.get_all_by_label("Close").next().unwrap().click();
+    h.run_steps(3);
+    assert_eq!(inputs(&h), MAX_VIEWS);
+    assert_eq!(field_value(&h, 1).as_deref(), Some("0x20000100"));
+    while h.query_all_by_label("Close").count() > 0 {
+        h.get_all_by_label("Close").next().unwrap().click();
+        h.run_steps(3);
+    }
+    assert_eq!(inputs(&h), 2);
+}
+
+#[test]
+fn search_next_jumps_and_continues() {
+    let (mut h, _dir) = dock(FakeBackend::new());
+    click(&mut h, "Memory");
+    set_field(&mut h, 0, "05 06 07");
+    click(&mut h, "Next");
+    // The hit 0x20000005 is in the row at 0x20000000.
+    assert_eq!(field_value(&h, 1).as_deref(), Some("0x20000000"));
+    assert!(h.query_by_label("Not found").is_none());
+    click(&mut h, "Next");
+    assert_eq!(field_value(&h, 1).as_deref(), Some("0x20000100"));
+    h.get_by_label_contains("20000100  05 06 07");
+}
+
+#[test]
+fn search_not_found_and_bad_pattern() {
+    let (mut h, _dir) = dock(FakeBackend::new());
+    click(&mut h, "Memory");
+    set_field(&mut h, 0, "\"zz\"");
+    click(&mut h, "Next");
+    h.get_by_label("Not found");
+    assert_eq!(field_value(&h, 1).as_deref(), Some("0x20000000"));
+    // Editing the pattern clears the result.
+    set_field(&mut h, 0, "xyz");
+    assert!(h.query_by_label("Not found").is_none());
+    click(&mut h, "Next");
+    h.get_by_label("Not a pattern");
+}
+
+#[test]
+fn enter_in_find_searches_without_pressing_keys() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = dock(fake);
+    click(&mut h, "Memory");
+    set_field(&mut h, 0, "05 06 07");
+    press(&mut h, Key::Enter);
+    press(&mut h, Key::Enter);
+    // Two searches: the hits at 0x20000005 and 0x20000100.
+    assert_eq!(field_value(&h, 1).as_deref(), Some("0x20000100"));
+    assert!(probe.key_log().is_empty(), "{:?}", probe.key_log());
 }
