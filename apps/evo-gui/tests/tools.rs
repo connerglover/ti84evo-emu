@@ -1,4 +1,4 @@
-//! Tools: key scripts (E1) and key history (E2).
+//! Tools: key scripts (E1), key history (E2) and macros / AutoTester (E3).
 
 mod common;
 
@@ -359,4 +359,546 @@ fn copy_as_script() {
         seen.extend(h.output().platform_output.commands.iter().cloned());
     }
     assert!(seen.contains(&want), "{seen:?}");
+}
+
+// ---- E3: macros / AutoTester ----
+
+mod macros {
+    use super::{TempDir, kev, test_options, tools_harness};
+    use crate::common::{harness_with, open_action};
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    use evo_gui::app::{AppOptions, EvoApp};
+    use evo_gui::backend::fake::{FakeBackend, FakeProbe};
+    use evo_gui::backend::{CLOCK_HZ, Frame, KeyEvent};
+    use evo_gui::keypad::KeyId;
+    use evo_gui::pacer::Speed;
+    use evo_gui::platform::FakePlatform;
+    use evo_gui::prefs::Prefs;
+    use evo_gui::toolbar::Action;
+    use evo_gui::tools::macros::{
+        DEFAULT_SETTLE_MS, MACROS_TITLE, MacroFile, MacroResult, macro_path, screen_sha256,
+    };
+    use sha2::{Digest, Sha256};
+
+    const MS: u64 = CLOCK_HZ / 1000;
+
+    fn frame() -> Frame {
+        Frame {
+            width: 4,
+            height: 2,
+            rgba: (0u8..32).collect(),
+        }
+    }
+
+    fn open(h: &mut Harness<'static, EvoApp>) {
+        open_action(h, Action::Macros);
+        assert!(h.state().features().active(Action::Macros));
+        h.get_by_label(MACROS_TITLE);
+    }
+
+    fn set_script(h: &mut Harness<'static, EvoApp>, s: &str) {
+        h.state_mut()
+            .features_mut()
+            .tools
+            .macros_mut()
+            .set_script(s);
+        h.run_steps(1);
+    }
+
+    fn playing(h: &Harness<'static, EvoApp>) -> bool {
+        h.state().features().tools.macros().is_playing()
+    }
+
+    /// Steps (at least once, so a queued click lands) until `done` holds, at most `max` steps.
+    fn step_until(
+        h: &mut Harness<'static, EvoApp>,
+        max: usize,
+        mut done: impl FnMut(&Harness<'static, EvoApp>) -> bool,
+    ) {
+        for _ in 0..max {
+            h.step();
+            if done(h) {
+                return;
+            }
+        }
+        assert!(done(h), "condition not reached in {max} steps");
+    }
+
+    /// The four events of `"2 add"` from `start`.
+    fn two_add(start: u64) -> Vec<KeyEvent> {
+        vec![
+            kev(KeyId::Two, true, start),
+            kev(KeyId::Two, false, start + 7_800_000),
+            kev(KeyId::Add, true, start + 15_600_000),
+            kev(KeyId::Add, false, start + 23_400_000),
+        ]
+    }
+
+    /// Plays `"2 add"` to the end; returns the probe's key events.
+    fn play_two_add(mut h: Harness<'static, EvoApp>, probe: &FakeProbe) -> Vec<KeyEvent> {
+        open(&mut h);
+        set_script(&mut h, "2 add");
+        h.get_by_label("Play").click();
+        step_until(&mut h, 400, |h| {
+            !playing(h) && probe.key_events().len() == 4
+        });
+        h.get_by_label("Result: done");
+        probe.key_events()
+    }
+
+    #[test]
+    fn screen_sha256_matches_sha2() {
+        let f = frame();
+        let want: String = Sha256::digest(&f.rgba)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(screen_sha256(&f), want);
+        assert_eq!(want.len(), 64);
+        // Only the pixels count, not the size.
+        let other = Frame {
+            width: 8,
+            height: 1,
+            ..frame()
+        };
+        assert_eq!(screen_sha256(&other), want);
+        assert_eq!(
+            screen_sha256(&Frame {
+                width: 0,
+                height: 0,
+                rgba: vec![]
+            }),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn macro_file_roundtrip() {
+        assert_eq!(DEFAULT_SETTLE_MS, 500);
+        let hash = "ab".repeat(32);
+        let m = MacroFile {
+            name: "graph test".into(),
+            script: "2 add 3\nenter".into(),
+            expect_sha256: Some(hash.clone()),
+            settle_ms: 750,
+        };
+        let text = m.to_text();
+        assert!(text.contains(&format!("# expect-sha256: {hash}")), "{text}");
+        assert!(text.contains("# settle-ms: 750"), "{text}");
+        assert_eq!(MacroFile::parse("graph test", &text).unwrap(), m);
+
+        let m = MacroFile {
+            expect_sha256: None,
+            ..m
+        };
+        assert_eq!(MacroFile::parse("graph test", &m.to_text()).unwrap(), m);
+
+        // Unknown '#' lines are ignored; no settle header means the default; CRLF is fine;
+        // an upper-case hash is kept lower-case.
+        let text = format!(
+            "# a note\r\n# EXPECT: no\r\n2 add\r\n# expect-sha256: {}\r\n",
+            "AB".repeat(32)
+        );
+        assert_eq!(
+            MacroFile::parse("x", &text).unwrap(),
+            MacroFile {
+                name: "x".into(),
+                script: "2 add".into(),
+                expect_sha256: Some(hash.clone()),
+                settle_ms: DEFAULT_SETTLE_MS,
+            }
+        );
+
+        assert!(MacroFile::parse("x", "# settle-ms: soon\n2").is_err());
+        assert!(MacroFile::parse("x", "# settle-ms: -1\n2").is_err());
+        assert!(MacroFile::parse("x", "# expect-sha256: 1234\n2").is_err());
+        let text = format!("# expect-sha256: {}\n2", "g".repeat(64));
+        assert!(MacroFile::parse("x", &text).is_err());
+    }
+
+    #[test]
+    fn macro_names_validated() {
+        let dir = std::path::Path::new("data");
+        assert_eq!(
+            macro_path(dir, "graph test_1-a").unwrap(),
+            dir.join("macros").join("graph test_1-a.keys")
+        );
+        assert!(macro_path(dir, &"a".repeat(64)).is_ok());
+        for bad in [
+            "",
+            "../x",
+            "a/b",
+            "a\\b",
+            "x.keys",
+            "caf\u{e9}",
+            " lead",
+            "trail ",
+            "con",
+            "NUL",
+            "com1",
+        ] {
+            assert!(macro_path(dir, bad).is_err(), "{bad:?} accepted");
+        }
+        assert!(macro_path(dir, &"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn record_then_stop_fills_script() {
+        let (mut h, _dir) = tools_harness(FakeBackend::new());
+        open(&mut h);
+        h.get_by_label("Record").click();
+        h.run_steps(3);
+        assert!(h.state().features().tools.macros().is_recording());
+        h.get_by_label("enter").click();
+        h.run_steps(8);
+        h.get_by_label("Stop recording").click();
+        h.run_steps(2);
+        let m = h.state().features().tools.macros();
+        assert!(!m.is_recording());
+        assert_eq!(m.script(), "enter");
+    }
+
+    #[test]
+    fn play_presses_at_scripted_cycles() {
+        let fake = FakeBackend::new();
+        let probe = fake.probe();
+        let (h, _dir) = tools_harness(fake);
+        let events = play_two_add(h, &probe);
+        assert_eq!(events, two_add(events[0].cycle));
+        assert!(probe.held().is_empty());
+    }
+
+    #[test]
+    fn playback_at_unlimited_speed_hits_exact_cycles() {
+        let fake = FakeBackend::new();
+        let probe = fake.probe();
+        let dir = TempDir::new("evo-gui-tools", true);
+        let opts = AppOptions {
+            start_paused: false,
+            prefs: Prefs {
+                speed: Speed::Unlimited,
+                ..Prefs::default()
+            },
+            ..test_options(&dir, FakePlatform::shared())
+        };
+        let h = harness_with(fake, opts);
+        assert_eq!(h.state().speed(), Speed::Unlimited);
+        let events = play_two_add(h, &probe);
+        assert_eq!(events, two_add(events[0].cycle));
+    }
+
+    #[test]
+    fn play_unpauses() {
+        let fake = FakeBackend::new();
+        let probe = fake.probe();
+        let (mut h, _dir) = tools_harness(fake);
+        h.state_mut().set_paused(true);
+        open(&mut h);
+        set_script(&mut h, "2");
+        h.get_by_label("Play").click();
+        h.run_steps(2);
+        assert!(!h.state().paused());
+        step_until(&mut h, 200, |h| !playing(h));
+        assert_eq!(probe.key_events().len(), 2);
+    }
+
+    #[test]
+    fn playback_across_pause_hits_exact_cycles() {
+        let fake = FakeBackend::new();
+        let probe = fake.probe();
+        let (mut h, _dir) = tools_harness(fake);
+        open(&mut h);
+        set_script(&mut h, "2 add");
+        h.get_by_label("Play").click();
+        step_until(&mut h, 200, |_| probe.key_events().len() == 1);
+        h.state_mut().run_action(Action::TogglePause);
+        assert!(h.state().paused());
+        let cycles = probe.cycles();
+        h.run_steps(10);
+        assert_eq!(probe.cycles(), cycles);
+        assert_eq!(probe.held(), vec![KeyId::Two]);
+        assert!(playing(&h));
+        h.state_mut().run_action(Action::TogglePause);
+        assert!(!h.state().paused());
+        step_until(&mut h, 400, |h| !playing(h));
+        let events = probe.key_events();
+        assert_eq!(events, two_add(events[0].cycle));
+        h.get_by_label("Result: done");
+    }
+
+    #[test]
+    fn stop_releases_held_keys() {
+        let fake = FakeBackend::new();
+        let probe = fake.probe();
+        let (mut h, _dir) = tools_harness(fake);
+        open(&mut h);
+        set_script(&mut h, "+alpha wait=60000 -alpha");
+        h.get_by_label("Play").click();
+        step_until(&mut h, 200, |_| probe.key_events().len() == 1);
+        h.get_by_label("Stop").click();
+        h.run_steps(2);
+        assert!(!playing(&h));
+        assert!(probe.held().is_empty());
+        assert_eq!(
+            probe
+                .key_events()
+                .iter()
+                .map(|e| (e.key, e.pressed))
+                .collect::<Vec<_>>(),
+            [(KeyId::Alpha, true), (KeyId::Alpha, false)]
+        );
+        assert!(h.query_by_label_contains("Result:").is_none());
+    }
+
+    #[test]
+    fn reset_ends_playback() {
+        let fake = FakeBackend::new();
+        let probe = fake.probe();
+        let (mut h, _dir) = tools_harness(fake);
+        open(&mut h);
+        set_script(&mut h, "+alpha wait=60000 -alpha 2");
+        h.get_by_label("Play").click();
+        step_until(&mut h, 200, |_| probe.key_events().len() == 1);
+        h.state_mut().run_action(Action::Reset);
+        h.run_steps(4);
+        assert!(!playing(&h));
+        assert!(
+            h.state()
+                .features()
+                .tools
+                .macros()
+                .next_deadline()
+                .is_none()
+        );
+        // Nothing of the script is played after the reset.
+        let presses: Vec<_> = probe
+            .key_events()
+            .into_iter()
+            .filter(|e| e.pressed)
+            .collect();
+        assert_eq!(presses.len(), 1, "{presses:?}");
+    }
+
+    #[test]
+    fn bad_script_is_reported_inline() {
+        let fake = FakeBackend::new();
+        let probe = fake.probe();
+        let (mut h, _dir) = tools_harness(fake);
+        open(&mut h);
+        set_script(&mut h, "2 +nokey");
+        h.get_by_label("Play").click();
+        h.run_steps(2);
+        assert!(!playing(&h));
+        h.get_by_label("key script token 1 `+nokey` is not valid");
+        assert!(probe.key_events().is_empty());
+    }
+
+    fn check_harness() -> (Harness<'static, EvoApp>, TempDir) {
+        let (mut h, dir) = tools_harness(FakeBackend::with_frame(frame()));
+        open(&mut h);
+        set_script(&mut h, "2");
+        (h, dir)
+    }
+
+    #[test]
+    fn check_passes_with_current_screen_hash() {
+        let (mut h, _dir) = check_harness();
+        h.get_by_label("Use current screen").click();
+        h.run_steps(2);
+        let m = h.state().features().tools.macros();
+        assert_eq!(m.expected(), screen_sha256(&frame()));
+        assert!(m.check());
+        h.get_by_label("Play").click();
+        step_until(&mut h, 300, |h| !playing(h));
+        assert_eq!(
+            h.state().features().tools.macros().result(),
+            Some(&MacroResult::Pass)
+        );
+        h.get_by_label("Result: PASS");
+    }
+
+    #[test]
+    fn check_waits_for_settle() {
+        let fake = FakeBackend::with_frame(frame());
+        let probe = fake.probe();
+        let (mut h, _dir) = tools_harness(fake);
+        open(&mut h);
+        set_script(&mut h, "2");
+        h.get_by_label("Use current screen").click();
+        h.run_steps(2);
+        h.get_by_label("Play").click();
+        step_until(&mut h, 300, |_| probe.key_events().len() == 2);
+        assert!(playing(&h));
+        let release = probe.key_events()[1].cycle;
+        assert_eq!(
+            h.state().features().tools.macros().next_deadline(),
+            Some(release + DEFAULT_SETTLE_MS * MS)
+        );
+        step_until(&mut h, 300, |h| !playing(h));
+        // The run stopped exactly at the check cycle.
+        assert_eq!(probe.cycles(), release + DEFAULT_SETTLE_MS * MS);
+    }
+
+    #[test]
+    fn check_fails_with_other_hash() {
+        let (mut h, _dir) = check_harness();
+        let other = "0".repeat(64);
+        h.state_mut()
+            .features_mut()
+            .tools
+            .macros_mut()
+            .set_check(true, &other);
+        h.get_by_label("Play").click();
+        step_until(&mut h, 300, |h| !playing(h));
+        let got = screen_sha256(&frame());
+        assert_eq!(
+            h.state().features().tools.macros().result(),
+            Some(&MacroResult::Fail { got: got.clone() })
+        );
+        h.get_by_label(&format!("Result: FAIL (screen sha256 {got})"));
+    }
+
+    #[test]
+    fn check_without_display_reports_no_frame() {
+        let (mut h, _dir) = tools_harness(FakeBackend::without_display());
+        open(&mut h);
+        set_script(&mut h, "2");
+        h.state_mut()
+            .features_mut()
+            .tools
+            .macros_mut()
+            .set_check(true, &"0".repeat(64));
+        h.get_by_label("Play").click();
+        step_until(&mut h, 300, |h| !playing(h));
+        assert_eq!(
+            h.state().features().tools.macros().result(),
+            Some(&MacroResult::NoFrame)
+        );
+        h.get_by_label("Result: no display frame");
+        // "Use current screen" without a display explains itself and changes nothing.
+        h.get_by_label("Use current screen").click();
+        h.run_steps(2);
+        h.get_by_label("No display frame");
+        assert_eq!(
+            h.state().features().tools.macros().expected(),
+            "0".repeat(64)
+        );
+    }
+
+    #[test]
+    fn check_with_bad_expected_hash_is_refused() {
+        let (mut h, _dir) = check_harness();
+        h.state_mut()
+            .features_mut()
+            .tools
+            .macros_mut()
+            .set_check(true, "abc");
+        h.get_by_label("Play").click();
+        h.run_steps(2);
+        assert!(!playing(&h));
+        h.get_by_label("Expected SHA-256 must be 64 hex digits");
+    }
+
+    #[test]
+    fn save_and_load_macro() {
+        let (mut h, dir) = tools_harness(FakeBackend::new());
+        open(&mut h);
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Name")
+            .click();
+        h.run_steps(1);
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Name")
+            .type_text("sum");
+        h.run_steps(1);
+        set_script(&mut h, "2 add 3 enter");
+        let hash = "cd".repeat(32);
+        h.state_mut()
+            .features_mut()
+            .tools
+            .macros_mut()
+            .set_check(true, &hash);
+        h.run_steps(1);
+        h.get_by_label("Save").click();
+        h.run_steps(2);
+        let path = dir.join("macros").join("sum.keys");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            MacroFile::parse("sum", &text).unwrap(),
+            MacroFile {
+                name: "sum".into(),
+                script: "2 add 3 enter".into(),
+                expect_sha256: Some(hash.clone()),
+                settle_ms: DEFAULT_SETTLE_MS,
+            }
+        );
+
+        // A garbage file next to it is listed but fails to load without changing anything.
+        std::fs::write(dir.join("macros").join("junk.keys"), "# settle-ms: x\n").unwrap();
+        set_script(&mut h, "mode");
+        h.state_mut()
+            .features_mut()
+            .tools
+            .macros_mut()
+            .set_check(false, "");
+        h.get_by_label("Load").click();
+        h.run_steps(2);
+        h.get_by_label("junk").click();
+        h.run_steps(2);
+        assert_eq!(h.state().features().tools.macros().script(), "mode");
+        h.get_by_label("sum").click();
+        h.run_steps(2);
+        let m = h.state().features().tools.macros();
+        assert_eq!(m.script(), "2 add 3 enter");
+        assert_eq!(m.name(), "sum");
+        assert!(m.check());
+        assert_eq!(m.expected(), hash);
+    }
+
+    #[test]
+    fn save_with_bad_name_is_refused() {
+        let (mut h, dir) = tools_harness(FakeBackend::new());
+        open(&mut h);
+        h.state_mut()
+            .features_mut()
+            .tools
+            .macros_mut()
+            .set_name("../x");
+        h.run_steps(1);
+        h.get_by_label("Save").click();
+        h.run_steps(2);
+        assert!(!dir.join("macros").exists());
+        assert!(!dir.join("x.keys").exists());
+        assert!(
+            h.state()
+                .features()
+                .tools
+                .macros()
+                .error()
+                .is_some_and(|e| e.starts_with("Macro name"))
+        );
+    }
+
+    #[test]
+    fn oversized_macro_file_is_refused_unread() {
+        let (mut h, dir) = tools_harness(FakeBackend::new());
+        open(&mut h);
+        std::fs::create_dir_all(dir.join("macros")).unwrap();
+        let f = std::fs::File::create(dir.join("macros").join("big.keys")).unwrap();
+        f.set_len(64 * 1024 * 1024).unwrap();
+        drop(f);
+        set_script(&mut h, "mode");
+        h.get_by_label("Load").click();
+        h.run_steps(2);
+        h.get_by_label("big").click();
+        h.run_steps(2);
+        assert_eq!(h.state().features().tools.macros().script(), "mode");
+        assert!(
+            h.state()
+                .features()
+                .tools
+                .macros()
+                .error()
+                .is_some_and(|e| e.contains("too large"))
+        );
+    }
 }

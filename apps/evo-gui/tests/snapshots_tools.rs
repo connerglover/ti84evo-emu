@@ -38,3 +38,20 @@ fn snapshot_tools_key_history() {
     h.run_steps(5);
     h.snapshot("tools_key_history");
 }
+
+#[test]
+#[cfg_attr(
+    not(feature = "snapshots"),
+    ignore = "golden images: cargo test -p evo-gui --features snapshots"
+)]
+fn snapshot_tools_macros() {
+    let _gpu = gpu_lock();
+    let mut h = snap_harness(FakeBackend::new(), [520.0, 960.0], FakePlatform::shared());
+    let macros = h.state_mut().features_mut().tools.macros_mut();
+    macros.set_name("sum");
+    macros.set_script("2 add 3 enter");
+    macros.set_check(true, &"0123456789abcdef".repeat(4));
+    open_action(&mut h, Action::Macros);
+    h.run_steps(5);
+    h.snapshot("tools_macros");
+}
