@@ -19,7 +19,7 @@ use evo_hw::dev::rtc::Rtc;
 use evo_hw::dev::sysctl::Spctrl;
 use evo_hw::{DeviceInspect, RegView};
 
-use crate::Machine;
+use crate::{Machine, StopReason};
 
 /// LR values from here up are `EXC_RETURN` values: in a handler, `bx lr` returns from the
 /// exception rather than to an address.
@@ -41,21 +41,20 @@ pub enum RunGoal {
 impl Machine {
     /// Step over the instruction at the PC. A call (`BL`, `BLX <reg>`, `BLXNS`) arms a
     /// [`RunGoal::Return`] to the instruction after it at the current stack pointer and returns
-    /// true; the call runs with the next [`run`](Self::run). Anything else (and an
+    /// `None`; the call runs with the next [`run`](Self::run). Anything else (and an
     /// instruction that cannot be read) is executed now with one [`step`](Self::step), and
-    /// this returns false. Either way the goal armed before is replaced.
-    pub fn arm_step_over(&mut self) -> bool {
+    /// this returns `Some` with that step's stop reason. Either way the old goal is replaced.
+    pub fn arm_step_over(&mut self) -> Option<StopReason> {
         let pc = self.cpu.regs.pc;
         if let Some(len) = self.call_len(pc) {
             self.goal = Some(RunGoal::Return {
                 pc: pc.wrapping_add(len),
                 sp: self.cpu.regs.sp(),
             });
-            return true;
+            return None;
         }
         self.goal = None;
-        self.step();
-        false
+        Some(self.step())
     }
 
     /// Run until the current function or handler returns. In a handler with an `EXC_RETURN`

@@ -43,6 +43,105 @@ fn backend(code: &[u16]) -> MachineBackend {
     MachineBackend::from_bytes(&bundle_bytes(code), "test.84b2".into(), &nv_dir()).unwrap()
 }
 
+fn stopped_store_app() -> (
+    egui_kittest::Harness<'static, evo_gui::app::EvoApp>,
+    TempDir,
+) {
+    let dir = nv_dir();
+    let mut b = backend(&STORE);
+    let flash = dir.join("synthetic.evoflash");
+    b.export_flash(&flash).unwrap();
+    b.import_flash(&flash).unwrap();
+    b.set_breakpoints(vec![STORE_PC]);
+    b.set_watchpoints(vec![write_watch(STORE_ADDR, 4)]).unwrap();
+    let opts = common::test_options(&dir, evo_gui::platform::FakePlatform::shared());
+    let mut h = egui_kittest::Harness::builder()
+        .with_size([1060.0, 960.0])
+        .with_step_dt(1.0 / 60.0)
+        .build_eframe(|cc| evo_gui::app::EvoApp::new(&cc.egui_ctx, Box::new(b), opts));
+    h.run_steps(3);
+    assert_eq!(h.state().status(), RunStatus::Breakpoint(STORE_PC));
+    assert!(h.state().paused());
+    (h, dir)
+}
+
+fn assert_store_hit(h: &mut egui_kittest::Harness<'static, evo_gui::app::EvoApp>) {
+    assert!(
+        h.state().paused(),
+        "the watchpoint must keep execution paused"
+    );
+    assert_eq!(
+        h.state().status(),
+        RunStatus::Watchpoint {
+            addr: STORE_ADDR,
+            dir: AccessDir::Write,
+            value: 0x41,
+            pc: STORE_PC,
+        }
+    );
+    let cycles = h.state().backend().cycles();
+    h.run_steps(3);
+    assert_eq!(h.state().backend().cycles(), cycles);
+    h.state_mut().set_paused(false);
+    h.run_steps(3);
+    assert!(!h.state().paused());
+    assert_eq!(h.state().status(), RunStatus::Running);
+}
+
+#[test]
+fn resume_from_breakpoint_preserves_watchpoint_stop() {
+    let (mut h, _dir) = stopped_store_app();
+    h.state_mut().set_paused(false);
+    assert_store_hit(&mut h);
+}
+
+#[test]
+fn step_over_from_breakpoint_preserves_watchpoint_stop() {
+    use egui_kittest::kittest::Queryable;
+    let (mut h, _dir) = stopped_store_app();
+    h.get_by_label("Step over").click();
+    h.run_steps(3);
+    assert_store_hit(&mut h);
+}
+
+#[test]
+fn step_over_reports_guest_bkpt_and_lockup_like_step() {
+    for instruction in [0xBE42, 0xDE00] {
+        let mut plain = backend(&[instruction]);
+        let mut over = backend(&[instruction]);
+        let mut stopped = false;
+        for _ in 0..8 {
+            let expected = plain.step();
+            assert_eq!(over.begin_goal(Goal::StepOver).unwrap(), Some(expected));
+            assert_eq!(over.cpu(), plain.cpu());
+            if matches!(expected, RunStatus::Bkpt { .. } | RunStatus::Lockup { .. }) {
+                stopped = true;
+                break;
+            }
+        }
+        assert!(stopped, "instruction {instruction:#x} did not stop");
+    }
+}
+
+#[test]
+fn plain_step_over_clears_the_previous_breakpoint_status() {
+    use egui_kittest::kittest::Queryable;
+    let (mut h, _dir) = stopped_store_app();
+    h.state_mut().backend_mut().set_watchpoints(vec![]).unwrap();
+    h.get_by_label("Step over").click();
+    h.run_steps(3);
+    assert!(h.state().paused());
+    assert_eq!(h.state().status(), RunStatus::Running);
+    assert_eq!(h.state().backend().cpu().core[15], STORE_PC + 2);
+    let cycles = h.state().backend().cycles();
+    h.state_mut().set_paused(false);
+    assert_eq!(
+        h.state().backend().cycles(),
+        cycles,
+        "Resume must not insert an extra step"
+    );
+}
+
 /// Where `MachineBackend` keeps the flash file of `bundle` under `dir`.
 fn nv_path_for(dir: &Path, bundle: &[u8]) -> PathBuf {
     dir.join(format!("{:016x}.nv", fnv1a64(bundle)))
@@ -584,24 +683,27 @@ fn bus_monitor_records_the_store() {
 fn step_over_and_run_to_goals() {
     let mut b = backend(&CALL);
     // Over the call: it runs, and the run stops after it.
-    assert!(b.begin_goal(Goal::StepOver).unwrap());
+    assert_eq!(b.begin_goal(Goal::StepOver).unwrap(), None);
     assert_eq!(b.run_for(1000), RunStatus::Goal { pc: 0x100B_0604 });
     assert_eq!(b.cpu().core[1], 1);
     // Over a plain instruction: done at once.
-    assert!(!b.begin_goal(Goal::StepOver).unwrap());
+    assert_eq!(
+        b.begin_goal(Goal::StepOver).unwrap(),
+        Some(RunStatus::Running)
+    );
     assert_eq!(b.cpu().core[15], 0x100B_0606);
     assert_eq!(b.cpu().core[0], 7);
     // Run to an address the program never reaches: armed until cancelled.
-    assert!(b.begin_goal(Goal::RunTo(0x100B_0608)).unwrap());
+    assert_eq!(b.begin_goal(Goal::RunTo(0x100B_0608)).unwrap(), None);
     assert_eq!(b.run_for(1000), RunStatus::Running);
     b.cancel_goal();
     assert_eq!(b.run_for(1000), RunStatus::Running);
 
     let mut b = backend(&CALL);
-    assert!(b.begin_goal(Goal::RunTo(0x100B_0611)).unwrap());
+    assert_eq!(b.begin_goal(Goal::RunTo(0x100B_0611)).unwrap(), None);
     assert_eq!(b.run_for(1000), RunStatus::Goal { pc: 0x100B_0610 });
     // Step out of the function returns to the instruction after the call.
-    assert!(b.begin_goal(Goal::StepOut).unwrap());
+    assert_eq!(b.begin_goal(Goal::StepOut).unwrap(), None);
     assert_eq!(b.run_for(1000), RunStatus::Goal { pc: 0x100B_0604 });
 }
 
@@ -629,7 +731,7 @@ fn reset_keeps_watchpoints() {
     b.run_for(1000);
     b.clear_bus_records();
     // A goal armed before the reset is dropped.
-    assert!(b.begin_goal(Goal::RunTo(0x100B_0602)).unwrap());
+    assert_eq!(b.begin_goal(Goal::RunTo(0x100B_0602)).unwrap(), None);
     b.reset();
     assert_eq!(b.watchpoints(), set);
     assert_eq!(b.breakpoints(), vec![0x100B_0700]);

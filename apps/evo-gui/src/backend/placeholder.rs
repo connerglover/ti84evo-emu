@@ -111,7 +111,7 @@ impl EmuBackend for Placeholder {
         ))
     }
     fn set_breakpoints(&mut self, _addrs: Vec<u32>) {}
-    fn begin_goal(&mut self, _goal: Goal) -> Result<bool, BackendError> {
+    fn begin_goal(&mut self, _goal: Goal) -> Result<Option<RunStatus>, BackendError> {
         Err(BackendError::Unsupported(
             "debugger goals without a machine",
         ))

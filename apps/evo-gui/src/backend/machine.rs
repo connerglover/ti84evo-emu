@@ -614,16 +614,16 @@ impl EmuBackend for MachineBackend {
         self.machine.breakpoints = addrs.into_iter().collect();
     }
 
-    fn begin_goal(&mut self, goal: Goal) -> Result<bool, BackendError> {
+    fn begin_goal(&mut self, goal: Goal) -> Result<Option<RunStatus>, BackendError> {
         Ok(match goal {
-            Goal::StepOver => self.machine.arm_step_over(),
+            Goal::StepOver => self.machine.arm_step_over().map(run_status),
             Goal::StepOut => {
                 self.machine.arm_step_out();
-                true
+                None
             }
             Goal::RunTo(addr) => {
                 self.machine.arm_run_to(addr);
-                true
+                None
             }
         })
     }

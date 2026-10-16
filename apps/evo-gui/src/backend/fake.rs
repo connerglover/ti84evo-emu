@@ -655,18 +655,18 @@ impl EmuBackend for FakeBackend {
         self.breakpoints = addrs;
     }
 
-    fn begin_goal(&mut self, goal: Goal) -> Result<bool, BackendError> {
+    fn begin_goal(&mut self, goal: Goal) -> Result<Option<RunStatus>, BackendError> {
         self.shared().goals.push(goal);
         let target = match goal {
             Goal::StepOver => {
-                self.step();
-                return Ok(false);
+                self.shared().goal = None;
+                return Ok(Some(self.step()));
             }
             Goal::StepOut => FAKE_PC + 0x40,
             Goal::RunTo(a) => a & !1,
         };
         self.shared().goal = Some(target);
-        Ok(true)
+        Ok(None)
     }
 
     fn cancel_goal(&mut self) {

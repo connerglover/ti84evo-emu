@@ -321,9 +321,9 @@ pub trait EmuBackend: Send {
     fn set_banked_reg(&mut self, name: &str, value: u32) -> Result<(), BackendError>;
     /// Replaces every breakpoint.
     fn set_breakpoints(&mut self, addrs: Vec<u32>);
-    /// Starts a goal: `Ok(true)` when it is armed (a later [`run_for`](Self::run_for)
-    /// returns [`RunStatus::Goal`] when it is reached), `Ok(false)` when it is done at once.
-    fn begin_goal(&mut self, goal: Goal) -> Result<bool, BackendError>;
+    /// Starts a goal: `Ok(None)` when armed (a later [`run_for`](Self::run_for) returns
+    /// [`RunStatus::Goal`] when reached), `Ok(Some(status))` when one step completed it now.
+    fn begin_goal(&mut self, goal: Goal) -> Result<Option<RunStatus>, BackendError>;
     /// Disarms the goal, if any.
     fn cancel_goal(&mut self);
     fn watchpoints(&self) -> Vec<Watchpoint>;

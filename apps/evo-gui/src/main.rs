@@ -48,8 +48,7 @@ fn main() -> ExitCode {
     ) {
         Ok(lock) => lock,
         Err(e) => {
-            eprintln!("evo-gui: {e}");
-            return ExitCode::from(1);
+            return startup_error(&e.to_string());
         }
     };
     let data_dir = lock.dir.clone();
@@ -59,8 +58,7 @@ fn main() -> ExitCode {
             Choice::Bundle(path) => match MachineBackend::open(&path, &data_dir.join("flash")) {
                 Ok(b) => Some((Box::new(b), Some(path))),
                 Err(e) => {
-                    eprintln!("evo-gui: {}: {e}", path.display());
-                    return ExitCode::from(1);
+                    return startup_error(&format!("{}: {e}", path.display()));
                 }
             },
             Choice::FromPrefs => None,
@@ -70,11 +68,25 @@ fn main() -> ExitCode {
     drop(lock);
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("evo-gui: {e}");
-            ExitCode::from(1)
-        }
+        Err(e) => startup_error(&e.to_string()),
     }
+}
+
+fn startup_error(message: &str) -> ExitCode {
+    report_startup_error(message, |message| {
+        rfd::MessageDialog::new()
+            .set_title("TI-84 Evo Emulator could not start")
+            .set_description(message)
+            .set_level(rfd::MessageLevel::Error)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    })
+}
+
+fn report_startup_error(message: &str, show: impl FnOnce(&str)) -> ExitCode {
+    eprintln!("evo-gui: {message}");
+    show(message);
+    ExitCode::from(1)
 }
 
 fn run(opened: Opened, data_dir: PathBuf, instance: Option<String>) -> eframe::Result {
@@ -125,4 +137,17 @@ fn run(opened: Opened, data_dir: PathBuf, instance: Option<String>) -> eframe::R
             Ok(Box::new(EvoApp::new(&cc.egui_ctx, backend, opts)))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn startup_failure_is_shown_before_exiting() {
+        for message in ["instance lab is already running", "rename: access denied"] {
+            let mut shown = None;
+            let code = super::report_startup_error(message, |s| shown = Some(s.to_owned()));
+            assert_eq!(shown.as_deref(), Some(message));
+            assert_eq!(code, std::process::ExitCode::from(1));
+        }
+    }
 }

@@ -145,6 +145,58 @@ fn rename_onto_existing_is_refused() {
     assert!(b.join("instances").join("old").join("x").is_file());
 }
 
+#[cfg(windows)]
+#[test]
+fn rename_retries_a_transient_windows_sharing_violation() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let b = base("sharing");
+    let old = prepare(&b, Some("old"), None).unwrap();
+    let path = old.dir.join("held");
+    std::fs::write(&path, b"saved data").unwrap();
+    drop(old);
+    // Unlike a normal Rust handle, this explicitly disallows delete/rename sharing.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&path)
+        .unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(120));
+        drop(held);
+    });
+    let renamed = prepare(&b, Some("new"), Some("old"));
+    release.join().unwrap();
+    let renamed = renamed.unwrap();
+    assert_eq!(
+        std::fs::read(renamed.dir.join("held")).unwrap(),
+        b"saved data"
+    );
+    assert!(!b.join("instances/old").exists());
+}
+
+#[test]
+fn rename_refuses_destination_created_while_waiting() {
+    let b = base("destination-race");
+    let old = prepare(&b, Some("old"), None).unwrap();
+    std::fs::write(old.dir.join("source"), b"source").unwrap();
+    let base_path = b.to_path_buf();
+    let worker = std::thread::spawn(move || prepare(&base_path, Some("new"), Some("old")));
+    std::thread::sleep(Duration::from_millis(100));
+    let target = b.join("instances/new");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("destination"), b"destination").unwrap();
+    drop(old);
+    assert!(worker.join().unwrap().is_err());
+    assert_eq!(
+        std::fs::read(b.join("instances/old/source")).unwrap(),
+        b"source"
+    );
+    assert_eq!(
+        std::fs::read(target.join("destination")).unwrap(),
+        b"destination"
+    );
+}
+
 #[test]
 fn rename_without_new_id_is_invalid() {
     let b = base("renamenoid");

@@ -472,6 +472,10 @@ impl EvoApp {
         }
         if matches!(self.status, RunStatus::Breakpoint(_)) {
             self.status = self.backend.step();
+            if self.status.is_stop() {
+                self.speed.reset();
+                return;
+            }
         }
         self.paused = false;
         if !self.status.is_stop() {
@@ -1032,12 +1036,12 @@ impl EvoApp {
             && self.paused
         {
             match self.backend.begin_goal(goal) {
-                Ok(true) => {
+                Ok(None) => {
                     self.paused = false;
                     self.status = RunStatus::Running;
                     self.speed.reset();
                 }
-                Ok(false) => {}
+                Ok(Some(status)) => self.status = status,
                 Err(e) => self.toasts.push(e.to_string(), ToastKind::Error),
             }
         }

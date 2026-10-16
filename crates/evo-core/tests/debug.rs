@@ -449,7 +449,7 @@ const BUDGET: u64 = 1_000_000;
 fn step_over_a_call_stops_after_it() {
     let mut m = call().boot();
     assert_eq!(m.cpu.regs.pc, addr(CODE));
-    assert!(m.arm_step_over());
+    assert_eq!(m.arm_step_over(), None);
     assert!(matches!(
         m.goal(),
         Some(RunGoal::Return {
@@ -468,7 +468,7 @@ fn step_over_a_plain_instruction_steps_once() {
     let mut m = call().boot();
     m.arm_run_to(addr(0x220));
     assert_eq!(m.run(BUDGET), StopReason::Goal { pc: 0x100B_0620 });
-    assert!(!m.arm_step_over());
+    assert_eq!(m.arm_step_over(), Some(StopReason::Stepped));
     assert_eq!(m.cpu.regs.pc, 0x100B_0622);
     assert_eq!(m.cpu.regs.r[2], 100);
     assert_eq!(m.goal(), None);
@@ -481,7 +481,7 @@ fn step_over_recursion_waits_for_the_outer_return() {
     assert_eq!(m.run(BUDGET), StopReason::Goal { pc: 0x100B_0646 });
     assert_eq!(m.cpu.regs.r[2], 2, "depth 1");
     let sp = m.cpu.regs.sp();
-    assert!(m.arm_step_over());
+    assert_eq!(m.arm_step_over(), None);
     assert_eq!(m.run(BUDGET), StopReason::Goal { pc: 0x100B_064A });
     assert_eq!(m.cpu.regs.sp(), sp, "the outer return, not a deeper one");
     assert_eq!(m.cpu.regs.r[2], 0);
@@ -546,7 +546,7 @@ fn breakpoint_before_goal_keeps_goal_armed() {
     let mut m = call().boot();
     // `bx lr`, which runs once (the brief's 0x100B_0622 is the loop's `subs`, hit 100 times).
     m.breakpoints.insert(0x100B_0626);
-    assert!(m.arm_step_over());
+    assert_eq!(m.arm_step_over(), None);
     assert_eq!(m.run(BUDGET), StopReason::Breakpoint(0x100B_0626));
     assert!(m.goal().is_some());
     assert_eq!(m.run(BUDGET), StopReason::Goal { pc: 0x100B_0604 });
@@ -947,5 +947,31 @@ fn power_state_at_power_on() {
             hold: false,
             deep_sleep: false
         }
+    );
+}
+
+#[test]
+fn step_over_preserves_data_hit() {
+    let mut m = store().boot();
+    m.set_watchpoints(vec![range(WORD, 4, kinds(false, true, false))])
+        .unwrap();
+    for _ in 0..3 {
+        assert_eq!(m.step(), StopReason::Stepped);
+    }
+    assert_eq!(m.cpu.regs.pc, STORE_PC);
+    assert_eq!(
+        m.arm_step_over(),
+        Some(StopReason::Watchpoint {
+            addr: WORD,
+            dir: AccessDir::Write,
+            value: 1,
+            pc: STORE_PC,
+        })
+    );
+    assert_eq!(m.bus.peek(WORD, 4), Some(1), "store ran");
+    assert_eq!(
+        m.step(),
+        StopReason::Stepped,
+        "the hit is delivered exactly once"
     );
 }

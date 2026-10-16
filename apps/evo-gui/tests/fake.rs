@@ -335,16 +335,19 @@ fn register_overrides() {
 fn goals_arm_and_finish() {
     let mut fake = FakeBackend::new();
     let probe = fake.probe();
-    assert!(!fake.begin_goal(Goal::StepOver).unwrap());
+    assert_eq!(
+        fake.begin_goal(Goal::StepOver).unwrap(),
+        Some(RunStatus::Running)
+    );
     assert_eq!(fake.cycles(), 1);
-    assert!(fake.begin_goal(Goal::RunTo(0x1000_0203)).unwrap());
+    assert_eq!(fake.begin_goal(Goal::RunTo(0x1000_0203)).unwrap(), None);
     assert!(probe.goal_armed());
     assert_eq!(fake.run_for(5000), RunStatus::Goal { pc: 0x1000_0202 });
     assert!(RunStatus::Goal { pc: 0 }.is_stop());
     assert_eq!(fake.cycles(), 1001);
     assert!(!probe.goal_armed());
     assert_eq!(fake.run_for(5000), RunStatus::Running);
-    assert!(fake.begin_goal(Goal::StepOut).unwrap());
+    assert_eq!(fake.begin_goal(Goal::StepOut).unwrap(), None);
     assert_eq!(fake.run_for(10), RunStatus::Goal { pc: FAKE_PC + 0x40 });
     assert_eq!(fake.cycles(), 6011);
     assert_eq!(
@@ -357,7 +360,7 @@ fn goals_arm_and_finish() {
 fn cancel_goal_disarms() {
     let mut fake = FakeBackend::new();
     let probe = fake.probe();
-    assert!(fake.begin_goal(Goal::RunTo(0x1000_0300)).unwrap());
+    assert_eq!(fake.begin_goal(Goal::RunTo(0x1000_0300)).unwrap(), None);
     fake.cancel_goal();
     assert_eq!(probe.goal_cancels(), 1);
     assert!(!probe.goal_armed());
@@ -369,7 +372,7 @@ fn cancel_goal_disarms() {
 fn never_reached_goal_stays_armed() {
     let mut fake = FakeBackend::new().goal_never_reached();
     let probe = fake.probe();
-    assert!(fake.begin_goal(Goal::RunTo(0x1000_0300)).unwrap());
+    assert_eq!(fake.begin_goal(Goal::RunTo(0x1000_0300)).unwrap(), None);
     for _ in 0..3 {
         assert_eq!(fake.run_for(5000), RunStatus::Running);
     }
@@ -386,7 +389,7 @@ fn load_state_disarms_goal_and_clears_overrides() {
     let state = fake.save_state().unwrap();
     fake.poke(0x2000_0000, &[0xEE]).unwrap();
     fake.set_core_reg(0, 0x55).unwrap();
-    assert!(fake.begin_goal(Goal::StepOut).unwrap());
+    assert_eq!(fake.begin_goal(Goal::StepOut).unwrap(), None);
     fake.load_state(&state).unwrap();
     assert!(!probe.goal_armed());
     assert_eq!(fake.peek(0x2000_0000, 1), vec![Some(0)]);

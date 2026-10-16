@@ -671,7 +671,7 @@ fn pause_cancels_goal() {
         .state_mut()
         .backend_mut()
         .begin_goal(Goal::RunTo(0x1000_0300));
-    assert!(armed.unwrap());
+    assert_eq!(armed.unwrap(), None);
     h.state_mut().apply_request(AppRequest::SetPaused(false));
     h.state_mut().apply_request(AppRequest::SetPaused(true));
     assert_eq!(probe.goal_cancels(), 1);
@@ -687,7 +687,7 @@ fn endless_goal_keeps_running_until_pause() {
         .state_mut()
         .backend_mut()
         .begin_goal(Goal::RunTo(0x1000_0300));
-    assert!(armed.unwrap());
+    assert_eq!(armed.unwrap(), None);
     h.state_mut().apply_request(AppRequest::SetPaused(false));
     let mut last = probe.cycles();
     for _ in 0..20 {

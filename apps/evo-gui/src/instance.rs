@@ -143,5 +143,92 @@ fn rename(base: &Path, old: &str, new: &str) -> Result<(), InstanceError> {
         file.lock().map_err(|e| io_err(&path, e))?;
         // The handle closes here: Windows cannot rename a directory with an open file in it.
     }
-    std::fs::rename(&from, &to).map_err(|e| io_err(&from, e))
+    retry_rename(
+        || {
+            // The destination can appear while waiting for the old process or retrying.
+            if to.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("instance {new} already exists"),
+                ));
+            }
+            std::fs::rename(&from, &to)
+        },
+        std::thread::sleep,
+    )
+    .map_err(|e| io_err(&from, e))
+}
+
+/// Windows indexers and antivirus can briefly hold a handle after the app exits.
+/// Retry only sharing/lock violations and permission errors, with a bounded backoff.
+fn retry_rename(
+    mut rename: impl FnMut() -> std::io::Result<()>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> std::io::Result<()> {
+    for attempt in 0..6 {
+        match rename() {
+            Err(e)
+                if attempt < 5
+                    && (e.kind() == std::io::ErrorKind::PermissionDenied
+                        || (cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33)))) =>
+            {
+                sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the last attempt always returns")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_rename;
+    use std::io::{Error, ErrorKind};
+    use std::time::Duration;
+
+    #[test]
+    fn transient_rename_failure_retries_then_succeeds() {
+        let mut calls = 0;
+        let mut delays = Vec::new();
+        retry_rename(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(Error::from(ErrorKind::PermissionDenied))
+                } else {
+                    Ok(())
+                }
+            },
+            |d| delays.push(d),
+        )
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(
+            delays,
+            [Duration::from_millis(50), Duration::from_millis(100)]
+        );
+    }
+
+    #[test]
+    fn rename_retry_is_bounded_and_permanent_errors_return_immediately() {
+        for (kind, expected) in [
+            (ErrorKind::PermissionDenied, 6),
+            (ErrorKind::NotFound, 1),
+            (ErrorKind::AlreadyExists, 1),
+        ] {
+            let mut calls = 0;
+            let mut sleeps = 0;
+            let error = retry_rename(
+                || {
+                    calls += 1;
+                    Err(Error::from(kind))
+                },
+                |_| sleeps += 1,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(calls, expected);
+            assert_eq!(sleeps, expected - 1);
+        }
+    }
 }

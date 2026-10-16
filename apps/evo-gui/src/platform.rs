@@ -8,6 +8,7 @@ use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use crate::backend::fake::FakeBackend;
 use crate::backend::machine::MachineBackend;
@@ -15,6 +16,13 @@ use crate::backend::{EmuBackend, Frame};
 
 /// Largest HTTP reply body [`DesktopPlatform::http_get`] reads (the update check needs a few KiB).
 pub const HTTP_BODY_LIMIT: u64 = 1024 * 1024;
+
+fn update_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .build()
+        .into()
+}
 
 /// One file-type filter of an open or save dialog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,7 +113,8 @@ impl Platform for DesktopPlatform {
     }
 
     fn http_get(&self, url: &str) -> Result<String, String> {
-        let reply = ureq::get(url)
+        let reply = update_agent()
+            .get(url)
             .header("User-Agent", concat!("evo-gui/", env!("CARGO_PKG_VERSION")))
             .header("Accept", "application/vnd.github+json")
             .call();
@@ -295,5 +304,17 @@ impl Platform for FakePlatform {
     fn spawn_instance(&self, args: &[String]) -> Result<(), String> {
         self.state().spawned.push(args.to_vec());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn update_http_has_a_finite_whole_request_timeout() {
+        // Uses the production agent configuration, independent of FakePlatform.
+        assert_eq!(
+            super::update_agent().config().timeouts().global,
+            Some(std::time::Duration::from_secs(30))
+        );
     }
 }
