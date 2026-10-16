@@ -134,6 +134,12 @@ impl Cpu {
         self.highest_pending().is_some()
     }
 
+    /// Number of active exceptions, both security states: 0 in Thread mode, 1 in a handler,
+    /// more while handlers are nested (e.g. for a debugger's step out of a handler).
+    pub fn active_exceptions(&self) -> u32 {
+        self.active_count()
+    }
+
     // ---- Exception state ----
 
     pub(crate) fn exc_pending(&self, num: u16, sec: Sec) -> bool {

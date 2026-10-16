@@ -47,6 +47,12 @@
 //! next run executes it first. While anything is watched (or the bus monitor records),
 //! `run` takes the checked path instead of batches ([`Machine::batched_runs`]).
 //!
+//! # Goals
+//!
+//! Step over, step out and run to arm a [`RunGoal`] ([`crate::debug`]) that `run` checks
+//! before each step, ahead of breakpoints; reaching it stops the run with
+//! [`StopReason::Goal`]. While a goal is armed, `run` takes the checked path too.
+//!
 //! # Save states
 //!
 //! [`Machine::save_state`] / [`Machine::load_state`] (in [`crate::state`]): CPU, scheduler,
@@ -69,6 +75,7 @@ use evo_hw::{
 use evo_image::{Bundle, ImageError, Layout};
 use serde::{Deserialize, Serialize};
 
+use crate::debug::RunGoal;
 use crate::{EventKind, Scheduler, state};
 
 pub use evo_hw::CPU_HZ;
@@ -222,6 +229,9 @@ pub struct Machine {
     /// `run_batch` calls since power-on. Statistics only: not saved.
     #[serde(skip)]
     pub(crate) batched: u64,
+    /// The run goal ([`crate::debug`]). Debugger setting: not saved; a restore clears it.
+    #[serde(skip)]
+    pub(crate) goal: Option<RunGoal>,
 }
 
 impl Machine {
@@ -274,7 +284,8 @@ impl Machine {
     /// [`from_bundle_nv`](Self::from_bundle_nv) builds from [`nv_state`](Self::nv_state) (the
     /// bundle's images are already in that flash). Flash and the NOR security registers are
     /// kept; the CPU, SRAM, devices, time, `resets`, breakpoints, watchpoints (and any pending
-    /// hit), the bus monitor, held keys and host inputs start over as at power-on.
+    /// hit), the bus monitor, the run goal, held keys and host inputs start over as at
+    /// power-on.
     pub fn power_cycle(&mut self) {
         let nv = self.nv_state();
         let unbatched = self.unbatched;
@@ -315,6 +326,7 @@ impl Machine {
             unbatched: false,
             exec_watch: Vec::new(),
             batched: 0,
+            goal: None,
         };
         if let Some(secregs) = secregs {
             m.with_dev("spif", |s: &mut Spif, _| s.nor_mut().set_secregs(secregs));
@@ -444,12 +456,13 @@ impl Machine {
 
     /// Run for up to `max_cycles` cycles from now.
     ///
-    /// Stops before an instruction at a breakpoint or in an exec watchpoint (a run that starts
-    /// where the previous run stopped this way executes it first), after an instruction that
+    /// Stops before an instruction where the run goal is reached, at a breakpoint or in an exec
+    /// watchpoint (a run that starts where the previous run stopped this way executes it
+    /// first), after an instruction that
     /// matched a read/write watchpoint, on lockup, on a guest `BKPT`, when the budget is used
     /// up, or when the CPU is asleep with nothing left to wake it ([`StopReason::Idle`]).
     ///
-    /// While no breakpoint or watchpoint is set and the bus monitor is off, the CPU steps in
+    /// While no breakpoint, watchpoint or goal is set and the bus monitor is off, the CPU steps in
     /// batches that end at the next due event, when
     /// a device runs, or when the CPU sleeps; each step does exactly what it does one at a
     /// time, so the result is the same as [`set_batching(false)`](Self::set_batching).
@@ -479,13 +492,14 @@ impl Machine {
         }
     }
 
-    /// Whether `run` must check every step: a breakpoint or watchpoint is set, the bus
+    /// Whether `run` must check every step: a breakpoint, watchpoint or goal is set, the bus
     /// monitor records, or the last run stopped on an instruction it has to step over.
     #[inline]
     fn needs_checks(&self) -> bool {
         !self.breakpoints.is_empty()
             || self.stopped_at.is_some()
             || !self.exec_watch.is_empty()
+            || self.goal.is_some()
             || self.bus.watching()
     }
 
@@ -601,9 +615,9 @@ impl Machine {
         stop
     }
 
-    /// One step of `run_with` on the awake CPU: stop at a breakpoint or exec watchpoint (unless
-    /// the last run stopped there), call `before_step`, step, then stop if the step matched a
-    /// read/write watchpoint.
+    /// One step of `run_with` on the awake CPU: stop where the goal is reached, at a breakpoint
+    /// or at an exec watchpoint (unless the last run stopped there), call `before_step`, step,
+    /// then stop if the step matched a read/write watchpoint.
     #[inline(always)]
     fn checked_step(
         &mut self,
@@ -611,6 +625,11 @@ impl Machine {
     ) -> Option<StopReason> {
         let pc = self.cpu.regs.pc;
         let resumed = self.stopped_at.take() == Some(pc);
+        if !resumed && self.goal.is_some() && self.goal_reached(pc) {
+            self.goal = None;
+            self.stopped_at = Some(pc);
+            return Some(StopReason::Goal { pc });
+        }
         if !resumed && !self.breakpoints.is_empty() && self.breakpoints.contains(&pc) {
             self.stopped_at = Some(pc);
             return Some(StopReason::Breakpoint(pc));

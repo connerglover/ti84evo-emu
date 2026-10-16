@@ -1,10 +1,13 @@
-//! `Machine` debugging: watchpoints that stop the run.
+//! `Machine` debugging: watchpoints that stop the run, and run goals (step over, step out,
+//! run to).
 //!
 //! Every test boots a synthetic bundle whose secure image is a hand-assembled Thumb program,
 //! placed by `Layout::EVO_7_1` like the real OS. The helpers are copied from `tests/machine.rs`
 //! (test files cannot share private helpers).
 
-use evo_core::{AccessDir, Machine, StopReason, UartPort, WatchError, WatchKinds, WatchRange};
+use evo_core::{
+    AccessDir, Machine, RunGoal, StopReason, UartPort, WatchError, WatchKinds, WatchRange,
+};
 use evo_image::testutil::secure_image_bundle;
 use evo_image::{Bundle, Layout};
 
@@ -353,4 +356,253 @@ fn watchpoints_survive_load_state() {
     assert_eq!(m.run(1000), store_hit(1));
     m.load_state(&snap).unwrap();
     assert_eq!(m.run(1000), store_hit(1), "restored to reset; same stop");
+}
+
+// ---- Goals: step over, step out, run to ----
+
+/// `bl 0x220 ; nop ; b .` with `0x220: movs r2, #100 ; loop: subs r2, #1 ; bne loop ; bx lr`.
+fn call() -> Payload {
+    let mut p = Payload::new();
+    p.vector(1, CODE)
+        .asm(
+            CODE,
+            &[
+                I::H(0xF000),
+                I::H(0xF80E), // bl 0x220
+                I::H(NOP),    // 0x204
+                I::H(B_SELF), // 0x206
+            ],
+        )
+        .asm(
+            0x220,
+            &[
+                I::H(0x2264),  // movs r2, #100
+                I::H(0x3A01),  // 0x222 subs r2, #1
+                I::Bne(0x222), // 0x224
+                I::H(BX_LR),   // 0x226
+            ],
+        );
+    p
+}
+
+/// `movs r2, #3 ; bl f ; b .` with `f: push {lr} ; subs r2, #1 ; beq out ; bl f ; out: pop {pc}`.
+fn recurse() -> Payload {
+    let mut p = Payload::new();
+    p.vector(1, CODE)
+        .asm(
+            CODE,
+            &[
+                I::H(0x2203), // movs r2, #3
+                I::H(0xF000),
+                I::H(0xF81D), // 0x202 bl 0x240
+                I::H(B_SELF), // 0x206
+            ],
+        )
+        .asm(
+            0x240,
+            &[
+                I::H(0xB500), // push {lr}
+                I::H(0x3A01), // 0x242 subs r2, #1
+                I::H(0xD001), // 0x244 beq 0x24A
+                I::H(0xF7FF),
+                I::H(0xFFFB), // 0x246 bl 0x240
+                I::H(0xBD00), // 0x24A pop {pc}
+            ],
+        );
+    p
+}
+
+/// Enable and pend IRQ0, then `b .`; the handler counts r3 down from 5 and returns.
+fn irq() -> Payload {
+    let mut p = Payload::new();
+    p.vector(1, CODE)
+        .vector(16, 0x280)
+        .word(0x300, 0xE000_E100) // ISER0
+        .word(0x304, 0xE000_E200) // ISPR0
+        .asm(
+            CODE,
+            &[
+                I::Ld(0, 0x300),
+                I::H(0x2101), // movs r1, #1
+                I::H(0x6001), // str: enable IRQ0
+                I::Ld(0, 0x304),
+                I::H(0x6001), // 0x208 str: pend IRQ0
+                I::H(B_SELF), // 0x20A
+            ],
+        )
+        .asm(
+            0x280,
+            &[
+                I::H(0x2305),  // movs r3, #5
+                I::H(0x3B01),  // 0x282 subs r3, #1
+                I::Bne(0x282), // 0x284
+                I::H(BX_LR),   // 0x286
+            ],
+        );
+    p
+}
+
+const BUDGET: u64 = 1_000_000;
+
+#[test]
+fn step_over_a_call_stops_after_it() {
+    let mut m = call().boot();
+    assert_eq!(m.cpu.regs.pc, addr(CODE));
+    assert!(m.arm_step_over());
+    assert!(matches!(
+        m.goal(),
+        Some(RunGoal::Return {
+            pc: 0x100B_0604,
+            ..
+        })
+    ));
+    assert_eq!(m.run(BUDGET), StopReason::Goal { pc: 0x100B_0604 });
+    assert_eq!(m.cpu.regs.r[2], 0, "the call ran to its end");
+    assert_eq!(m.goal(), None, "reaching the goal disarms it");
+    assert_eq!(m.run(1000), StopReason::CycleLimit);
+}
+
+#[test]
+fn step_over_a_plain_instruction_steps_once() {
+    let mut m = call().boot();
+    m.arm_run_to(addr(0x220));
+    assert_eq!(m.run(BUDGET), StopReason::Goal { pc: 0x100B_0620 });
+    assert!(!m.arm_step_over());
+    assert_eq!(m.cpu.regs.pc, 0x100B_0622);
+    assert_eq!(m.cpu.regs.r[2], 100);
+    assert_eq!(m.goal(), None);
+}
+
+#[test]
+fn step_over_recursion_waits_for_the_outer_return() {
+    let mut m = recurse().boot();
+    m.arm_run_to(addr(0x246));
+    assert_eq!(m.run(BUDGET), StopReason::Goal { pc: 0x100B_0646 });
+    assert_eq!(m.cpu.regs.r[2], 2, "depth 1");
+    let sp = m.cpu.regs.sp();
+    assert!(m.arm_step_over());
+    assert_eq!(m.run(BUDGET), StopReason::Goal { pc: 0x100B_064A });
+    assert_eq!(m.cpu.regs.sp(), sp, "the outer return, not a deeper one");
+    assert_eq!(m.cpu.regs.r[2], 0);
+}
+
+#[test]
+fn step_out_returns_to_lr() {
+    let mut m = call().boot();
+    m.arm_run_to(addr(0x222));
+    assert_eq!(m.run(BUDGET), StopReason::Goal { pc: 0x100B_0622 });
+    m.arm_step_out();
+    assert!(matches!(
+        m.goal(),
+        Some(RunGoal::Return {
+            pc: 0x100B_0604,
+            ..
+        })
+    ));
+    assert_eq!(m.run(BUDGET), StopReason::Goal { pc: 0x100B_0604 });
+    assert_eq!(m.cpu.regs.r[2], 0);
+}
+
+#[test]
+fn step_out_of_a_handler_waits_for_exception_return() {
+    let mut m = irq().boot();
+    m.arm_run_to(addr(0x282));
+    assert_eq!(m.run(BUDGET), StopReason::Goal { pc: 0x100B_0682 });
+    assert_eq!(m.cpu.active_exceptions(), 1);
+    m.arm_step_out();
+    assert_eq!(m.goal(), Some(RunGoal::ExceptionReturn { depth: 1 }));
+    assert_eq!(m.run(BUDGET), StopReason::Goal { pc: 0x100B_060A });
+    assert_eq!(m.cpu.active_exceptions(), 0);
+    assert_eq!(m.cpu.regs.r[3], 0);
+}
+
+#[test]
+fn run_to_stops_before_the_address() {
+    let mut m = store().boot();
+    m.arm_run_to(0x100B_0607);
+    assert_eq!(
+        m.goal(),
+        Some(RunGoal::Address(STORE_PC)),
+        "Thumb bit cleared"
+    );
+    assert_eq!(m.run(BUDGET), StopReason::Goal { pc: STORE_PC });
+    assert_eq!(m.cpu.regs.pc, STORE_PC);
+    assert_eq!(m.bus.peek(WORD, 4), Some(0), "the store has not run");
+}
+
+#[test]
+fn run_to_the_resumed_address_comes_back_round() {
+    let mut m = store().boot();
+    m.arm_run_to(STORE_PC);
+    assert_eq!(m.run(BUDGET), StopReason::Goal { pc: STORE_PC });
+    m.arm_run_to(STORE_PC);
+    assert_eq!(m.run(BUDGET), StopReason::Goal { pc: STORE_PC });
+    assert_eq!(m.bus.peek(WORD, 4), Some(1), "one pass of the loop");
+}
+
+#[test]
+fn breakpoint_before_goal_keeps_goal_armed() {
+    let mut m = call().boot();
+    // `bx lr`, which runs once (the brief's 0x100B_0622 is the loop's `subs`, hit 100 times).
+    m.breakpoints.insert(0x100B_0626);
+    assert!(m.arm_step_over());
+    assert_eq!(m.run(BUDGET), StopReason::Breakpoint(0x100B_0626));
+    assert!(m.goal().is_some());
+    assert_eq!(m.run(BUDGET), StopReason::Goal { pc: 0x100B_0604 });
+    assert_eq!(m.goal(), None);
+}
+
+#[test]
+fn watchpoint_before_goal_keeps_goal_armed() {
+    let mut m = store().boot();
+    m.set_watchpoints(vec![range(WORD, 4, kinds(false, true, false))])
+        .unwrap();
+    m.arm_run_to(addr(0x300));
+    assert_eq!(m.run(1000), store_hit(1));
+    assert!(m.goal().is_some());
+}
+
+#[test]
+fn goal_is_disarmed_by_disarm() {
+    let mut m = store().boot();
+    m.arm_run_to(STORE_PC);
+    m.disarm();
+    assert_eq!(m.goal(), None);
+    assert_eq!(m.run(1000), StopReason::CycleLimit);
+}
+
+#[test]
+fn unreached_goal_returns_at_budget_and_stays_armed() {
+    let mut m = store().boot();
+    m.arm_run_to(addr(0x300));
+    let start = m.sched.now;
+    assert_eq!(m.run(1000), StopReason::CycleLimit);
+    let ran = m.sched.now - start;
+    assert!((1000..1010).contains(&ran), "ran {ran} cycles");
+    assert_eq!(m.goal(), Some(RunGoal::Address(addr(0x300))));
+}
+
+#[test]
+fn goal_turns_batching_off() {
+    let mut m = store().boot();
+    m.arm_run_to(addr(0x300));
+    let before = m.batched_runs();
+    assert_eq!(m.run(1000), StopReason::CycleLimit);
+    assert_eq!(m.batched_runs(), before);
+    m.disarm();
+    assert_eq!(m.run(1000), StopReason::CycleLimit);
+    assert!(m.batched_runs() > before);
+}
+
+#[test]
+fn load_state_and_power_cycle_clear_the_goal() {
+    let mut m = store().boot();
+    let snap = m.save_state();
+    m.arm_run_to(STORE_PC);
+    m.load_state(&snap).unwrap();
+    assert_eq!(m.goal(), None);
+    m.arm_run_to(STORE_PC);
+    m.power_cycle();
+    assert_eq!(m.goal(), None);
+    assert_eq!(m.run(1000), StopReason::CycleLimit);
 }
