@@ -55,6 +55,9 @@ words `0x113`, total payload length, and name length, followed by the uppercase 
 name and NUL. The next word stores source byte length in its low 24 bits and `2` in its
 high byte; UTF-8 source and a final NUL follow. Native export extracts the source into
 `.py`. Renaming a Python import updates both its metadata tokens and inner name.
+The guest can return a zero-padded four-byte allocation while retaining the logical
+length in that header (observed: 46 logical bytes, 48 returned bytes). Export accepts
+only that bounded zero padding and returns the exact source bytes.
 Unsupported or ambiguous names are rejected instead of being silently truncated.
 
 Image type 5 has 33,601 data bytes: byte `11`, then 160×105 little-endian RGB565 pixels

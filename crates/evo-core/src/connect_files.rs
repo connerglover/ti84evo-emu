@@ -565,7 +565,14 @@ fn python_source(bytes: &[u8]) -> Result<Vec<u8>> {
                 .unwrap(),
         ))
     };
-    if word(0)? != 0x113 || word(4)? as usize != data.len() {
+    let logical_size = word(4)? as usize;
+    // The client emits the logical length; the guest may return its four-byte
+    // allocation, with zero padding beyond that length.
+    if word(0)? != 0x113
+        || logical_size > data.len()
+        || (data.len() != logical_size && data.len() != logical_size.next_multiple_of(4))
+        || data[logical_size..].iter().any(|&byte| byte != 0)
+    {
         return Err(err("Invalid Python file header"));
     }
     let namesize = word(8)? as usize;
@@ -576,8 +583,8 @@ fn python_source(bytes: &[u8]) -> Result<Vec<u8>> {
     let len = (packed & 0xffffff) as usize;
     let begin = 17 + namesize;
     if packed >> 24 != 2
-        || begin.checked_add(len + 1) != Some(data.len())
-        || data.last() != Some(&0)
+        || begin.checked_add(len + 1) != Some(logical_size)
+        || data.get(logical_size.saturating_sub(1)) != Some(&0)
     {
         return Err(err("Invalid Python source bounds"));
     }
@@ -752,7 +759,10 @@ pub fn encode_csv(csv: &str, mode: CsvMode, archived: bool) -> Result<Vec<Variab
     let table: Vec<Vec<&str>> = normalized
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| l.split(',').map(str::trim).collect())
+        .take(1000)
+        // One extra row/column detects excessive inferred dimensions without allocating
+        // a Vec for every delimiter in an otherwise small malicious text file.
+        .map(|l| l.split(',').take(100).map(str::trim).collect())
         .collect();
     if table.is_empty() || table.len() > 999 {
         return Err(err("CSV must contain 1–999 rows"));
@@ -922,6 +932,32 @@ mod tests {
     }
 
     #[test]
+    fn python_received_from_guest_accepts_only_bounded_zero_padding() {
+        // Guest response after uploading this synthetic source. The guest pads
+        // its 46-byte Python payload to 48, retaining the logical header size.
+        let received = hex(
+            "bf686d65746144617461bf64747970650f6776657273696f6e0165666c61677300646e616d654a19e806e814e808e80000ff6776657273696f6e016473697a65183064646174615830130100002e000000040000005a47554900180000027072696e7428276e6174697665204755492055534227290a000000ff",
+        );
+        assert_eq!(
+            export_variable(&received).unwrap(),
+            ("ZGUI.py".into(), b"print('native GUI USB')\n".to_vec())
+        );
+        let renamed = prepare_native(&received, Some("RENAMED"), None).unwrap();
+        assert_eq!(
+            export_variable(&renamed.bytes).unwrap().1,
+            b"print('native GUI USB')\n"
+        );
+        let mut invalid = received.clone();
+        let padding = invalid.len() - 2;
+        invalid[padding] = 1;
+        assert!(export_variable(&invalid).is_err());
+        // A shorter logical size cannot hide nonzero source bytes as padding.
+        let mut invalid = received;
+        invalid[77] = 44;
+        assert!(export_variable(&invalid).is_err());
+    }
+
+    #[test]
     fn image_matches_official_conversion_orientation_and_quantization() {
         let rgba: Vec<u8> = (0..160 * 105 * 4)
             .map(|i| if i % 4 == 3 { 255 } else { (i * 7 % 256) as u8 })
@@ -981,6 +1017,19 @@ mod tests {
                 "{bad}"
             );
         }
+        assert!(encode_csv(&"1\n".repeat(1000), CsvMode::Lists { names: vec![] }, false).is_err());
+        assert!(
+            encode_csv(
+                &"1,".repeat(100_000),
+                CsvMode::Matrix {
+                    name: "A".into(),
+                    rows: 0,
+                    columns: 0
+                },
+                false
+            )
+            .is_err()
+        );
         assert!(
             encode_csv(
                 "1",
