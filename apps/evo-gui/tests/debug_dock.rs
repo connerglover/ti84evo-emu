@@ -1,5 +1,5 @@
-//! The debug dock: tab registry, run row, the Control tab, register editing and the
-//! Memory tab (views, editing, search), on `FakeBackend`.
+//! The debug dock: tab registry, run row, the Control tab, register editing, the
+//! Memory tab (views, editing, search) and the Visualizer, on `FakeBackend`.
 
 mod common;
 
@@ -12,8 +12,8 @@ use evo_gui::app::{AppOptions, EvoApp};
 use evo_gui::backend::fake::FakeBackend;
 use evo_gui::backend::{EmuBackend, Goal, RunStatus};
 use evo_gui::debug::{
-    DebugTab, MAX_VIEWS, SEARCH_CHUNK, SEARCH_CHUNKS_PER_FRAME, Search, cycle_text, find,
-    parse_pattern, parse_value,
+    DebugTab, MAX_VIEWS, PixelFormat, SEARCH_CHUNK, SEARCH_CHUNKS_PER_FRAME, Search, VIS_MAX,
+    cycle_text, find, parse_pattern, parse_size, parse_value, render,
 };
 use evo_gui::platform::FakePlatform;
 
@@ -696,5 +696,155 @@ fn enter_in_find_searches_without_pressing_keys() {
     press(&mut h, Key::Enter);
     // Two searches: the hits at 0x20000005 and 0x20000100.
     assert_eq!(field_value(&h, 1).as_deref(), Some("0x20000100"));
+    assert!(probe.key_log().is_empty(), "{:?}", probe.key_log());
+}
+
+// ---- Visualizer ----
+
+const MAGENTA: [u8; 4] = [0xFF, 0x00, 0xFF, 0xFF];
+
+fn bytes(v: &[u8]) -> Vec<Option<u8>> {
+    v.iter().copied().map(Some).collect()
+}
+
+#[test]
+fn pixel_format_labels_and_bits() {
+    let labels: Vec<&str> = PixelFormat::ALL.iter().map(|f| f.label()).collect();
+    assert_eq!(labels, ["RGB565", "RGB888", "Gray 8-bit", "1-bit"]);
+    let bits: Vec<u32> = PixelFormat::ALL.iter().map(|f| f.bits()).collect();
+    assert_eq!(bits, [16, 24, 8, 1]);
+    assert_eq!(PixelFormat::default(), PixelFormat::Rgb565);
+    assert_eq!(VIS_MAX, 1024);
+}
+
+#[test]
+fn rgb565_white_and_red() {
+    let px = render(&bytes(&[0xFF, 0xFF, 0x00, 0xF8]), PixelFormat::Rgb565, 2, 1);
+    assert_eq!(px, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0xFF]);
+    // Green is bits 10:5, blue bits 4:0.
+    let px = render(&bytes(&[0xE0, 0x07, 0x1F, 0x00]), PixelFormat::Rgb565, 2, 1);
+    assert_eq!(px, [0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00, 0xFF, 0xFF]);
+}
+
+#[test]
+fn rgb888_and_gray() {
+    let px = render(&bytes(&[0x12, 0x34, 0x56]), PixelFormat::Rgb888, 1, 1);
+    assert_eq!(px, [0x12, 0x34, 0x56, 0xFF]);
+    let px = render(&bytes(&[0x00, 0x80, 0xFF]), PixelFormat::Gray8, 3, 1);
+    assert_eq!(
+        px,
+        [
+            0, 0, 0, 0xFF, 0x80, 0x80, 0x80, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+        ]
+    );
+}
+
+#[test]
+fn mono1_bits() {
+    // MSB first; 1 is black, 0 white.
+    let black = [0x00, 0x00, 0x00, 0xFF];
+    let white = [0xFF, 0xFF, 0xFF, 0xFF];
+    let px = render(&bytes(&[0b1010_0000]), PixelFormat::Mono1, 4, 1);
+    assert_eq!(px, [black, white, black, white].concat());
+    // The ninth pixel is the next byte's MSB.
+    let px = render(&bytes(&[0x00, 0x80]), PixelFormat::Mono1, 9, 1);
+    assert_eq!(&px[28..32], white);
+    assert_eq!(&px[32..36], black);
+}
+
+#[test]
+fn unreadable_is_magenta() {
+    for fmt in PixelFormat::ALL {
+        let px = render(&[None; 3], fmt, 1, 1);
+        assert_eq!(px, MAGENTA, "{fmt:?}");
+    }
+    // One unreadable byte spoils only its own pixel.
+    let px = render(
+        &[Some(0xFF), Some(0xFF), None, Some(0)],
+        PixelFormat::Rgb565,
+        2,
+        1,
+    );
+    assert_eq!(px, [[0xFF; 4], MAGENTA].concat());
+}
+
+#[test]
+fn short_input_pads_magenta() {
+    let px = render(&bytes(&[0x40]), PixelFormat::Gray8, 2, 2);
+    assert_eq!(px.len(), 16);
+    assert_eq!(&px[..4], [0x40, 0x40, 0x40, 0xFF]);
+    for p in px[4..].chunks(4) {
+        assert_eq!(p, MAGENTA);
+    }
+    // A half pixel is magenta too.
+    let px = render(&bytes(&[0xFF]), PixelFormat::Rgb565, 1, 1);
+    assert_eq!(px, MAGENTA);
+    assert_eq!(render(&[], PixelFormat::Mono1, 3, 1), [MAGENTA; 3].concat());
+}
+
+#[test]
+fn sizes_are_clamped() {
+    assert_eq!(parse_size("5000"), Some(VIS_MAX));
+    assert_eq!(parse_size(" 64 "), Some(64));
+    assert_eq!(parse_size("0"), Some(1));
+    assert_eq!(parse_size("99999999999999"), Some(VIS_MAX));
+    for bad in ["", "abc", "-3", "0x10", "1.5"] {
+        assert_eq!(parse_size(bad), None, "{bad:?}");
+    }
+    // Through the UI: the width field takes 5000 as 1024.
+    let (mut h, _dir) = visualizer(FakeBackend::new());
+    set_field(&mut h, 1, "5000");
+    h.get_by_label("1024 × 240, 491520 bytes");
+    // Leaving the field shows the clamped value.
+    press(&mut h, Key::Enter);
+    assert_eq!(field_value(&h, 1).as_deref(), Some("1024"));
+    set_field(&mut h, 2, "0");
+    h.get_by_label("1024 × 1, 2048 bytes");
+}
+
+/// Opens the Visualizer; its text fields in drawing order are address, width, height.
+fn visualizer(fake: FakeBackend) -> (Harness<'static, EvoApp>, TempDir) {
+    let (mut h, dir) = dock(fake);
+    click(&mut h, "Visualizer");
+    (h, dir)
+}
+
+#[test]
+fn visualizer_defaults() {
+    let (h, _dir) = visualizer(FakeBackend::new());
+    assert_eq!(inputs(&h), 3);
+    assert_eq!(field_value(&h, 0).as_deref(), Some("0x20048000"));
+    assert_eq!(field_value(&h, 1).as_deref(), Some("320"));
+    assert_eq!(field_value(&h, 2).as_deref(), Some("240"));
+    for label in ["RGB565", "RGB888", "Gray 8-bit", "1-bit"] {
+        h.get_by_label(label);
+    }
+    h.get_by_label("320 × 240, 153600 bytes");
+}
+
+#[test]
+fn visualizer_format_and_bad_fields() {
+    let (mut h, _dir) = visualizer(FakeBackend::new());
+    click(&mut h, "1-bit");
+    h.get_by_label("320 × 240, 9600 bytes");
+    click(&mut h, "Gray 8-bit");
+    h.get_by_label("320 × 240, 76800 bytes");
+    set_field(&mut h, 0, "zz");
+    h.get_by_label("Not a hex address");
+    set_field(&mut h, 1, "wide");
+    h.get_by_label("Not a size");
+    // The last good size stays in use.
+    h.get_by_label("320 × 240, 76800 bytes");
+}
+
+#[test]
+fn visualizer_fields_take_keys_from_calculator() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = visualizer(fake);
+    set_field(&mut h, 0, "0x20000000");
+    press(&mut h, Key::Enter);
+    set_field(&mut h, 1, "64");
+    press(&mut h, Key::Enter);
     assert!(probe.key_log().is_empty(), "{:?}", probe.key_log());
 }

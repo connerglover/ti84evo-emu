@@ -9,6 +9,7 @@ mod regs;
 mod search;
 mod uart;
 mod unmapped;
+mod visualizer;
 
 use egui::{Button, ScrollArea, Sense};
 
@@ -17,6 +18,7 @@ pub use disasm::{DISASM_LINES, format_disasm};
 pub use memory::{DEFAULT_MEM_ADDR, MAX_VIEWS};
 pub use search::{SEARCH_CHUNK, SEARCH_CHUNKS_PER_FRAME, Search, find, parse_pattern};
 pub use uart::{UART_CAP, UartConsole};
+pub use visualizer::{DEFAULT_VIS_ADDR, PixelFormat, VIS_MAX, parse_size, render};
 
 use crate::backend::{EmuBackend, Goal, UartId};
 use crate::logbuf::LOG_CAP;
@@ -140,6 +142,7 @@ pub struct DebugPanel {
     regs: regs::RegsState,
     disasm: disasm::DisasmState,
     memory: memory::MemoryState,
+    visualizer: visualizer::VisualizerState,
     uart: UartConsole,
     uart2: UartConsole,
     /// The newest log lines, at most [`LOG_CAP`].
@@ -240,8 +243,8 @@ impl DebugPanel {
             }
             DebugTab::Console => uart::show(ui, &mut self.uart),
             DebugTab::Unmapped => unmapped::show(ui, &backend.unmapped()),
-            DebugTab::Visualizer
-            | DebugTab::Breakpoints
+            DebugTab::Visualizer => visualizer::show(ui, &mut self.visualizer, backend),
+            DebugTab::Breakpoints
             | DebugTab::Watchpoints
             | DebugTab::Peripherals
             | DebugTab::BusMonitor
