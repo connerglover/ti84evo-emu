@@ -190,6 +190,8 @@ pub const BOARD_INPUTS_HIGH: [u8; 2] = [9, 11];
 /// A persisted flash cannot boot directly into its stored secure image.
 #[derive(Debug, thiserror::Error)]
 pub enum NvBootError {
+    #[error("cannot provision firmware bundle: {0}")]
+    Bundle(#[from] ImageError),
     #[error("invalid persisted boot image: {0}")]
     Image(&'static str),
     #[error("invalid persisted boot vectors: {0}")]
@@ -316,6 +318,24 @@ impl Machine {
             vtor,
             identity,
         ))
+    }
+
+    /// Provision a bundle only for a new calculator; otherwise boot the stored images.
+    /// Valid fresh images use persisted-boot identity immediately, so their save states
+    /// remain compatible on reopening the saved flash. Invalid fresh synthetic vectors
+    /// retain `from_bundle`'s runtime fault behavior; invalid saved images return an error.
+    pub fn from_bundle_or_nv(
+        b: &Bundle,
+        layout: &Layout,
+        nv: Option<NvState>,
+    ) -> Result<Self, NvBootError> {
+        match nv {
+            Some(nv) => Self::from_nv(nv, layout),
+            None => {
+                let provisioned = Self::from_bundle(b, layout)?;
+                Ok(Self::from_nv(provisioned.nv_state(), layout).unwrap_or(provisioned))
+            }
+        }
     }
 
     pub(crate) fn nv_boot_metadata(

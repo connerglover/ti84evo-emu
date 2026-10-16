@@ -2,8 +2,8 @@ use evo_core::machine::{FLASH_S, SRAM_S};
 use evo_core::{Machine, NvState, StopReason};
 use evo_hw::nor::{NOR_SIZE, SECREGS_LEN};
 use evo_hw::soc::FLASH_BUFFER;
-use evo_image::Layout;
-use evo_image::testutil::Img;
+use evo_image::testutil::{Img, secure_image_bundle};
+use evo_image::{Bundle, Layout};
 
 fn saved_image(header_size: u16, value: u8) -> NvState {
     let body_address = FLASH_S + Layout::EVO_7_1.secure_slot_base + u32::from(header_size);
@@ -90,4 +90,42 @@ fn corrupt_persisted_headers_and_vectors_are_rejected() {
         };
         assert!(Machine::from_nv(saved_image(0x400, 42), &layout).is_err());
     }
+}
+
+#[test]
+fn provision_once_constructor_preserves_updates_and_fresh_state_identity() {
+    let nv = saved_image(0x400, 7);
+    let start = Layout::EVO_7_1.secure_slot_base as usize + 0x400;
+    let bundle = Bundle::from_bytes(&secure_image_bundle(
+        nv.flash()[start..start + 0x104].to_vec(),
+    ))
+    .unwrap();
+    let mut fresh = Machine::from_bundle_or_nv(&bundle, &Layout::EVO_7_1, None).unwrap();
+    fresh.run(10);
+    let state = fresh.save_state();
+    let mut reopened =
+        Machine::from_bundle_or_nv(&bundle, &Layout::EVO_7_1, Some(fresh.nv_state())).unwrap();
+    reopened.load_state(&state).unwrap();
+    assert_eq!(fresh.cpu, reopened.cpu);
+
+    let updated = saved_image(0x200, 42);
+    let mut reopened =
+        Machine::from_bundle_or_nv(&bundle, &Layout::EVO_7_1, Some(updated.clone())).unwrap();
+    reopened.run(10);
+    assert_eq!(reopened.cpu.regs.r[0], 42);
+    assert_eq!(reopened.nv_state().flash(), updated.flash());
+    assert_eq!(reopened.nv_state().secregs(), updated.secregs());
+    assert!(
+        Machine::from_bundle_or_nv(&bundle, &Layout::EVO_7_1, Some(NvState::erased())).is_err()
+    );
+}
+
+#[test]
+fn provision_once_keeps_fresh_invalid_vector_runtime_behavior() {
+    let bundle = Bundle::from_bytes(&secure_image_bundle(vec![0; 0x104])).unwrap();
+    let mut original = Machine::from_bundle(&bundle, &Layout::EVO_7_1).unwrap();
+    let mut fresh = Machine::from_bundle_or_nv(&bundle, &Layout::EVO_7_1, None).unwrap();
+    assert_eq!(fresh.cpu, original.cpu);
+    assert_eq!(fresh.run(10), original.run(10));
+    assert_eq!(fresh.cpu, original.cpu);
 }

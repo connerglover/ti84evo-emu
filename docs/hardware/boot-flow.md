@@ -28,6 +28,12 @@ writes therefore preserve boot identity, but loading a state still requires exac
 saved NV contents. Bundle-created and persisted-image-created machines can have different
 boot identities even when their flash bytes match.
 
+Launchers can use `Machine::from_bundle_or_nv`: existing NV goes directly to `from_nv`;
+a new calculator is provisioned once from the bundle and normalized to persisted boot
+identity. Fresh save states therefore reopen against their saved flash consistently.
+For synthetic fresh bundles with invalid vectors, it retains `from_bundle`'s runtime
+fault behavior. Invalid existing flash is always an error, never reinstalled silently.
+
 ### Completed permanent secure updates
 
 For `Layout::EVO_7_1`, persisted boot, `power_cycle`, and AIRCR.SYSRESETREQ recognize a
