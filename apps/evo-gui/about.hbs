@@ -1,0 +1,19 @@
+Third-party software in evo-gui
+===============================
+
+evo-gui is built from the open-source Rust crates listed below. Each section
+names a license, the crates published under that license text, and the text.
+{{#each licenses}}
+
+------------------------------------------------------------------------------
+{{{name}}} ({{{id}}})
+
+Used by:
+{{#each used_by}}
+{{#if crate.source}}
+  {{{crate.name}}} {{{crate.version}}}
+{{/if}}
+{{/each}}
+
+{{{text}}}
+{{/each}}
