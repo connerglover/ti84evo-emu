@@ -1,4 +1,4 @@
-//! Tools: key scripts (E1), key history (E2) and macros / AutoTester (E3).
+//! Tools: key scripts (E1), key history (E2), macros / AutoTester (E3) and the Hardware panel (E4).
 
 mod common;
 
@@ -942,5 +942,214 @@ mod macros {
                 .error()
                 .is_some_and(|e| e.contains("too large"))
         );
+    }
+}
+
+// ---- E4: hardware panel ----
+
+mod hardware {
+    use super::{kev, tools_harness};
+    use crate::common::open_action;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    use evo_gui::app::EvoApp;
+    use evo_gui::backend::HwChange;
+    use evo_gui::backend::fake::FakeBackend;
+    use evo_gui::input::MIN_HOLD_CYCLES;
+    use evo_gui::keypad::KeyId;
+    use evo_gui::toolbar::Action;
+    use evo_gui::tools::hardware::{HARDWARE_TITLE, hms, utc_seconds_of_day};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn open(h: &mut Harness<'static, EvoApp>) {
+        open_action(h, Action::Hardware);
+        assert!(h.state().features().active(Action::Hardware));
+        h.get_by_label(HARDWARE_TITLE);
+    }
+
+    #[test]
+    fn hms_cases() {
+        assert_eq!(hms(0), "00:00:00");
+        assert_eq!(hms(3_723), "01:02:03");
+        assert_eq!(hms(86_399), "23:59:59");
+        assert_eq!(hms(59), "00:00:59");
+        assert_eq!(hms(36_000), "10:00:00");
+    }
+
+    #[test]
+    fn utc_seconds_of_day_cases() {
+        let at = |s: u64| UNIX_EPOCH + Duration::from_secs(s);
+        assert_eq!(utc_seconds_of_day(at(86_400 * 3 + 3_723)), 3_723);
+        assert_eq!(utc_seconds_of_day(UNIX_EPOCH), 0);
+        assert_eq!(utc_seconds_of_day(at(86_399)), 86_399);
+        assert_eq!(utc_seconds_of_day(at(86_400)), 0);
+        // Sub-second parts round down.
+        assert_eq!(utc_seconds_of_day(at(10) + Duration::from_millis(999)), 10);
+        // Before the epoch: one second before midnight, 1970-01-01.
+        assert_eq!(
+            utc_seconds_of_day(UNIX_EPOCH - Duration::from_secs(1)),
+            86_399
+        );
+        assert_eq!(
+            utc_seconds_of_day(UNIX_EPOCH - Duration::from_millis(500)),
+            86_399
+        );
+        assert_eq!(
+            utc_seconds_of_day(UNIX_EPOCH - Duration::from_secs(86_400)),
+            0
+        );
+        assert!(utc_seconds_of_day(SystemTime::now()) < 86_400);
+    }
+
+    #[test]
+    fn window_shows_board_state() {
+        let (mut h, _dir) = tools_harness(FakeBackend::new());
+        open(&mut h);
+        h.get_by_label("Backlight 100%");
+        h.get_by_label("Power hold: on");
+        h.get_by_label("Deep sleep: not armed");
+        h.get_by_label("RTC 00:00:00");
+        // Toggling the action again closes the window.
+        open_action(&mut h, Action::Hardware);
+        assert!(!h.state().features().active(Action::Hardware));
+        assert!(h.query_by_label("Press ON").is_none());
+    }
+
+    #[test]
+    fn toggles_send_changes() {
+        let fake = FakeBackend::new();
+        let probe = fake.probe();
+        let (mut h, _dir) = tools_harness(fake);
+        open(&mut h);
+        h.get_by_label("Charger line high (GPIO 9)").click();
+        h.run_steps(2);
+        assert_eq!(probe.hw_changes(), [HwChange::ChargerLine(false)]);
+        h.get_by_label("Battery OK (GPIO 11)").click();
+        h.run_steps(2);
+        h.get_by_label("USB-C attached").click();
+        h.run_steps(2);
+        assert_eq!(
+            probe.hw_changes(),
+            [
+                HwChange::ChargerLine(false),
+                HwChange::BatteryOk(false),
+                HwChange::UsbAttached(true),
+            ]
+        );
+        // The checkbox follows the backend: ticking the charger line again sends `true`.
+        h.get_by_label("Charger line high (GPIO 9)").click();
+        h.run_steps(2);
+        assert_eq!(probe.hw_changes()[3], HwChange::ChargerLine(true));
+    }
+
+    #[test]
+    fn press_on_holds_then_releases() {
+        let fake = FakeBackend::new();
+        let probe = fake.probe();
+        let (mut h, _dir) = tools_harness(fake);
+        open(&mut h);
+        h.get_by_label("Press ON").click();
+        for _ in 0..200 {
+            h.step();
+            if probe.key_events().len() == 2 {
+                break;
+            }
+        }
+        let events = probe.key_events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        let p = events[0].cycle;
+        assert_eq!(
+            events,
+            [
+                kev(KeyId::On, true, p),
+                kev(KeyId::On, false, p + MIN_HOLD_CYCLES)
+            ]
+        );
+        assert!(probe.held().is_empty());
+        assert!(
+            h.state()
+                .features()
+                .tools
+                .hardware()
+                .next_deadline()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn press_on_reports_its_release_deadline() {
+        let fake = FakeBackend::new();
+        let probe = fake.probe();
+        let (mut h, _dir) = tools_harness(fake);
+        h.state_mut().set_paused(true);
+        open(&mut h);
+        h.get_by_label("Press ON").click();
+        h.run_steps(3);
+        // Paused: the press is in, the release waits for its cycle.
+        let events = probe.key_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(probe.held(), [KeyId::On]);
+        assert_eq!(
+            h.state().features().tools.hardware().next_deadline(),
+            Some(events[0].cycle + MIN_HOLD_CYCLES)
+        );
+        h.state_mut().set_paused(false);
+        for _ in 0..200 {
+            h.step();
+            if probe.key_events().len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            probe.key_events()[1],
+            kev(KeyId::On, false, events[0].cycle + MIN_HOLD_CYCLES)
+        );
+    }
+
+    #[test]
+    fn reset_drops_a_pending_on_release() {
+        let fake = FakeBackend::new();
+        let probe = fake.probe();
+        let (mut h, _dir) = tools_harness(fake);
+        h.state_mut().set_paused(true);
+        open(&mut h);
+        h.get_by_label("Press ON").click();
+        h.run_steps(3);
+        assert_eq!(probe.key_events().len(), 1);
+        h.state_mut().run_action(Action::Reset);
+        h.state_mut().set_paused(false);
+        h.run_steps(4);
+        assert!(
+            h.state()
+                .features()
+                .tools
+                .hardware()
+                .next_deadline()
+                .is_none()
+        );
+        assert!(probe.held().is_empty());
+    }
+
+    #[test]
+    fn set_rtc_sends_seconds() {
+        let fake = FakeBackend::new();
+        let probe = fake.probe();
+        let (mut h, _dir) = tools_harness(fake);
+        open(&mut h);
+        let before = utc_seconds_of_day(SystemTime::now());
+        h.get_by_label("Set RTC to host clock (UTC)").click();
+        h.run_steps(2);
+        let after = utc_seconds_of_day(SystemTime::now());
+        let changes = probe.hw_changes();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        let HwChange::RtcSeconds(s) = changes[0] else {
+            panic!("{changes:?}");
+        };
+        // `after < before` only across UTC midnight.
+        assert!(
+            (before <= s && s <= after) || after < before,
+            "{before} {s} {after}"
+        );
+        h.get_by_label(&format!("RTC {}", hms(s)));
     }
 }

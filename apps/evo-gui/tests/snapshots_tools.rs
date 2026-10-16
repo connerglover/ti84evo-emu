@@ -55,3 +55,16 @@ fn snapshot_tools_macros() {
     h.run_steps(5);
     h.snapshot("tools_macros");
 }
+
+#[test]
+#[cfg_attr(
+    not(feature = "snapshots"),
+    ignore = "golden images: cargo test -p evo-gui --features snapshots"
+)]
+fn snapshot_tools_hardware() {
+    let _gpu = gpu_lock();
+    let mut h = snap_harness(FakeBackend::new(), [520.0, 960.0], FakePlatform::shared());
+    open_action(&mut h, Action::Hardware);
+    h.run_steps(5);
+    h.snapshot("tools_hardware");
+}
