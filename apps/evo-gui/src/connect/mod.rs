@@ -22,6 +22,8 @@ use egui::{Button, ColorImage, RichText, ScrollArea, TextureHandle, TextureOptio
 use types::*;
 
 const INPUT_LIMIT: u64 = 32 * 1024 * 1024;
+pub(crate) const PANEL_ID: &str = "usb-tools";
+pub(crate) const PANEL_WIDTH: f32 = 440.0;
 const FILE_FILTER: &[FileFilter] = &[FileFilter {
     name: "Calculator files, Python, images and CSV",
     extensions: &[
@@ -143,6 +145,9 @@ impl Default for ConnectTools {
 impl ConnectTools {
     pub fn is_open(&self) -> bool {
         self.open
+    }
+    pub(crate) fn close(&mut self) {
+        self.open = false;
     }
     pub fn busy(&self) -> bool {
         self.receiver.is_some()
@@ -977,23 +982,32 @@ impl Feature for ConnectTools {
         }
     }
 
-    fn ui(&mut self, ctx: &egui::Context, cx: &mut FeatureCtx<'_>) {
+    fn ui(&mut self, _: &egui::Context, _: &mut FeatureCtx<'_>) {}
+
+    fn panels(&mut self, parent: &mut egui::Ui, cx: &mut FeatureCtx<'_>) {
         if !self.open {
             return;
         }
+        let ctx = parent.ctx().clone();
         if self.tab == Tab::Screen && self.auto_screen {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
-        let mut open = self.open;
         let enabled = !self.busy() && !cx.provisioning && cx.backend.usb_available();
-        let max_width = (ctx.content_rect().width() - 24.0).max(280.0);
-        egui::Window::new("USB tools").id(egui::Id::new("evo-usb-tools"))
-            .open(&mut open).default_width(480.0_f32.min(max_width)).min_width(280.0).max_width(max_width)
-            .default_height(520.0_f32.min(ctx.content_rect().height() - 140.0)).min_height(240.0)
-            .default_pos(egui::pos2(60.0, 65.0)).resizable(true)
-            .frame(egui::Frame::window(&ctx.global_style()).fill(HEADER_BG))
-            .show(ctx, |ui| {
+        let max_width = (parent.available_width() - 160.0).max(0.0);
+        egui::Panel::right(PANEL_ID)
+            .resizable(true).default_size(PANEL_WIDTH).min_size(280.0).max_size(max_width)
+            .frame(egui::Frame::side_top_panel(&ctx.global_style()).fill(HEADER_BG))
+            .show(parent, |ui| {
                 ui.visuals_mut().override_text_color = Some(LABEL_DARK);
+                ui.horizontal(|ui| {
+                    ui.strong("USB tools");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").on_hover_text("Close USB tools").clicked() {
+                            self.open = false;
+                        }
+                    });
+                });
+                ui.separator();
                 ui.horizontal_wrapped(|ui| {
                     for (tab, label) in [(Tab::Files,"Files"), (Tab::Screen,"Screen"), (Tab::Calculator,"Calculator"), (Tab::Developer,"Developer")] {
                         ui.selectable_value(&mut self.tab, tab, label);
@@ -1005,12 +1019,12 @@ impl Feature for ConnectTools {
                     ui.separator();
                 }
                 // Reserve feedback space: otherwise a growing preview consumes it and
-                // clips the status/cancel controls outside the resizable window.
+                // clips the status/cancel controls outside the dock.
                 let footer_height = if self.busy() { 105.0 } else {
                     ui.painter().layout(self.status.clone(), egui::FontId::proportional(ui.text_style_height(&egui::TextStyle::Body)), LABEL_DARK, ui.available_width()).size().y + 12.0
                 };
-                let content_height = (ui.available_height() - footer_height).max(80.0).min((ctx.content_rect().height() - 220.0).max(200.0));
-                ScrollArea::vertical().id_salt("usb-workspace").max_height(content_height).show(ui, |ui| {
+                let content_height = (ui.available_height() - footer_height).max(0.0);
+                ScrollArea::both().id_salt("usb-workspace").max_height(content_height).auto_shrink([false, false]).show(ui, |ui| {
                     match self.tab {
                         Tab::Files => self.files_ui(ui, cx, enabled),
                         Tab::Screen => self.screen_ui(ui, cx, enabled),
@@ -1035,7 +1049,6 @@ impl Feature for ConnectTools {
                     ui.label(RichText::new(&self.status).color(if self.error { crate::theme::TOAST_ERROR_BG } else { BODY_OUTLINE }));
                 }
             });
-        self.open = open;
     }
 
     fn active(&self, action: Action) -> bool {

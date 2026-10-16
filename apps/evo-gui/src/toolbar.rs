@@ -31,6 +31,7 @@ pub enum Group {
     Calculator,
     Capture,
     Files,
+    Usb,
     Debug,
     Tools,
     Settings,
@@ -39,10 +40,11 @@ pub enum Group {
 
 impl Group {
     /// Every group, top to bottom.
-    pub const ALL: [Group; 7] = [
+    pub const ALL: [Group; 8] = [
         Group::Calculator,
         Group::Capture,
         Group::Files,
+        Group::Usb,
         Group::Debug,
         Group::Tools,
         Group::Settings,
@@ -55,6 +57,7 @@ impl Group {
             Group::Calculator => "\u{1F5A9}",
             Group::Capture => "\u{1F4F7}",
             Group::Files => "\u{1F4C1}",
+            Group::Usb => "USB",
             Group::Debug => "\u{1F41B}",
             Group::Tools => "\u{1F527}",
             Group::Settings => "\u{2699}",
@@ -68,6 +71,7 @@ impl Group {
             Group::Calculator => "Calc",
             Group::Capture => "Shot",
             Group::Files => "Files",
+            Group::Usb => "USB",
             Group::Debug => "Debug",
             Group::Tools => "Tools",
             Group::Settings => "Prefs",
@@ -81,6 +85,7 @@ impl Group {
             Group::Calculator => "Calculator",
             Group::Capture => "Capture",
             Group::Files => "Files",
+            Group::Usb => "USB tools",
             Group::Debug => "Debug panels",
             Group::Tools => "Tools",
             Group::Settings => "Settings",
@@ -180,7 +185,7 @@ impl Action {
     pub fn group(self) -> Group {
         use Action::*;
         match self {
-            UsbTools => Group::Files,
+            UsbTools => Group::Usb,
             Reset | Reprovision | ReloadRom | ChangeRom | SaveState | LoadState | TogglePause
             | Speed(_) => Group::Calculator,
             Screenshot | CopyScreen | RecordApng | RecordVideo => Group::Capture,
@@ -199,7 +204,7 @@ impl Action {
     pub fn label(self) -> &'static str {
         use Action::*;
         match self {
-            UsbTools => "USB tools…",
+            UsbTools => "USB tools",
             Reset => "Reset",
             Reprovision => "Re-provision",
             ReloadRom => "Reload ROM",
@@ -246,9 +251,9 @@ pub fn not_available(action: Action) -> String {
 }
 
 /// For each group in [`Group::ALL`] order, whether its icon is drawable.
-pub fn drawable_icons(ctx: &egui::Context) -> [bool; 7] {
+pub fn drawable_icons(ctx: &egui::Context) -> [bool; Group::ALL.len()] {
     let font = FontId::proportional(ICON_SIZE);
-    Group::ALL.map(|g| has_glyphs(ctx, &font, g.icon()))
+    Group::ALL.map(|g| g != Group::Usb && has_glyphs(ctx, &font, g.icon()))
 }
 
 /// What the sidebar did this frame.
@@ -266,7 +271,7 @@ pub struct SidebarOutput {
 /// Space/Enter (calculator keys) never click them.
 pub fn sidebar_buttons(
     ui: &mut egui::Ui,
-    icons: &[bool; 7],
+    icons: &[bool; Group::ALL.len()],
     open: Option<Group>,
     active: impl Fn(Group) -> bool,
 ) -> SidebarOutput {

@@ -253,13 +253,13 @@ pub struct EvoApp {
     dpad_pressed: Option<KeyId>,
     /// Debug panel state, including the UART console.
     debug: DebugPanel,
-    /// Whether the debug panel was open when the window size was last synced.
-    debug_shown: bool,
-    /// True when opening the debug panel grew the window by `DEBUG_W`.
-    grown: bool,
+    /// Combined default width of the docks at the last window-size sync.
+    dock_width_shown: f32,
+    /// Width added by opening docks, removed again when they close.
+    grown: f32,
     /// While the window grows: the width asked for and how many more frames
-    /// to wait for it. The panel forgets its width meanwhile, so it opens at
-    /// `DEBUG_W` once there is room instead of keeping the narrow first frame's.
+    /// to wait for it. Docks forget their widths meanwhile, so they open at
+    /// their defaults once there is room instead of keeping the narrow first frame's.
     grow_target: Option<(f32, u32)>,
     lcd: LcdView,
     filter: ScaleFilter,
@@ -274,7 +274,7 @@ pub struct EvoApp {
     toasts: Toasts,
     /// Per group, whether its icon is drawable; filled on the first frame,
     /// once the fonts are loaded.
-    icons: Option<[bool; 7]>,
+    icons: Option<[bool; Group::ALL.len()]>,
     /// The open group popover and where it sits.
     popover: Option<(Group, Pos2)>,
     /// Where the last popover sat: the slot picker opens there.
@@ -349,8 +349,8 @@ impl EvoApp {
             // eframe restores the saved window, which already includes the
             // panel when it was open at quit: do not grow it again, but do
             // give its width back when the panel closes.
-            debug_shown: opts.prefs.debug_open,
-            grown: opts.prefs.debug_open,
+            dock_width_shown: if opts.prefs.debug_open { DEBUG_W } else { 0.0 },
+            grown: if opts.prefs.debug_open { DEBUG_W } else { 0.0 },
             grow_target: None,
             lcd: LcdView::new(),
             filter: opts.prefs.filter,
@@ -798,17 +798,19 @@ impl EvoApp {
         self.speed.reset();
     }
 
-    /// Closes the debug dock and leaves compact mode, forgets window and panel positions
+    /// Closes the docks and leaves compact mode, forgets window and panel positions
     /// and sizes, and asks for the default window size.
     fn reset_layout(&mut self, ctx: &egui::Context) {
         self.debug_open = false;
-        self.debug_shown = false;
+        self.features.connect.close();
+        self.dock_width_shown = 0.0;
         self.compact = false;
-        self.grown = false;
+        self.grown = 0.0;
         self.grow_target = None;
         self.popover = None;
         self.picker = None;
         ctx.data_mut(|d| d.remove::<egui::PanelState>(Id::new(DEBUG_PANEL_ID)));
+        ctx.data_mut(|d| d.remove::<egui::PanelState>(Id::new(crate::connect::PANEL_ID)));
         ctx.memory_mut(|m| m.reset_areas());
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(DEFAULT_WINDOW));
         self.toasts.push(LAYOUT_RESET, ToastKind::Info);
@@ -901,12 +903,16 @@ impl EvoApp {
     }
 
     /// Opens `group`'s popover beside `button`, or closes it when it is already open.
-    /// Debug has no popover: it toggles the dock.
+    /// Debug and USB have no popover: they toggle their docks.
     fn click_group(&mut self, group: Group, button: Rect) {
         self.picker = None;
-        if group == Group::Debug {
+        if matches!(group, Group::Debug | Group::Usb) {
             self.popover = None;
-            self.run_action(Action::ToggleDebug);
+            self.run_action(if group == Group::Debug {
+                Action::ToggleDebug
+            } else {
+                Action::UsbTools
+            });
             return;
         }
         self.popover = match self.popover {
@@ -919,8 +925,11 @@ impl EvoApp {
         self.toolbar_rect = ui.max_rect();
         let icons = *self.icons.get_or_insert_with(|| drawable_icons(ui.ctx()));
         let debug_open = self.debug_open;
+        let usb_open = self.features.connect.is_open();
         let open = self.popover.map(|(g, _)| g);
-        let out = sidebar_buttons(ui, &icons, open, |g| g == Group::Debug && debug_open);
+        let out = sidebar_buttons(ui, &icons, open, |g| {
+            (g == Group::Debug && debug_open) || (g == Group::Usb && usb_open)
+        });
         if let (Some(group), Some(rect)) = (out.clicked, out.clicked_rect) {
             self.click_group(group, rect);
         }
@@ -1097,27 +1106,36 @@ impl EvoApp {
         }
     }
 
-    /// Grows the window by `DEBUG_W` when the debug panel opens and shrinks it
+    /// Grows the window by each dock's default width when it opens and shrinks it
     /// back when it closes (only if it grew). A host that ignores viewport
     /// commands (kittest) keeps the size; the panel's width cap covers that.
     fn sync_window(&mut self, ctx: &egui::Context) {
-        if self.debug_open == self.debug_shown {
+        let dock_width = if self.debug_open { DEBUG_W } else { 0.0 }
+            + if self.features.connect.is_open() {
+                crate::connect::PANEL_WIDTH
+            } else {
+                0.0
+            };
+        let delta = dock_width - self.dock_width_shown;
+        if delta == 0.0 {
             return;
         }
-        self.debug_shown = self.debug_open;
+        self.dock_width_shown = dock_width;
         self.grow_target = None;
         let inner = ctx.input(|i| i.viewport().inner_rect);
-        if self.debug_open {
+        if delta > 0.0 {
             if let Some(r) = inner {
-                let size = r.size() + vec2(DEBUG_W, 0.0);
+                let size = r.size() + vec2(delta, 0.0);
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
-                self.grown = true;
+                self.grown += delta;
                 self.grow_target = Some((size.x, GROW_WAIT_FRAMES));
             }
-        } else if std::mem::take(&mut self.grown)
+        } else if self.grown > 0.0
             && let Some(r) = inner
         {
-            let size = (r.size() - vec2(DEBUG_W, 0.0)).max(Vec2::splat(1.0));
+            let removed = (-delta).min(self.grown);
+            self.grown -= removed;
+            let size = (r.size() - vec2(removed, 0.0)).max(Vec2::splat(1.0));
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
         }
     }
@@ -1339,14 +1357,16 @@ impl eframe::App for EvoApp {
                 .frame(toolbar_frame())
                 .show(ui, |ui| self.sidebar(ui));
         }
+        if let Some((target, left)) = self.grow_target {
+            ui.ctx().data_mut(|d| {
+                d.remove::<egui::PanelState>(Id::new(DEBUG_PANEL_ID));
+                d.remove::<egui::PanelState>(Id::new(crate::connect::PANEL_ID));
+            });
+            self.grow_target =
+                (ui.max_rect().width() + 0.5 < target && left > 0).then(|| (target, left - 1));
+        }
         if self.debug_open {
             let window_w = ui.max_rect().width();
-            if let Some((target, left)) = self.grow_target {
-                ui.ctx()
-                    .data_mut(|d| d.remove::<egui::PanelState>(Id::new(DEBUG_PANEL_ID)));
-                self.grow_target =
-                    (window_w + 0.5 < target && left > 0).then(|| (target, left - 1));
-            }
             let max_w = debug_max_width(window_w);
             // `max_size` after `min_size` lowers the minimum to the cap when
             // the window is too narrow for both.
@@ -1359,6 +1379,10 @@ impl eframe::App for EvoApp {
                     ui.add_enabled_ui(self.usb_worker.is_none(), |ui| self.debug_panel(ui));
                 });
         }
+        self.feature_pass(&[], |f, cx| {
+            f.panels(ui, cx);
+            false
+        });
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(APP_BG).inner_margin(CENTRAL_MARGIN))
             .show(ui, |ui| self.calculator(ui));

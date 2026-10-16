@@ -34,7 +34,7 @@ cargo run --release -p evo-cli -- run <bundle.84b2> --gdb 3333   # attach arm-no
 `provision` uses the calculator's own engineering menu to switch a fresh unit from its
 factory self-test to the calculator OS, as a new unit leaves the factory.
 
-Open **Files → USB tools** in the desktop app for calculator files, Python programs,
+Click **USB** on the desktop app's left toolbar for calculator files, Python programs,
 images, CSV lists/matrices, screenshots, exam exit, and OS updates. These native tools
 use the calculator already open in the app; no browser, Node installation, or physical
 cable is needed. The Developer tab includes resource inspection and diagnostics.

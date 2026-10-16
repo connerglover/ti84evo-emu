@@ -133,6 +133,49 @@ fn demo_explains_why_usb_is_unavailable() {
 }
 
 #[test]
+fn usb_toolbar_button_toggles_a_dock_beside_the_calculator_and_debugger() {
+    use egui::accesskit::Role;
+    let dir = TempDir::new("evo-usb-dock", true);
+    let mut opts = test_options(&dir, FakePlatform::shared());
+    opts.start_paused = true;
+    let mut h = harness_with(FakeBackend::new(), opts);
+    h.set_size(egui::vec2(1380.0, 960.0));
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::Button, "USB tools").click();
+    h.run_steps(3);
+    assert!(h.state().features().connect.is_open());
+    let enter = h.get_by_label("enter").rect();
+    let files = h.get_by_label("Send files…").rect();
+    assert!(
+        enter.right() < files.left(),
+        "USB dock overlaps the calculator"
+    );
+    h.get_by_label("Debug panels").click();
+    h.run_steps(3);
+    assert!(h.state().debug_open());
+    assert!(h.state().features().connect.is_open());
+    assert!(
+        h.get_by_label("Send files…").rect().right() < h.get_by_label("Continue").rect().left()
+    );
+    h.get_by_role_and_label(Role::Button, "USB tools").click();
+    h.run_steps(3);
+    assert!(!h.state().features().connect.is_open());
+    assert!(h.state().debug_open());
+    h.get_by_role_and_label(Role::Button, "USB tools").click();
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::Button, "Close").click();
+    h.run_steps(3);
+    assert!(!h.state().features().connect.is_open());
+    h.get_by_role_and_label(Role::Button, "USB tools").click();
+    h.run_steps(3);
+    h.state_mut()
+        .apply_request(evo_gui::feature::AppRequest::ResetLayout);
+    h.run_steps(3);
+    assert!(!h.state().features().connect.is_open());
+    assert!(!h.state().debug_open());
+}
+
+#[test]
 fn file_search_matches_readable_types_and_recovers_from_no_matches() {
     let dir = TempDir::new("evo-usb-search", true);
     let fake = FakeBackend::new().with_usb_results(vec![Ok(directory())]);
@@ -249,10 +292,14 @@ fn snapshot_usb_files() {
     let fake = FakeBackend::new().with_usb_results(vec![Ok(directory())]);
     let mut opts = test_options(&dir, FakePlatform::shared());
     opts.start_paused = true;
-    let mut h = common::snap_harness_with(fake, [760.0, 960.0], opts);
+    let mut h = common::snap_harness_with(fake, [960.0, 960.0], opts);
     open_action(&mut h, Action::UsbTools);
     finish(&mut h);
     h.snapshot("usb_files");
+    h.set_size(egui::vec2(1380.0, 960.0));
+    h.get_by_label("Debug panels").click();
+    h.run_steps(5);
+    h.snapshot("usb_with_debug");
 }
 
 #[test]
@@ -288,7 +335,7 @@ fn snapshot_usb_calculator_and_screen() {
     let fake = fake.with_usb_results(vec![Ok(directory()), Ok(UsbResult::Screen(frame))]);
     let mut opts = test_options(&dir, FakePlatform::shared());
     opts.start_paused = true;
-    let mut h = common::snap_harness_with(fake, [760.0, 960.0], opts);
+    let mut h = common::snap_harness_with(fake, [960.0, 960.0], opts);
     open_action(&mut h, Action::UsbTools);
     finish(&mut h);
     h.query_all_by_label("Calculator").last().unwrap().click();

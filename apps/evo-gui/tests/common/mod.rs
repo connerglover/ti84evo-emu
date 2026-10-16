@@ -51,13 +51,13 @@ impl Drop for TempDir {
 }
 
 /// Runs `a` from the sidebar: clicks its group, then its entry in the popover, then lets
-/// the click play out (3 steps). [`Action::ToggleDebug`] has no popover: it clicks the
+/// the click play out (3 steps). Dock buttons have no popover: they click the
 /// group only.
 pub fn open_action(h: &mut Harness<'static, EvoApp>, a: Action) {
     h.get_by_role_and_label(Role::Button, a.group().tooltip())
         .click();
     h.run_steps(3);
-    if a != Action::ToggleDebug {
+    if !matches!(a, Action::ToggleDebug | Action::UsbTools) {
         h.get_by_role_and_label(Role::Button, a.label()).click();
         h.run_steps(3);
     }

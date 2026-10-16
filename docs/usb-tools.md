@@ -1,7 +1,9 @@
 # Desktop USB tools
 
-Open **Files → USB tools** from the left toolbar. The window follows the desktop
-app's theme and works with the calculator already open. It uses native USB CDC and
+Click **USB** on the left toolbar to open its resizable side panel. Click the button
+again or **Close** to hide it; drag the panel divider to adjust its width. Like the
+debug dock, opening it makes room beside the calculator. Both docks can stay open.
+The panel follows the app's theme and works with the calculator already open. It uses native USB CDC and
 Kermit transfers through the guest firmware, without a browser or JavaScript runtime.
 The demonstration calculator has no USB device; load an OS bundle first.
 

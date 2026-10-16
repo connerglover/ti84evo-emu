@@ -1,11 +1,12 @@
 //! The feature seam: each tool (ROM setup, capture, tools, files, help) is a [`Feature`] the
-//! app drives through [`Feature::on_action`], [`Feature::frame`] and [`Feature::ui`].
+//! app drives through [`Feature::on_action`], [`Feature::frame`], [`Feature::panels`]
+//! and [`Feature::ui`].
 //!
 //! Features never change the app directly. They change the backend through
 //! [`FeatureCtx::backend`] and ask the app for everything else with an [`AppRequest`].
 //!
 //! **Request rule.** Each pass that hands features a [`FeatureCtx`] (an action, the `logic`
-//! pass, the `ui` pass, exit) collects the requests into one list. The app applies that list,
+//! pass, panels, the `ui` pass, exit) collects the requests into one list. The app applies that list,
 //! in push order, right after the pass ends and before the next pass starts. A request pushed
 //! from `on_action` or `ui` therefore takes effect in the same frame. Requests are never kept
 //! for a later frame.
@@ -95,12 +96,14 @@ impl std::fmt::Debug for AppRequest {
     }
 }
 
-/// One tool of the app. There are no default methods: every feature states each one.
+/// One tool of the app. Features state their lifecycle; docked panels are optional.
 pub trait Feature {
     /// Runs `action` if this feature owns it; `false` means "not mine".
     fn on_action(&mut self, action: Action, cx: &mut FeatureCtx<'_>) -> bool;
     /// Called every frame in `logic`, after emulation.
     fn frame(&mut self, cx: &mut FeatureCtx<'_>);
+    /// Draws docked panels before the calculator's central panel.
+    fn panels(&mut self, _ui: &mut egui::Ui, _cx: &mut FeatureCtx<'_>) {}
     /// Draws this feature's windows and modals, after the app's overlays.
     fn ui(&mut self, ctx: &egui::Context, cx: &mut FeatureCtx<'_>);
     /// Whether `action` is drawn selected in its popover.

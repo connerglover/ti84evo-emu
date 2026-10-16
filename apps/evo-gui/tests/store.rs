@@ -222,7 +222,9 @@ fn group_and_action_tables() {
     use Group::*;
     assert_eq!(
         Group::ALL,
-        [Calculator, Capture, Files, Debug, Tools, Settings, Help]
+        [
+            Calculator, Capture, Files, Usb, Debug, Tools, Settings, Help
+        ]
     );
     let rows: Vec<_> = Group::ALL
         .iter()
@@ -234,6 +236,7 @@ fn group_and_action_tables() {
             ("\u{1F5A9}", "Calc", "Calculator"),
             ("\u{1F4F7}", "Shot", "Capture"),
             ("\u{1F4C1}", "Files", "Files"),
+            ("USB", "USB", "USB tools"),
             ("\u{1F41B}", "Debug", "Debug panels"),
             ("\u{1F527}", "Tools", "Tools"),
             ("\u{2699}", "Prefs", "Settings"),
@@ -275,7 +278,6 @@ fn group_and_action_tables() {
     assert_eq!(
         by_group(Files),
         [
-            "USB tools\u{2026}",
             "Import RAM image\u{2026}",
             "Export RAM image\u{2026}",
             "Import calculator state\u{2026}",
@@ -289,6 +291,7 @@ fn group_and_action_tables() {
         ]
     );
     assert_eq!(by_group(Debug), ["Debug panels"]);
+    assert_eq!(by_group(Usb), ["USB tools"]);
     assert_eq!(
         by_group(Tools),
         ["Key history", "Macros / AutoTester", "Hardware"]
