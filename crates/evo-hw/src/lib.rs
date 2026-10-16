@@ -9,7 +9,10 @@ pub mod soc;
 pub mod unmapped;
 pub mod watch;
 
-pub use device::{DevCtx, DevHarness, Device, ResetKind, StateError, load_serde, save_serde};
+pub use device::{
+    DevCtx, DevHarness, Device, DeviceInspect, RegView, ResetKind, StateError, load_serde,
+    save_serde,
+};
 pub use memmap::{DeviceState, MemoryMap};
 pub use unmapped::{UnmappedAccess, UnmappedKind, UnmappedLog};
 pub use watch::{AccessDir, BUS_RING_CAP, BusRecord, WatchError, WatchHit, WatchKinds, WatchRange};

@@ -51,6 +51,55 @@ pub trait Device: Any + Send {
     fn save(&self) -> Vec<u8>;
     /// Restore what [`Device::save`] produced. On error the device must be unchanged.
     fn load(&mut self, state: &[u8]) -> Result<(), StateError>;
+    /// The device's registers as a debugger shows them at cycle `now`: one row per register
+    /// [`Device::read`] decodes, in offset order, each with the value a guest read would return
+    /// at `now`, but without the read's side effects (nothing is popped, cleared or advanced).
+    /// Devices with nothing to show return no rows (the default).
+    fn inspect(&self, _now: u64) -> Vec<RegView> {
+        Vec::new()
+    }
+}
+
+/// One register row of [`Device::inspect`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegView {
+    /// The register's name, lower case (e.g. `lsr`, `data_in`, `ch0_value`).
+    pub name: String,
+    /// Offset from the device's base address.
+    pub offset: u32,
+    /// What a guest read of the register returns.
+    pub value: u32,
+    /// The value decoded, where it needs it (e.g. `"enabled, power on"`).
+    pub note: Option<String>,
+}
+
+impl RegView {
+    /// A row without a note.
+    pub fn new(name: impl Into<String>, offset: u32, value: u32) -> Self {
+        RegView {
+            name: name.into(),
+            offset,
+            value,
+            note: None,
+        }
+    }
+
+    /// This row with `note`.
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.note = Some(note.into());
+        self
+    }
+}
+
+/// One device's registers, from [`crate::MemoryMap::inspect_devices`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceInspect {
+    /// The name the device was added under.
+    pub name: &'static str,
+    /// The device window's base address.
+    pub base: u32,
+    /// Its registers, from [`Device::inspect`].
+    pub regs: Vec<RegView>,
 }
 
 /// What a device can see and touch while one of its methods runs.

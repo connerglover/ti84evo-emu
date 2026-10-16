@@ -1,4 +1,5 @@
-//! Debugger controls on [`Machine`]: run goals (step over, step out, run to).
+//! Debugger controls on [`Machine`]: run goals (step over, step out, run to) and
+//! side-effect-free peripheral inspection ([`Machine::peripherals`]).
 //!
 //! A goal is armed by one of the `arm_*` methods and checked by [`Machine::run`] before every
 //! step, ahead of breakpoints and exec watchpoints, except on the instruction the run resumes
@@ -10,7 +11,9 @@
 //!
 //! [`StopReason::Goal`]: crate::StopReason::Goal
 
-use armv8m::{Instr, decode16, decode32};
+use armv8m::scs::nvic::NUM_IRQS;
+use armv8m::{Instr, Sec, decode16, decode32};
+use evo_hw::{DeviceInspect, RegView};
 
 use crate::Machine;
 
@@ -107,5 +110,60 @@ impl Machine {
         } else {
             matches!(decode16(hw1), Instr::Blx { .. } | Instr::Blxns { .. }).then_some(2)
         }
+    }
+}
+
+/// Base of the Secure SysTick registers (`SYST_CSR`); the Non-secure view is at the same
+/// address through the Non-secure alias, listed under its own name.
+const SYSTICK_BASE: u32 = 0xE000_E010;
+/// Base of the NVIC registers (`NVIC_ISER0`).
+const NVIC_BASE: u32 = 0xE000_E100;
+
+impl Machine {
+    /// Every peripheral's registers as a debugger shows them, without side effects: the
+    /// memory-mapped devices with something to show, in the order they are attached
+    /// ([`evo_hw::MemoryMap::inspect_devices`] at `sched.now`), then `systick_s` and
+    /// `systick_ns` (rows `csr`, `rvr`, `cvr`) and `nvic`: one row `irq{n}` (offset `n`) per
+    /// IRQ that is enabled, pending, active or has its line asserted, with value
+    /// `enabled | pending << 1 | active << 2 | level << 3` and those words as the note.
+    pub fn peripherals(&self) -> Vec<DeviceInspect> {
+        let mut devs = self.bus.inspect_devices(self.sched.now);
+        for (name, sec) in [("systick_s", Sec::Secure), ("systick_ns", Sec::NonSecure)] {
+            let st = self.cpu.scs.systick.get(sec);
+            devs.push(DeviceInspect {
+                name,
+                base: SYSTICK_BASE,
+                regs: [("csr", 0x0), ("rvr", 0x4), ("cvr", 0x8)]
+                    .into_iter()
+                    .map(|(n, off)| RegView::new(n, off, st.peek(off)))
+                    .collect(),
+            });
+        }
+        let nvic = &self.cpu.scs.nvic;
+        let regs = (0..NUM_IRQS)
+            .filter_map(|irq| {
+                let bits = [
+                    ("enabled", nvic.is_enabled(irq)),
+                    ("pending", nvic.is_pending(irq)),
+                    ("active", nvic.is_active(irq)),
+                    ("level", nvic.level(irq)),
+                ];
+                let value = bits
+                    .iter()
+                    .enumerate()
+                    .fold(0, |v, (i, &(_, set))| v | u32::from(set) << i);
+                (value != 0).then(|| {
+                    let words: Vec<_> = bits.iter().filter(|b| b.1).map(|b| b.0).collect();
+                    // `irq < NUM_IRQS` fits in u32.
+                    RegView::new(format!("irq{irq}"), irq as u32, value).with_note(words.join(" "))
+                })
+            })
+            .collect();
+        devs.push(DeviceInspect {
+            name: "nvic",
+            base: NVIC_BASE,
+            regs,
+        });
+        devs
     }
 }

@@ -606,3 +606,72 @@ fn load_state_and_power_cycle_clear_the_goal() {
     assert_eq!(m.goal(), None);
     assert_eq!(m.run(1000), StopReason::CycleLimit);
 }
+
+// ---- device and SCS inspection ----
+
+#[test]
+fn peripherals_lists_devices_in_order() {
+    let m = store().boot();
+    let devs = m.peripherals();
+    let names: Vec<_> = devs.iter().map(|d| d.name).collect();
+    assert_eq!(
+        names,
+        [
+            "mpc_sram0",
+            "mpc_sram1",
+            "mpc_sram2",
+            "mpc_flash",
+            "cru",
+            "spctrl",
+            "timer",
+            "uart0",
+            "uart2",
+            "spif",
+            "gpio",
+            "lcdc",
+            "pwm",
+            "keypad",
+            "rtc",
+            "systick_s",
+            "systick_ns",
+            "nvic"
+        ]
+    );
+    let gpio = devs.iter().find(|d| d.name == "gpio").unwrap();
+    assert_eq!(gpio.base, 0x4010_5000);
+    let data_in = gpio.regs.iter().find(|r| r.name == "data_in").unwrap();
+    assert_eq!(data_in.value & (1 << 9 | 1 << 11), 1 << 9 | 1 << 11);
+    let systick = devs.iter().find(|d| d.name == "systick_s").unwrap();
+    assert_eq!(systick.base, 0xE000_E010);
+    let rows: Vec<_> = systick
+        .regs
+        .iter()
+        .map(|r| (r.name.as_str(), r.offset))
+        .collect();
+    assert_eq!(rows, [("csr", 0x0), ("rvr", 0x4), ("cvr", 0x8)]);
+}
+
+#[test]
+fn nvic_rows_show_pending_irq() {
+    let mut m = store().boot();
+    m.cpu.set_irq_level(13, true);
+    let devs = m.peripherals();
+    let nvic = devs.iter().find(|d| d.name == "nvic").unwrap();
+    assert_eq!(nvic.base, 0xE000_E100);
+    let row = nvic.regs.iter().find(|r| r.name == "irq13").unwrap();
+    assert_eq!(row.offset, 13);
+    assert_eq!(row.value, 1 << 1 | 1 << 3);
+    assert_eq!(row.note.as_deref(), Some("pending level"));
+    // Only IRQs with something set are listed.
+    assert!(nvic.regs.iter().all(|r| r.value != 0));
+}
+
+#[test]
+fn peripherals_changes_nothing() {
+    let mut m = store().boot();
+    m.run(10_000);
+    let before = m.save_state();
+    let first = m.peripherals();
+    assert_eq!(m.save_state(), before);
+    assert_eq!(m.peripherals(), first);
+}

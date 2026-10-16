@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use armv8m::{Access, AccessKind, Bus, BusError};
 use serde::{Deserialize, Serialize};
 
-use crate::device::{DevCtx, Device, ResetKind, StateError, Written, mask};
+use crate::device::{DevCtx, Device, DeviceInspect, ResetKind, StateError, Written, mask};
 use crate::region::{self, Buffer, Region, Target};
 use crate::unmapped::{UnmappedAccess, UnmappedKind, UnmappedLog};
 use crate::watch::{AccessDir, BusRecord, Watch, WatchError, WatchHit, WatchRange};
@@ -397,6 +397,22 @@ impl MemoryMap {
                 .downcast_mut::<T>()
                 .map(|t| f(t, ctx))
         })?
+    }
+
+    /// Every device's registers at cycle `now` ([`Device::inspect`]), in add order; devices
+    /// with no rows are left out. Changes nothing (no device call, no log entry).
+    pub fn inspect_devices(&self, now: u64) -> Vec<DeviceInspect> {
+        self.slots
+            .iter()
+            .filter_map(|s| {
+                let regs = s.dev.inspect(now);
+                (!regs.is_empty()).then_some(DeviceInspect {
+                    name: s.name,
+                    base: s.base,
+                    regs,
+                })
+            })
+            .collect()
     }
 
     /// Device `id`'s requested event is due: call its [`Device::event`] at `self.now`. An

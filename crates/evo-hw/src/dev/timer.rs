@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CPU_HZ, DevCtx, Device, ResetKind, StateError, load_serde, save_serde};
+use crate::{CPU_HZ, DevCtx, Device, RegView, ResetKind, StateError, load_serde, save_serde};
 
 /// Number of counter channels.
 const CHANNELS: usize = 3;
@@ -201,5 +201,20 @@ impl Device for Timer {
 
     fn load(&mut self, state: &[u8]) -> Result<(), StateError> {
         load_serde(&mut self.regs, state)
+    }
+
+    fn inspect(&self, now: u64) -> Vec<RegView> {
+        let mut rows = Vec::new();
+        for n in 0..CHANNELS as u32 {
+            for (name, off) in [("value", 0x10 * n), ("load", 0x10 * n + 4)] {
+                // Every offset listed here is a register.
+                let v = self.reg(off, now).unwrap_or(0);
+                rows.push(RegView::new(format!("ch{n}_{name}"), off, v));
+            }
+        }
+        for (name, off) in [("ctrl", CTRL), ("int_stat", INT_STAT), ("int_en", INT_EN)] {
+            rows.push(RegView::new(name, off, self.reg(off, now).unwrap_or(0)));
+        }
+        rows
     }
 }

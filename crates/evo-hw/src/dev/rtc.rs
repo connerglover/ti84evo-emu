@@ -19,7 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CPU_HZ, DevCtx, Device, ResetKind, StateError, load_serde, save_serde};
+use crate::{CPU_HZ, DevCtx, Device, RegView, ResetKind, StateError, load_serde, save_serde};
 
 /// The RTC's IRQ line.
 pub const RTC_IRQ: u16 = 15;
@@ -155,5 +155,30 @@ impl Device for Rtc {
         s.base = (u64::from(s.base) % DAY) as u32;
         *self = s;
         Ok(())
+    }
+
+    fn inspect(&self, now: u64) -> Vec<RegView> {
+        let named = [
+            ("alarm0", ALARM0),
+            ("alarm1", ALARM1),
+            ("alarm2", ALARM2),
+            ("ctrl", CTRL),
+            ("status", STATUS),
+            ("busy", BUSY),
+            ("time", TIME),
+        ];
+        named
+            .into_iter()
+            .map(|(name, off)| {
+                // Every offset listed is a register.
+                let row = RegView::new(name, off, self.reg(off, now).unwrap_or(0));
+                if off == TIME {
+                    let s = self.seconds_of_day(now);
+                    row.with_note(format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60))
+                } else {
+                    row
+                }
+            })
+            .collect()
     }
 }

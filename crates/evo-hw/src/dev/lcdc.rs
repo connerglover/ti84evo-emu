@@ -20,7 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CPU_HZ, DevCtx, Device, ResetKind, StateError, load_serde, save_serde};
+use crate::{CPU_HZ, DevCtx, Device, RegView, ResetKind, StateError, load_serde, save_serde};
 
 /// Cycles per LCD frame: 60 Hz at [`CPU_HZ`] (the real pixel clock is unknown; `lcdc.md`).
 pub const FRAME_CYCLES: u64 = CPU_HZ / 60;
@@ -226,6 +226,65 @@ impl Device for Lcdc {
         *self = s;
         Ok(())
     }
+
+    fn inspect(&self, _now: u64) -> Vec<RegView> {
+        let mut named: Vec<(String, u32)> = vec![
+            ("tim0".into(), TIM0),
+            ("tim1".into(), TIM0 + 4),
+            ("tim2".into(), TIM0 + 8),
+            ("tim3".into(), TIM3),
+            ("upbase".into(), UPBASE),
+            ("lpbase".into(), LPBASE),
+            ("control".into(), CONTROL),
+            ("imsc".into(), IMSC),
+            ("ris".into(), RIS),
+            ("mis".into(), MIS),
+            ("icr".into(), ICR),
+            ("upcurr".into(), UPCURR),
+            ("lpcurr".into(), LPCURR),
+        ];
+        named.extend((0..IDS.len() as u32).map(|i| (format!("id{i}"), IDS_AT + 4 * i)));
+        named
+            .into_iter()
+            .map(|(name, off)| {
+                // Every offset listed is a register.
+                let row = RegView::new(name, off, self.reg(off).unwrap_or(0));
+                if off == CONTROL {
+                    row.with_note(control_note(self.control))
+                } else {
+                    row
+                }
+            })
+            .collect()
+    }
+}
+
+/// CONTROL decoded: `"enabled, power on, rgb565"`, `"disabled, power off, bpp 2"`, ...
+fn control_note(c: u32) -> String {
+    let mut parts = vec![
+        if c & LCD_EN != 0 {
+            "enabled"
+        } else {
+            "disabled"
+        }
+        .to_owned(),
+        if c & LCD_PWR != 0 {
+            "power on"
+        } else {
+            "power off"
+        }
+        .to_owned(),
+    ];
+    let bpp = (c >> 1) & 7;
+    parts.push(if bpp == BPP_565 {
+        "rgb565".to_owned()
+    } else {
+        format!("bpp {bpp}")
+    });
+    if c & LCD_BGR != 0 {
+        parts.push("bgr".to_owned());
+    }
+    parts.join(", ")
 }
 
 /// The backlight PWM: duty at +0x00, period at +0x04, plain storage (no IRQ).
@@ -280,5 +339,12 @@ impl Device for Pwm {
 
     fn load(&mut self, state: &[u8]) -> Result<(), StateError> {
         load_serde(self, state)
+    }
+
+    fn inspect(&self, _now: u64) -> Vec<RegView> {
+        vec![
+            RegView::new("duty", 0x00, self.duty),
+            RegView::new("period", 0x04, self.period),
+        ]
     }
 }

@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{DevCtx, Device, ResetKind, StateError, load_serde, save_serde};
+use crate::{DevCtx, Device, RegView, ResetKind, StateError, load_serde, save_serde};
 
 /// Undrained TX bytes kept; when more arrive, the oldest are dropped.
 pub const UART_TX_CAP: usize = 1 << 20;
@@ -131,14 +131,21 @@ impl Uart16550 {
 
     /// A register read at word offset `reg`, or `None` if it is not a register.
     fn read_reg(&mut self, reg: u32) -> Option<u32> {
+        let v = self.peek_reg(reg)?;
+        if reg == RBR_THR_DLL && !self.dlab() {
+            self.regs.rx.pop_front();
+            self.refill();
+        }
+        Some(v)
+    }
+
+    /// The value a read at word offset `reg` returns, without popping the RX FIFO; `None` if
+    /// it is not a register.
+    fn peek_reg(&self, reg: u32) -> Option<u32> {
         let r = &self.regs;
         Some(match reg {
             RBR_THR_DLL if self.dlab() => u32::from(r.dll),
-            RBR_THR_DLL => {
-                let b = self.regs.rx.pop_front().unwrap_or(0);
-                self.refill();
-                u32::from(b)
-            }
+            RBR_THR_DLL => u32::from(r.rx.front().copied().unwrap_or(0)),
             IER_DLH if self.dlab() => u32::from(r.dlh),
             IER_DLH => u32::from(r.ier & 0x0F),
             IIR_FCR => {
@@ -243,5 +250,34 @@ impl Device for Uart16550 {
         }
         self.regs = regs;
         Ok(())
+    }
+
+    fn inspect(&self, _now: u64) -> Vec<RegView> {
+        let named = [
+            ("rbr_thr_dll", RBR_THR_DLL),
+            ("ier_dlh", IER_DLH),
+            ("iir_fcr", IIR_FCR),
+            ("lcr", LCR),
+            ("mcr", MCR),
+            ("lsr", LSR),
+            ("msr", MSR),
+            ("scr", SCR),
+        ];
+        let dlab = self.dlab();
+        named
+            .into_iter()
+            .map(|(name, off)| {
+                // Every offset listed is a register.
+                let row = RegView::new(name, off, self.peek_reg(off).unwrap_or(0));
+                match off {
+                    RBR_THR_DLL if dlab => row.with_note("divisor latch low"),
+                    IER_DLH if dlab => row.with_note("divisor latch high"),
+                    RBR_THR_DLL if !self.regs.rx.is_empty() => {
+                        row.with_note(format!("{} bytes in the RX FIFO", self.regs.rx.len()))
+                    }
+                    _ => row,
+                }
+            })
+            .collect()
     }
 }
