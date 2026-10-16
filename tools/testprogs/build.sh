@@ -18,8 +18,12 @@ for entry in $PROGRAMS; do
     arm-none-eabi-gcc -mcpu=cortex-m33 -mthumb -mcmse -c -o "build/$name.o" "$name.S"
     arm-none-eabi-ld -T link.ld --no-warn-rwx-segments -o "build/$name.elf" "build/$name.o"
     arm-none-eabi-objcopy -O binary -j .s_text -j .s_nsc "build/$name.elf" "out/$name.bin"
+    # objcopy inherits executable permissions from the ELF on Linux. These are
+    # data images, and their tracked mode must be identical on every platform.
+    chmod 644 "out/$name.bin"
     if [ "$parts" = "s+ns" ]; then
         arm-none-eabi-objcopy -O binary -j .ns_text "build/$name.elf" "out/${name}_ns.bin"
+        chmod 644 "out/${name}_ns.bin"
     fi
     echo "built $name"
 done

@@ -1,108 +1,104 @@
-name: ci
+name: CI
+
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "2"
+  RUST_BACKTRACE: "1"
 
 jobs:
-  usb-adapter:
+  checks:
+    name: ${{ matrix.name }}
+    timeout-minutes: 30
     strategy:
+      # A Linux failure must not cancel the independent Windows result.
+      fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+            features: ""
+          - name: Windows
+            os: windows-2025
+            features: --features evo-gui/snapshots
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: "22"
-      - run: node --test tools/usb-connect/*.test.mjs
-
-  fmt:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+          persist-credentials: false
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: "1.98"
-          components: rustfmt
-      - run: cargo fmt --check
-
-  clippy:
-    strategy:
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+          toolchain: "1.98.0"
+          components: rustfmt, clippy
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          toolchain: "1.98"
-          components: clippy
-      # rfd (xdg-portal), arboard (x11rb) and openh264-sys2 (C/C++ source build) need no packages
-      # beyond these and the runner's compiler.
-      # eframe (evo-gui) needs the xkbcommon and wayland headers on Linux.
-      - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-
-  test:
-    strategy:
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+          node-version: "24"
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev cmake ninja-build libclang-dev
+      - name: Set up Arm test-program compiler
+        if: runner.os == 'Linux'
+        uses: carlosperate/arm-none-eabi-gcc-action@0edbb000a5a98e2292b051b463bff6f512547118 # v1.14.0
         with:
-          toolchain: "1.98"
-      # Same packages as clippy: rfd, arboard and openh264-sys2 need nothing more.
-      - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
-      - run: cargo test --workspace
-
-  gui-snapshots:
-    # Golden images of the GUI on the fake backend. kittest prefers a CPU
-    # wgpu adapter, which is WARP on Windows.
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+          release: "14.2.Rel1"
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
         with:
-          toolchain: "1.98"
-      - run: cargo test -p evo-gui --features snapshots --test "snapshots*"
-      - if: failure()
-        uses: actions/upload-artifact@v4
+          shared-key: ci-${{ matrix.name }}
+          cache-on-failure: true
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+      - name: Test USB browser adapter
+        run: node --test tools/usb-connect/*.test.mjs
+      - name: Verify committed Arm program images
+        if: runner.os == 'Linux'
+        run: |
+          sh tools/testprogs/build.sh
+          git diff --exit-code -- tools/testprogs/out
+          test -z "$(git status --porcelain -- tools/testprogs/out)"
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets ${{ matrix.features }} -- -D warnings
+      - name: Test workspace (including GUI snapshots on Windows)
+        # This includes connect.rs snapshots, not just tests named snapshots*.
+        run: cargo test --locked --workspace ${{ matrix.features }}
+      - name: Differential tests against Unicorn
+        if: runner.os == 'Linux'
+        env:
+          DIFFTEST_CASES: "10000"
+        run: |
+          cargo clippy --locked -p armv8m --all-targets --features difftest -- -D warnings
+          cargo test --locked -p armv8m --features difftest
+      - name: Upload failed GUI snapshots
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gui-snapshot-diffs
           path: apps/evo-gui/tests/snapshots/*.png
+          retention-days: 14
 
-  testprogs:
-    # The committed test program images (tools/testprogs/out) must match their sources.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: carlosperate/arm-none-eabi-gcc-action@v1
-        with:
-          release: "14.2.Rel1"
-      - run: sh tools/testprogs/build.sh
-      - run: git diff --exit-code tools/testprogs/out
-      - name: No new, uncommitted images
-        run: test -z "$(git status --porcelain tools/testprogs/out)"
-
-  difftest:
-    # Differential testing against Unicorn (GPL-2.0, test-only `difftest` feature).
-    runs-on: ubuntu-latest
-    env:
-      DIFFTEST_CASES: "10000"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.98"
-          components: clippy
-      # unicorn-engine-sys builds Unicorn with CMake and runs bindgen (libclang).
-      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libclang-dev
-      - run: cargo clippy -p armv8m --all-targets --features difftest -- -D warnings
-      - run: cargo test -p armv8m --features difftest
+  release:
+    name: Windows package
+    needs: checks
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml

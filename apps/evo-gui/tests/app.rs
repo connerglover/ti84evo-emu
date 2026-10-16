@@ -579,7 +579,9 @@ fn screenshot_button_writes_png() {
 
 #[test]
 fn long_toast_after_a_short_one_stays_wide() {
-    let dir = fresh_dir("toastwidth");
+    // Use a long fixture path on every OS. Linux's /tmp path otherwise produces
+    // a legitimately narrower label than Windows's user-specific temp folder.
+    let dir = fresh_dir("toastwidth-deliberately-long-calculator-directory");
     let mut h = harness_in(FakeBackend::new(), true, dir.to_path_buf());
     h.run_steps(1);
     open_action(&mut h, Action::SaveState);

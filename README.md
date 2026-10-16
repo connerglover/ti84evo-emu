@@ -54,6 +54,8 @@ EVO_OS_IMAGE=<bundle.84b2> cargo test --release -p evo-core --test milestones --
 Tests that need the real OS read its path from `EVO_OS_IMAGE` and skip themselves when it is
 unset.
 
+See [GitHub Actions](docs/ci.md) for platform checks, snapshot evidence, and Windows packages.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). TI-84 Evo is a trademark of Texas Instruments; this project is not affiliated with or
