@@ -11,21 +11,56 @@ written that way: 0x1015_2716 and 0x0015_2716 name the same instruction.
 ### Booting persisted flash
 
 `Machine::from_nv(nv, layout)` boots the secure image already stored in an `NvState`.
-It preserves all flash and NOR security-register bytes and derives `VTOR_S` from the
+It keeps guest data and NOR security-register bytes and derives `VTOR_S` from the
 stored MCUboot header. Use this when reopening flash after a guest USB OS update.
 `Machine::from_bundle_nv` retains its original installation behavior: bundle images
 overwrite their saved slots, while other data survives.
 
 Persisted boot rejects a missing or out-of-bounds secure header/body, an unaligned
 vector table, an initial stack pointer outside mapped SRAM, or a reset vector outside
-the secure image's Thumb code. It does not perform MCUboot signature verification or
-BL1/BL2 recovery, swap, or rollback. A rejected saved image stays unchanged.
+the secure image's Thumb code. The active image remains trusted under the existing
+bootloader bypass. A recognized pending permanent update gets the additional checks
+below; an invalid pending update makes this constructor fail without altering its NV.
 
 Its save-state identity hashes the stored secure header and payload plus slot addresses;
 the existing NV fingerprint separately covers all flash and security registers. User-data
 writes therefore preserve boot identity, but loading a state still requires exactly its
 saved NV contents. Bundle-created and persisted-image-created machines can have different
 boot identities even when their flash bytes match.
+
+### Completed permanent secure updates
+
+For `Layout::EVO_7_1`, persisted boot, `power_cycle`, and AIRCR.SYSRESETREQ recognize a
+completed permanent update in the secure secondary slot. The firmware flash-area table
+at physical `0xCE74C` identifies primary `0xB0000` and secondary `0x280000`, each 1 MiB.
+An actual official TI Connect Evo `sendBundle` transfer wrote the secondary image and
+its trailer: MCUboot magic at `0x37FFF0`, `image_ok=1` at `0x37FFE8`, and erased
+`copy_done` at `0x37FFE0`. Transfer success alone therefore means staging succeeded.
+
+Before activation, `evo-core/src/boot.rs` requires that trailer and validates bounded
+MCUboot header/TLV lengths, image flags, SHA-256 over header/body/protected TLVs, a
+nondecreasing protected security counter, and RSA-3072 PSS with SHA-256 and a 32-byte
+salt. The candidate's key-hash TLV must match a PKCS#1 DER public key embedded inside
+the active secure image body. No TI key is distributed with the emulator. This trusts
+the current image; it does not recreate an immutable hardware root of trust or OTP
+anti-rollback policy. The signed candidate's vectors must also pass persisted boot's
+bounds checks before any live flash changes.
+
+The emulator applies the **completed permanent swap outcome atomically in memory**:
+swap the two secure slots, set primary `copy_done=1`, and erase the secondary's final
+4 KiB trailer sector. Other images and NOR security registers are unchanged. This
+matches the permanent-update state described by [MCUboot's design](https://docs.mcuboot.com/design.html)
+and its [swap-type table](https://github.com/mcu-tools/mcuboot/blob/main/boot/bootutil/src/bootutil_public.c).
+It does not emulate BL2 instructions, scratch-sector writes, interrupted-swap recovery,
+test/revert updates, or bootloader replacement. Unsupported or incomplete trailers are
+left alone. A recognized but invalid candidate leaves all flash unchanged; reset logs
+one warning and boots the existing image, whereas `from_nv` returns an error.
+
+Synthetic signed tests execute different old/new instructions, reject damaged hashes,
+signatures, counters and vectors, and exercise power-cycle and guest reset activation.
+The optional `EVO_STAGED_UPDATE` test validates an external, uncommitted saved flash in
+memory. The observed TI transfer used bundle 7.1.0.4421 against the same installed
+version: it verifies real signed staging and activation, not a cross-version upgrade.
 
 ## 0. Result in one paragraph
 

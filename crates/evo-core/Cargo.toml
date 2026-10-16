@@ -13,9 +13,11 @@ log.workspace = true
 postcard.workspace = true
 serde.workspace = true
 sha2 = "0.10"
+rsa = { version = "0.9", default-features = false, features = ["std"] }
 thiserror.workspace = true
 
 [dev-dependencies]
 evo-image = { path = "../evo-image", features = ["testutil"] }
 png = "0.17"
 serde_json.workspace = true
+rand = "0.8"

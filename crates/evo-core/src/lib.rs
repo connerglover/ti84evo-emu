@@ -1,5 +1,6 @@
 //! TI-84 Evo machine core: scheduler, bus fabric and peripherals.
 
+mod boot;
 pub mod debug;
 pub mod gdb;
 pub mod host;

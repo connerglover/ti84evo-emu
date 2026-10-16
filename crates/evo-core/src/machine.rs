@@ -194,6 +194,8 @@ pub enum NvBootError {
     Image(&'static str),
     #[error("invalid persisted boot vectors: {0}")]
     Vectors(&'static str),
+    #[error("cannot activate staged firmware: {0}")]
+    Update(&'static str),
 }
 
 /// The whole emulated calculator.
@@ -289,20 +291,37 @@ impl Machine {
         ))
     }
 
-    /// Boot the images already in `nv`, preserving every flash byte and NOR security
-    /// register. Unlike [`from_bundle_nv`](Self::from_bundle_nv), this never installs a
+    /// Boot the images already in `nv`, keeping guest data and NOR security registers.
+    /// Unlike [`from_bundle_nv`](Self::from_bundle_nv), this never installs a
     /// bundle, so an OS update received over USB survives the next process start.
     ///
     /// The secure slot must contain an MCUboot header, an aligned vector table, a mapped
     /// SRAM stack pointer and a Thumb reset vector within its image body. This checks boot
-    /// bounds, not firmware signatures or BL1/BL2 recovery/swap state. An invalid image is
-    /// an error; callers must not silently replace it with an older bundle.
+    /// bounds; the active image is trusted as in the existing bootloader bypass. For the
+    /// EVO 7.1 layout, a completed permanent secondary update is activated after checking
+    /// its hash, RSA-PSS signature against a key in the active image, and security counter.
+    /// This models the completed swap outcome, not BL1/BL2 recovery or rollback. An invalid
+    /// image or pending update is an error; callers must not replace it with an older bundle.
     ///
     /// Save-state identity comes from the stored secure header/payload and layout, rather
     /// than a bundle package. The separate NV fingerprint still checks *all* flash and
     /// security-register bytes. States from bundle boot and persisted boot need not share
     /// an identity; ordinary data writes do not change the persisted boot identity.
     pub fn from_nv(nv: NvState, layout: &Layout) -> Result<Self, NvBootError> {
+        let nv = crate::boot::activate_pending(&nv, layout)?.unwrap_or(nv);
+        let (vtor, identity) = Self::nv_boot_metadata(&nv, layout)?;
+        Ok(Self::power_on(
+            nv.flash().to_vec(),
+            Some(nv.secregs()),
+            vtor,
+            identity,
+        ))
+    }
+
+    pub(crate) fn nv_boot_metadata(
+        nv: &NvState,
+        layout: &Layout,
+    ) -> Result<(u32, [u8; 32]), NvBootError> {
         let flash = nv.flash();
         let start = layout.secure_slot_base as usize;
         if layout.secure_slot_base >= FLASH_SIZE
@@ -363,12 +382,7 @@ impl Machine {
             layout.secure_slot_base,
             layout.ns_slot_base,
         );
-        Ok(Self::power_on(
-            flash.to_vec(),
-            Some(nv.secregs()),
-            vtor,
-            identity,
-        ))
+        Ok((vtor, identity))
     }
 
     /// Switch the calculator off and on again: the machine becomes what
@@ -378,6 +392,7 @@ impl Machine {
     /// hit), the bus monitor, the run goal, held keys and host inputs start over as at
     /// power-on.
     pub fn power_cycle(&mut self) {
+        self.activate_pending_update();
         let nv = self.nv_state();
         let unbatched = self.unbatched;
         *self = Self::power_on(
@@ -953,6 +968,7 @@ impl Machine {
     #[cold]
     #[inline(never)]
     fn system_reset(&mut self) {
+        self.activate_pending_update();
         self.resets += 1;
         log::info!(
             "system reset #{} at cycle {} (pc {:#010x})",
@@ -976,6 +992,34 @@ impl Machine {
         self.bus.reset_devices(ResetKind::System);
         write_bl2_header(&mut self.bus);
         self.sync_bus();
+    }
+
+    /// Complete only the observed permanent update at the boundary where BL2 would run.
+    /// An invalid candidate never changes flash or prevents the existing image from resetting.
+    fn activate_pending_update(&mut self) {
+        let layout = Layout::EVO_7_1;
+        if !(FLASH_S + layout.secure_slot_base..FLASH_S + layout.secure_slot_base + 0x100000)
+            .contains(&self.boot_vtor)
+            || !crate::boot::pending(&self.bus)
+        {
+            return;
+        }
+        match crate::boot::activate_pending(&self.nv_state(), &layout) {
+            Ok(Some(nv)) => {
+                // activate_pending already validated the resulting primary vectors.
+                let (vtor, identity) =
+                    Self::nv_boot_metadata(&nv, &layout).expect("validated update");
+                self.bus
+                    .buffer_mut(FLASH_BUFFER)
+                    .expect("machine flash")
+                    .copy_from_slice(nv.flash());
+                self.boot_vtor = vtor;
+                self.bundle_id = identity;
+                log::info!("activated verified permanent secure firmware update");
+            }
+            Ok(None) => {}
+            Err(error) => log::warn!("{error}; keeping the active firmware"),
+        }
     }
 }
 
