@@ -1,6 +1,9 @@
-//! Tools: key history, macros / AutoTester and the Hardware panel.
+//! Tools: key scripts, key history, macros / AutoTester and the Hardware panel.
 //!
-//! Stub written by Lane 0; Lane E replaces it and keeps `new(&AppOptions)`.
+//! [`Tools`] is the feature that owns the Key history, Macros / AutoTester and Hardware
+//! windows; until those land it declines every action. It keeps `new(&AppOptions)`.
+
+pub mod script;
 
 use crate::app::AppOptions;
 use crate::feature::{Feature, FeatureCtx};
