@@ -6,7 +6,8 @@
 //! host API: `screen`, the backlight `Pwm`, `set_key`, `take_uart_tx`, `save_state` /
 //! `load_state`, and the flash file (`from_bundle_nv`, `nv_state`, `NvState`). Plan 4's
 //! debugger API: watchpoints, goals (`arm_*`, `disarm`), `write_reg`, `peripherals`, and the
-//! bus monitor and `poke` on `bus`.
+//! bus monitor and `poke` on `bus`; and its I/O API: `inject_uart_rx`, `set_gpio_input`,
+//! `set_usb_cc`, `set_rtc` / `rtc_seconds`, `power_state` and `export_ram` / `import_ram`.
 
 use std::path::{Path, PathBuf};
 
@@ -109,6 +110,56 @@ pub struct MachineBackend {
     frame: Frame,
     /// The bus-monitor range as last set (the core has no getter), so `reset` can keep it.
     monitor: Option<(u32, u32)>,
+    /// The board inputs the Hardware panel sets (see [`Board`]).
+    board: Board,
+    /// [`EmuBackend::set_key`] calls not yet taken by `take_key_events`, oldest first; at most
+    /// [`KEY_EVENT_CAP`].
+    key_events: Vec<KeyEvent>,
+}
+
+/// The most key events kept undrained; older ones are dropped. The app drains them every
+/// frame, so the cap only bounds a backend nobody drains.
+const KEY_EVENT_CAP: usize = 4096;
+
+/// GPIO pin of the charger status line (high = no charger).
+const PIN_CHARGER: u8 = 9;
+/// GPIO pin of the battery comparator (high = the battery is good).
+const PIN_BATTERY: u8 = 11;
+/// Seconds in a day: the RTC counts seconds of day below it.
+const DAY_SECONDS: u32 = 86_400;
+
+/// The board conditions the host sets: they belong to the board, not the guest, so the
+/// backend keeps them and drives them again into every new machine (reset, flash import) and
+/// after a state load.
+#[derive(Clone, Copy, Debug)]
+struct Board {
+    /// GPIO 9 level.
+    charger_line: bool,
+    /// GPIO 11 level.
+    battery_ok: bool,
+    /// USB-C CC1 attached.
+    usb_attached: bool,
+}
+
+impl Board {
+    /// What the core's machine starts with: pins 9 and 11 high (`BOARD_INPUTS_HIGH`), no
+    /// cable.
+    const POWER_ON: Self = Self {
+        charger_line: true,
+        battery_ok: true,
+        usb_attached: false,
+    };
+
+    /// Drives these conditions into `m`.
+    fn apply(self, m: &mut Machine) {
+        m.set_gpio_input(PIN_CHARGER, Some(self.charger_line));
+        m.set_gpio_input(PIN_BATTERY, Some(self.battery_ok));
+        if self.usb_attached {
+            m.set_usb_cc(1, 0);
+        } else {
+            m.set_usb_cc(0, 0);
+        }
+    }
 }
 
 impl MachineBackend {
@@ -161,7 +212,25 @@ impl MachineBackend {
                 rgba: Vec::new(),
             },
             monitor: None,
+            board: Board::POWER_ON,
+            key_events: Vec::new(),
         })
+    }
+
+    /// Replaces the machine with a new one booted from the bundle over `nv`. The debugger's
+    /// breakpoints, watchpoints and bus-monitor range and the board inputs carry over; the
+    /// goal is dropped. On `Err` the machine is kept.
+    fn rebuild(&mut self, nv: NvState) -> Result<(), ImageError> {
+        let mut m = Machine::from_bundle_nv(&self.bundle, &Layout::EVO_7_1, Some(nv))?;
+        m.breakpoints = std::mem::take(&mut self.machine.breakpoints);
+        if let Err(e) = m.set_watchpoints(self.machine.watchpoints()) {
+            // They were validated when set, so this does not happen.
+            log::error!("the new machine dropped the watchpoints: {e}");
+        }
+        m.bus.set_bus_monitor(self.monitor);
+        self.board.apply(&mut m);
+        self.machine = m;
+        Ok(())
     }
 
     /// Where [`EmuBackend::persist`] writes the flash file.
@@ -291,6 +360,14 @@ impl EmuBackend for MachineBackend {
 
     fn set_key(&mut self, key: KeyId, pressed: bool) {
         self.machine.set_key(core_key(key), pressed);
+        if self.key_events.len() >= KEY_EVENT_CAP {
+            self.key_events.remove(0);
+        }
+        self.key_events.push(KeyEvent {
+            key,
+            pressed,
+            cycle: self.machine.sched.now,
+        });
     }
 
     fn run_for(&mut self, cycles: u64) -> RunStatus {
@@ -318,25 +395,17 @@ impl EmuBackend for MachineBackend {
     fn load_state(&mut self, bytes: &[u8]) -> Result<(), BackendError> {
         self.machine
             .load_state(bytes)
-            .map_err(|e| BackendError::BadState(e.to_string()))
+            .map_err(|e| BackendError::BadState(e.to_string()))?;
+        // The state holds the input levels of its own time; the board's are the panel's.
+        self.board.apply(&mut self.machine);
+        Ok(())
     }
 
     fn reset(&mut self) {
         // Flash is kept: the new machine starts from the current non-volatile state.
-        let nv = Some(self.machine.nv_state());
-        match Machine::from_bundle_nv(&self.bundle, &Layout::EVO_7_1, nv) {
-            Ok(mut m) => {
-                // Debugger settings carry over; the goal (never set on `m`) is dropped.
-                m.breakpoints = std::mem::take(&mut self.machine.breakpoints);
-                if let Err(e) = m.set_watchpoints(self.machine.watchpoints()) {
-                    // They were validated when set, so this does not happen.
-                    log::error!("reset dropped the watchpoints: {e}");
-                }
-                m.bus.set_bus_monitor(self.monitor);
-                self.machine = m;
-            }
+        if let Err(e) = self.rebuild(self.machine.nv_state()) {
             // The same bundle booted once already, so this does not happen.
-            Err(e) => log::error!("reset failed, machine kept: {e}"),
+            log::error!("reset failed, machine kept: {e}");
         }
     }
 
@@ -600,48 +669,87 @@ impl EmuBackend for MachineBackend {
             .collect()
     }
 
-    // Not wired to the core yet (Plan 4, Task W2): each returns `Unsupported`, an empty
-    // value, or does nothing.
-
     fn take_uart2(&mut self) -> Vec<u8> {
-        Vec::new()
+        self.machine.take_uart_tx(UartPort::Uart2)
     }
 
-    fn send_uart(&mut self, _port: UartId, _bytes: &[u8]) {}
+    fn send_uart(&mut self, port: UartId, bytes: &[u8]) {
+        let port = match port {
+            UartId::Uart0 => UartPort::Uart0,
+            UartId::Uart2 => UartPort::Uart2,
+        };
+        self.machine.inject_uart_rx(port, bytes);
+    }
 
     fn take_key_events(&mut self) -> Vec<KeyEvent> {
-        Vec::new()
+        std::mem::take(&mut self.key_events)
     }
 
     fn hardware(&self) -> HardwareView {
+        let power = self.machine.power_state();
         HardwareView {
             backlight: self.backlight(),
-            charger_line: false,
-            battery_ok: false,
-            usb_attached: false,
-            power_hold: false,
-            deep_sleep: false,
-            rtc_seconds: 0,
+            charger_line: self.board.charger_line,
+            battery_ok: self.board.battery_ok,
+            usb_attached: self.board.usb_attached,
+            power_hold: power.hold,
+            deep_sleep: power.deep_sleep,
+            rtc_seconds: self.machine.rtc_seconds(),
         }
     }
 
-    fn set_hardware(&mut self, _change: HwChange) -> Result<(), BackendError> {
-        Err(BackendError::Unsupported("hardware changes"))
+    fn set_hardware(&mut self, change: HwChange) -> Result<(), BackendError> {
+        let m = &mut self.machine;
+        match change {
+            HwChange::ChargerLine(on) => {
+                self.board.charger_line = on;
+                m.set_gpio_input(PIN_CHARGER, Some(on));
+            }
+            HwChange::BatteryOk(ok) => {
+                self.board.battery_ok = ok;
+                m.set_gpio_input(PIN_BATTERY, Some(ok));
+            }
+            HwChange::UsbAttached(on) => {
+                self.board.usb_attached = on;
+                m.set_usb_cc(u8::from(on), 0);
+            }
+            HwChange::RtcSeconds(s) if s >= DAY_SECONDS => {
+                return Err(BackendError::Invalid(
+                    "RTC time must be below 24 h".to_owned(),
+                ));
+            }
+            HwChange::RtcSeconds(s) => m.set_rtc(s),
+        }
+        Ok(())
     }
 
     fn export_ram(&self) -> Result<Vec<u8>, BackendError> {
-        Err(BackendError::Unsupported("exporting RAM"))
+        Ok(self.machine.export_ram())
     }
 
-    fn import_ram(&mut self, _bytes: &[u8]) -> Result<(), BackendError> {
-        Err(BackendError::Unsupported("importing RAM"))
+    fn import_ram(&mut self, bytes: &[u8]) -> Result<(), BackendError> {
+        self.machine
+            .import_ram(bytes)
+            .map_err(|e| BackendError::BadState(e.to_string()))
     }
 
-    fn export_flash(&self, _path: &Path) -> Result<(), BackendError> {
-        Err(BackendError::Unsupported("exporting flash"))
+    fn export_flash(&self, path: &Path) -> Result<(), BackendError> {
+        self.machine
+            .nv_state()
+            .write_file(path)
+            .map_err(|e| BackendError::Io(e.to_string()))
     }
 
-    fn import_flash(&mut self, _path: &Path) -> Result<(), BackendError> {
-        Err(BackendError::Unsupported("importing flash"))
+    fn import_flash(&mut self, path: &Path) -> Result<(), BackendError> {
+        // `read_file` checks the header and the file size before it reads the body, so a
+        // file of the wrong size (however large) is refused unread.
+        let bad = |e: &dyn std::fmt::Display| BackendError::BadState(e.to_string());
+        let nv = NvState::read_file(path).map_err(|e| bad(&e))?;
+        self.rebuild(nv).map_err(|e| bad(&e))?;
+        // The unit now boots from the imported flash; the file at `nv_path` does not hold
+        // it yet, so the next `persist` writes it.
+        self.fresh = false;
+        self.on_disk = None;
+        Ok(())
     }
 }

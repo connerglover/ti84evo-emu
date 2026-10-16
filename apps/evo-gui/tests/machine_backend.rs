@@ -8,11 +8,13 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use evo_core::{Key, NvState};
+use evo_gui::backend::fake::FakeBackend;
 use evo_gui::backend::machine::{
     MachineBackend, OpenError, core_key, fnv1a64, inspect_bundle, rgb888_to_rgba,
 };
 use evo_gui::backend::{
-    AccessDir, BackendError, EmuBackend, Goal, RunStatus, WatchKinds, Watchpoint,
+    AccessDir, BackendError, EmuBackend, Goal, HwChange, KeyEvent, RunStatus, UartId, WatchKinds,
+    Watchpoint,
 };
 use evo_gui::keypad::KeyId;
 use evo_hw::dev::keypad::KEY_NAMES;
@@ -426,13 +428,6 @@ fn inspect_bundle_reads_metadata() {
     assert!(inspect_bundle(b"nope").is_err());
 }
 
-#[test]
-fn io_methods_are_unsupported_until_wired() {
-    let mut b = backend(&COUNTER);
-    assert!(matches!(b.export_ram(), Err(BackendError::Unsupported(_))));
-    assert!(b.take_key_events().is_empty());
-}
-
 // ---- Task W1: the debugger on the real machine ----
 
 /// The store program at 0x100B_0600: `movs r1,#0x41; movs r2,#0x30; lsls r2,r2,#24;
@@ -641,4 +636,264 @@ fn reset_keeps_watchpoints() {
     assert!(matches!(b.run_for(1000), RunStatus::Watchpoint { .. }));
     // The monitor range survived the reset too.
     assert_eq!(b.bus_records().len(), 1, "{:?}", b.bus_records());
+}
+
+// ---- Task W2: I/O, hardware, RAM and flash on the real machine ----
+
+#[test]
+fn key_events_have_machine_cycles() {
+    let mut b = backend(&COUNTER);
+    assert!(b.take_key_events().is_empty());
+    b.run_for(1000);
+    let down = b.cycles();
+    b.set_key(KeyId::Enter, true);
+    b.run_for(500);
+    let up = b.cycles();
+    assert!(up > down);
+    b.set_key(KeyId::Enter, false);
+    assert_eq!(
+        b.take_key_events(),
+        vec![
+            KeyEvent {
+                key: KeyId::Enter,
+                pressed: true,
+                cycle: down,
+            },
+            KeyEvent {
+                key: KeyId::Enter,
+                pressed: false,
+                cycle: up,
+            },
+        ]
+    );
+    assert!(b.take_key_events().is_empty(), "the events are drained");
+}
+
+/// The UART2 echo program at 0x100B_0600: `ldr r2,=0x4010_B000`; loop: `ldrb r1,[r2,#0x14]`
+/// (LSR); `lsls r1,r1,#31`; `beq` loop; `ldrb r1,[r2]` (RBR); `strb r1,[r2]` (THR); `b` loop.
+const UART2_ECHO: [u16; 10] = [
+    0x4A03, 0x7D11, 0x07C9, 0xD0FC, 0x7811, 0x7011, 0xE7F9, 0xBF00, 0xB000, 0x4010,
+];
+
+#[test]
+fn uart2_roundtrip_is_drained() {
+    let mut b = backend(&UART2_ECHO);
+    b.run_for(1000);
+    assert!(b.take_uart2().is_empty());
+    b.send_uart(UartId::Uart2, b"hi!");
+    b.run_for(2000);
+    assert_eq!(b.take_uart2(), b"hi!");
+    assert!(b.take_uart2().is_empty(), "the bytes are drained");
+    // UART2 is not the console: UART0 saw nothing, and bytes for UART0 do not reach UART2.
+    assert!(b.take_uart().is_empty());
+    b.send_uart(UartId::Uart0, b"x");
+    b.run_for(2000);
+    assert!(b.take_uart2().is_empty());
+    let uart0 = b
+        .peripherals()
+        .into_iter()
+        .find(|d| d.name == "uart0")
+        .unwrap();
+    let lsr = uart0.regs.iter().find(|r| r.name == "lsr").unwrap();
+    assert_eq!(lsr.value & 1, 1, "UART0 holds the byte: {lsr:?}");
+}
+
+fn gpio_data_in(b: &MachineBackend) -> u32 {
+    let gpio = b
+        .peripherals()
+        .into_iter()
+        .find(|d| d.name == "gpio")
+        .unwrap();
+    gpio.regs
+        .iter()
+        .find(|r| r.name == "data_in")
+        .unwrap()
+        .value
+}
+
+#[test]
+fn hardware_inputs_reach_gpio() {
+    // Reads the USB Type-C status halfword at 0x4010_C01C into r0, forever.
+    let mut b = backend(&keypad_reader(0xC01C));
+    let hw = b.hardware();
+    assert!(
+        hw.charger_line && hw.battery_ok && !hw.usb_attached,
+        "{hw:?}"
+    );
+    assert!(!hw.power_hold && !hw.deep_sleep, "{hw:?}");
+    assert_eq!(gpio_data_in(&b) >> 9 & 1, 1);
+    assert_eq!(gpio_data_in(&b) >> 11 & 1, 1);
+
+    b.set_hardware(HwChange::ChargerLine(false)).unwrap();
+    assert_eq!(gpio_data_in(&b) >> 9 & 1, 0);
+    assert!(!b.hardware().charger_line);
+    b.set_hardware(HwChange::BatteryOk(false)).unwrap();
+    assert_eq!(gpio_data_in(&b) >> 11 & 1, 0);
+    assert!(!b.hardware().battery_ok);
+
+    b.set_hardware(HwChange::UsbAttached(true)).unwrap();
+    assert!(b.hardware().usb_attached);
+    b.run_for(1000);
+    assert_eq!(b.cpu().core[0] >> 8 & 3, 1, "CC1 attached");
+
+    // The inputs are board conditions: a reset keeps them.
+    b.reset();
+    assert_eq!(gpio_data_in(&b) >> 9 & 1, 0);
+    assert_eq!(gpio_data_in(&b) >> 11 & 1, 0);
+    let hw = b.hardware();
+    assert!(
+        !hw.charger_line && !hw.battery_ok && hw.usb_attached,
+        "{hw:?}"
+    );
+    b.run_for(1000);
+    assert_eq!(b.cpu().core[0] >> 8 & 3, 1, "CC1 still attached");
+
+    b.set_hardware(HwChange::UsbAttached(false)).unwrap();
+    b.set_hardware(HwChange::ChargerLine(true)).unwrap();
+    b.run_for(1000);
+    assert_eq!(b.cpu().core[0] >> 8 & 3, 0);
+    assert_eq!(gpio_data_in(&b) >> 9 & 1, 1);
+}
+
+#[test]
+fn rtc_set_reads_back() {
+    let mut b = backend(&COUNTER);
+    let t = 12 * 3600 + 34 * 60 + 56;
+    b.set_hardware(HwChange::RtcSeconds(t)).unwrap();
+    assert_eq!(b.hardware().rtc_seconds, t);
+    b.set_hardware(HwChange::RtcSeconds(86_399)).unwrap();
+    assert_eq!(b.hardware().rtc_seconds, 86_399);
+    assert!(matches!(
+        b.set_hardware(HwChange::RtcSeconds(86_400)),
+        Err(BackendError::Invalid(_))
+    ));
+    assert_eq!(
+        b.hardware().rtc_seconds,
+        86_399,
+        "a refused time changes nothing"
+    );
+}
+
+#[test]
+fn ram_image_roundtrip_and_rejects_garbage() {
+    let mut b = backend(&COUNTER);
+    b.poke(0x3000_0010, &[1, 2, 3]).unwrap();
+    b.poke(0x2017_FFFF, &[0x77]).unwrap();
+    let image = b.export_ram().unwrap();
+    assert!(image.starts_with(b"EVORAM"));
+    b.poke(0x3000_0010, &[9, 9, 9]).unwrap();
+    b.poke(0x2017_FFFF, &[0]).unwrap();
+    b.import_ram(&image).unwrap();
+    assert_eq!(b.peek(0x3000_0010, 3), vec![Some(1), Some(2), Some(3)]);
+    assert_eq!(b.peek(0x2017_FFFF, 1), vec![Some(0x77)]);
+
+    b.poke(0x3000_0010, &[4, 5, 6]).unwrap();
+    let before = b.peek(0x3000_0000, 32);
+    let longer = [image.as_slice(), &[0]].concat();
+    for bad in [&b"xx"[..], &image[..100], &longer, b""] {
+        assert!(
+            matches!(b.import_ram(bad), Err(BackendError::BadState(_))),
+            "{} bytes",
+            bad.len()
+        );
+        assert_eq!(
+            b.peek(0x3000_0000, 32),
+            before,
+            "a refused image changes nothing"
+        );
+    }
+}
+
+#[test]
+fn flash_export_import_roundtrip() {
+    let dir = nv_dir();
+    let bundle = bundle_bytes(&COUNTER);
+    let mut b = MachineBackend::from_bytes(&bundle, "test.84b2".into(), &dir).unwrap();
+    assert!(b.needs_provision());
+    b.set_breakpoints(vec![0x100B_0700]);
+    let set = vec![write_watch(0x3000_0100, 4)];
+    b.set_watchpoints(set.clone()).unwrap();
+    b.poke(0x0009_0000, &[0xA5]).unwrap();
+    b.run_for(1000);
+    let slot = b.save_state().unwrap();
+    let a = dir.join("a.evoflash");
+    b.export_flash(&a).unwrap();
+
+    b.poke(0x0009_0000, &[0x5A]).unwrap();
+    b.import_flash(&a).unwrap();
+    assert!(!b.needs_provision());
+    assert_eq!(b.peek(0x0009_0000, 1), vec![Some(0xA5)]);
+    assert_eq!(b.breakpoints(), vec![0x100B_0700]);
+    assert_eq!(b.watchpoints(), set);
+
+    let second = dir.join("b.evoflash");
+    b.export_flash(&second).unwrap();
+    assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&second).unwrap());
+
+    // The flash is the same, so the slot saved before the import still loads.
+    b.load_state(&slot).unwrap();
+    assert_eq!(b.peek(0x0009_0000, 1), vec![Some(0xA5)]);
+
+    // The imported flash is not on disk yet: the next persist writes it.
+    let path = nv_path_for(&dir, &bundle);
+    assert!(!path.exists());
+    b.persist().unwrap();
+    assert_eq!(NvState::read_file(&path).unwrap().flash()[0x9_0000], 0xA5);
+}
+
+#[test]
+fn import_flash_rejects_garbage_unchanged() {
+    let dir = nv_dir();
+    let bundle = bundle_bytes(&COUNTER);
+    let mut b = MachineBackend::from_bytes(&bundle, "test.84b2".into(), &dir).unwrap();
+    let good = dir.join("good.evoflash");
+    b.export_flash(&good).unwrap();
+    let bytes = std::fs::read(&good).unwrap();
+    let garbage = dir.join("garbage.evoflash");
+    std::fs::write(&garbage, [0x5A; 100]).unwrap();
+    let truncated = dir.join("truncated.evoflash");
+    std::fs::write(&truncated, &bytes[..bytes.len() - 1]).unwrap();
+    let longer = dir.join("longer.evoflash");
+    std::fs::write(&longer, [bytes.as_slice(), &[0]].concat()).unwrap();
+    let sub = dir.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let missing = dir.join("missing.evoflash");
+
+    b.poke(0x0009_0000, &[0x11]).unwrap();
+    b.run_for(1000);
+    let (cycles, cpu) = (b.cycles(), b.cpu());
+    for bad in [&garbage, &truncated, &longer, &sub, &missing] {
+        assert!(
+            matches!(b.import_flash(bad), Err(BackendError::BadState(_))),
+            "{}",
+            bad.display()
+        );
+        assert_eq!(
+            b.peek(0x0009_0000, 1),
+            vec![Some(0x11)],
+            "{}",
+            bad.display()
+        );
+        assert_eq!(b.cycles(), cycles);
+        assert_eq!(b.cpu(), cpu);
+        assert!(b.needs_provision());
+    }
+    // Exporting into a directory that does not exist is an I/O error.
+    assert!(matches!(
+        b.export_flash(&dir.join("no/such/dir/x.evoflash")),
+        Err(BackendError::Io(_))
+    ));
+}
+
+#[test]
+fn load_state_from_other_backend_is_refused_unchanged() {
+    let mut b = backend(&COUNTER);
+    b.poke(0x3000_0000, &[1, 2, 3, 4]).unwrap();
+    b.run_for(1000);
+    let (cycles, cpu, ram) = (b.cycles(), b.cpu(), b.peek(0x3000_0000, 16));
+    let other = FakeBackend::new().save_state().unwrap();
+    assert!(b.load_state(&other).is_err());
+    assert_eq!(b.cycles(), cycles);
+    assert_eq!(b.cpu(), cpu);
+    assert_eq!(b.peek(0x3000_0000, 16), ram);
 }
