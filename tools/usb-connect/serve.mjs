@@ -10,7 +10,8 @@ const { values } = parseArgs({ options: {
   library: { type: 'string' },
 } });
 if (!values.cli || !values.bundle) throw new Error('--cli and --bundle are required');
-const bridge = startBridge(values.cli, values.bundle, { flashFile: values.flash, provision: values.provision });
+const port = Number(values.port);
+if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('--port must be an integer from 0 to 65535');
 const assets = new Map(await Promise.all(['index.html', 'client.mjs', 'usb-host.mjs', 'client-environment.mjs'].map(async name =>
   ['/' + name, await readFile(new URL(name, import.meta.url))])));
 // Fetch into memory at launch or use the user's local copy. Never vendor TI code.
@@ -26,6 +27,8 @@ for (const name of ['ticonnect.min.js', 'ticonnect.js', 'ticonnect.worker.js']) 
   }
   assets.set('/library/' + name, source);
 }
+// Resolve every startup dependency before booting or provisioning a writable guest.
+const bridge = startBridge(values.cli, values.bundle, { flashFile: values.flash, provision: values.provision });
 let origin;
 const server = createServer(async (req, res) => {
   try {
@@ -52,17 +55,28 @@ const server = createServer(async (req, res) => {
     } else res.writeHead(404).end();
   } catch (error) { res.writeHead(500).end(error.message); }
 });
-server.listen(Number(values.port), '127.0.0.1', () => {
-  origin = `http://127.0.0.1:${server.address().port}`;
-  console.log(`Open ${origin} in your browser. Ctrl-C saves flash and stops.`);
-});
 let closing = false;
-process.on('SIGINT', async () => {
+async function shutdown(error) {
   if (closing) return;
   closing = true;
+  if (error) { console.error(error.message); process.exitCode = 1; }
   server.close();
   try { await bridge.close(); }
   catch (error) { console.error(error.message); process.exitCode = 1; }
   finally { server.closeAllConnections(); }
+}
+process.on('SIGINT', () => { void shutdown(); });
+server.on('error', error => { void shutdown(error); });
+// Spawn failures emit 'error' then 'close', but never 'exit'. Observe 'close' to
+// avoid leaving a listening web server alive after a missing/failed CLI.
+bridge.child.on('close', (code, signal) => {
+  server.close(); server.closeAllConnections();
+  if (!closing && code !== 0) {
+    console.error(`USB bridge stopped (${signal || code})`);
+    process.exitCode = 1;
+  }
 });
-bridge.child.on('exit', () => { server.close(); server.closeAllConnections(); });
+server.listen(port, '127.0.0.1', () => {
+  origin = `http://127.0.0.1:${server.address().port}`;
+  console.log(`Open ${origin} in your browser. Ctrl-C saves flash and stops.`);
+});
