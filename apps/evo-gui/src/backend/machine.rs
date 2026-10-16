@@ -4,20 +4,26 @@
 //! `armv8m`); `tests/boundary.rs` enforces that. Besides Plan 1's `Machine` API (`run`,
 //! `step`, `breakpoints`, `bus.peek`, `bus.log`, `cpu.regs`, `sched.now`) it uses Plan 2's
 //! host API: `screen`, the backlight `Pwm`, `set_key`, `take_uart_tx`, `save_state` /
-//! `load_state`, and the flash file (`from_bundle_nv`, `nv_state`, `NvState`).
+//! `load_state`, and the flash file (`from_bundle_nv`, `nv_state`, `NvState`). Plan 4's
+//! debugger API: watchpoints, goals (`arm_*`, `disarm`), `write_reg`, `peripherals`, and the
+//! bus monitor and `poke` on `bus`.
 
 use std::path::{Path, PathBuf};
 
 use armv8m::decode::is_32bit;
 use armv8m::{Sec, decode16, decode32, disasm};
-use evo_core::AccessDir as CoreDir;
-use evo_core::{Key, Machine, NvError, NvState, StopReason, UartPort};
+use evo_core::machine::{FLASH_NS, FLASH_S, FLASH_SIZE, SRAM_NS, SRAM_S, SRAM_SIZE};
+use evo_core::{AccessDir as CoreDir, BusRecord as CoreRecord};
+use evo_core::{
+    Key, Machine, NvError, NvState, StopReason, UartPort, WatchKinds as CoreKinds, WatchRange,
+};
 use evo_hw::dev::lcdc::Pwm;
 use evo_image::{Bundle, ImageError, Layout};
 
 use crate::backend::{
     AccessDir, BackendError, BusRecord, CpuView, DeviceView, DisasmLine, EmuBackend, Frame, Goal,
-    HardwareView, HwChange, KeyEvent, MemRegion, RunStatus, UartId, UnmappedRow, Watchpoint,
+    HardwareView, HwChange, KeyEvent, MemRegion, RegRow, RunStatus, UartId, UnmappedRow,
+    WatchKinds, Watchpoint,
 };
 use crate::keypad::KeyId;
 
@@ -101,6 +107,8 @@ pub struct MachineBackend {
     on_disk: Option<[u8; 32]>,
     /// The last LCD image, converted for the GUI.
     frame: Frame,
+    /// The bus-monitor range as last set (the core has no getter), so `reset` can keep it.
+    monitor: Option<(u32, u32)>,
 }
 
 impl MachineBackend {
@@ -152,6 +160,7 @@ impl MachineBackend {
                 height: 0,
                 rgba: Vec::new(),
             },
+            monitor: None,
         })
     }
 
@@ -179,6 +188,14 @@ impl MachineBackend {
     }
 }
 
+fn access_dir(dir: CoreDir) -> AccessDir {
+    match dir {
+        CoreDir::Read => AccessDir::Read,
+        CoreDir::Write => AccessDir::Write,
+        CoreDir::Exec => AccessDir::Exec,
+    }
+}
+
 fn run_status(stop: StopReason) -> RunStatus {
     match stop {
         StopReason::CycleLimit | StopReason::Halted | StopReason::Stepped => RunStatus::Running,
@@ -193,16 +210,59 @@ fn run_status(stop: StopReason) -> RunStatus {
             pc,
         } => RunStatus::Watchpoint {
             addr,
-            dir: match dir {
-                CoreDir::Read => AccessDir::Read,
-                CoreDir::Write => AccessDir::Write,
-                CoreDir::Exec => AccessDir::Exec,
-            },
+            dir: access_dir(dir),
             value,
             pc,
         },
         StopReason::Goal { pc } => RunStatus::Goal { pc },
     }
+}
+
+fn watch_range(w: Watchpoint) -> WatchRange {
+    WatchRange {
+        start: w.start,
+        len: w.len,
+        kinds: CoreKinds {
+            read: w.kinds.read,
+            write: w.kinds.write,
+            exec: w.kinds.exec,
+        },
+    }
+}
+
+fn watchpoint(r: WatchRange) -> Watchpoint {
+    Watchpoint {
+        start: r.start,
+        len: r.len,
+        kinds: WatchKinds {
+            read: r.kinds.read,
+            write: r.kinds.write,
+            exec: r.kinds.exec,
+        },
+    }
+}
+
+fn bus_record(r: CoreRecord) -> BusRecord {
+    BusRecord {
+        addr: r.addr,
+        width: r.width,
+        dir: access_dir(r.dir),
+        value: r.value,
+        pc: r.pc,
+        cycle: r.cycle,
+    }
+}
+
+/// The core's name for [`EmuBackend::set_core_reg`] index `i` (`None` past xPSR).
+fn core_reg_name(i: usize) -> Option<String> {
+    Some(match i {
+        0..=12 => format!("r{i}"),
+        13 => "sp".into(),
+        14 => "lr".into(),
+        15 => "pc".into(),
+        16 => "xpsr".into(),
+        _ => return None,
+    })
 }
 
 impl EmuBackend for MachineBackend {
@@ -266,7 +326,13 @@ impl EmuBackend for MachineBackend {
         let nv = Some(self.machine.nv_state());
         match Machine::from_bundle_nv(&self.bundle, &Layout::EVO_7_1, nv) {
             Ok(mut m) => {
+                // Debugger settings carry over; the goal (never set on `m`) is dropped.
                 m.breakpoints = std::mem::take(&mut self.machine.breakpoints);
+                if let Err(e) = m.set_watchpoints(self.machine.watchpoints()) {
+                    // They were validated when set, so this does not happen.
+                    log::error!("reset dropped the watchpoints: {e}");
+                }
+                m.bus.set_bus_monitor(self.monitor);
                 self.machine = m;
             }
             // The same bundle booted once already, so this does not happen.
@@ -302,10 +368,22 @@ impl EmuBackend for MachineBackend {
     }
 
     fn provision(&mut self) -> Result<(), BackendError> {
-        // `evo_core::provision` uses breakpoints of its own and clears them.
+        // `evo_core::provision` uses breakpoints of its own and clears them, and fails on any
+        // other stop: the debugger's breakpoints, watchpoints, bus monitor and goal are put
+        // aside while it runs (the goal is dropped, as by `reset`).
         let breakpoints = std::mem::take(&mut self.machine.breakpoints);
+        let watchpoints = self.machine.watchpoints();
+        self.machine.disarm();
+        let cleared = self.machine.set_watchpoints(Vec::new());
+        debug_assert!(cleared.is_ok(), "an empty set is valid");
+        self.machine.bus.set_bus_monitor(None);
         let result = evo_core::provision(&mut self.machine);
         self.machine.breakpoints = breakpoints;
+        if let Err(e) = self.machine.set_watchpoints(watchpoints) {
+            // They were validated when set, so this does not happen.
+            log::error!("provisioning dropped the watchpoints: {e}");
+        }
+        self.machine.bus.set_bus_monitor(self.monitor);
         match result {
             Ok(report) => {
                 log::info!("provisioned: {report:?}");
@@ -399,54 +477,131 @@ impl EmuBackend for MachineBackend {
         }
     }
 
-    // Not wired to the core yet (Plan 4, Lane W): each returns `Unsupported`, an empty
-    // value, or does nothing.
-
-    fn poke(&mut self, _addr: u32, _bytes: &[u8]) -> Result<(), BackendError> {
-        Err(BackendError::Unsupported("writing memory"))
+    fn poke(&mut self, addr: u32, bytes: &[u8]) -> Result<(), BackendError> {
+        // Every byte is checked before any is written, so a refused write changes nothing.
+        let at = |i: usize| u32::try_from(i).ok().and_then(|i| addr.checked_add(i));
+        for i in 0..bytes.len() {
+            match at(i) {
+                Some(a) if self.machine.bus.peek(a, 1).is_some() => {}
+                // Past 0xffffffff: the first address that does not exist wraps to 0.
+                bad => return Err(BackendError::Unwritable(bad.unwrap_or(0))),
+            }
+        }
+        for (i, &b) in bytes.iter().enumerate() {
+            let a = at(i).unwrap_or_else(|| unreachable!("checked above"));
+            if !self.machine.bus.poke(a, 1, u32::from(b)) {
+                // `peek` succeeded on this byte just now, so this does not happen.
+                return Err(BackendError::Unwritable(a));
+            }
+        }
+        Ok(())
     }
 
     fn memory_regions(&self) -> Vec<MemRegion> {
-        Vec::new()
+        [
+            ("Flash (NS)", FLASH_NS, FLASH_SIZE),
+            ("Flash (S)", FLASH_S, FLASH_SIZE),
+            ("SRAM (NS)", SRAM_NS, SRAM_SIZE),
+            ("SRAM (S)", SRAM_S, SRAM_SIZE),
+        ]
+        .into_iter()
+        .map(|(name, start, len)| MemRegion {
+            name: name.into(),
+            start,
+            len,
+        })
+        .collect()
     }
 
-    fn set_core_reg(&mut self, _index: usize, _value: u32) -> Result<(), BackendError> {
-        Err(BackendError::Unsupported("writing registers"))
+    fn set_core_reg(&mut self, index: usize, value: u32) -> Result<(), BackendError> {
+        let name =
+            core_reg_name(index).ok_or_else(|| BackendError::BadRegister(index.to_string()))?;
+        self.set_banked_reg(&name, value)
     }
 
-    fn set_banked_reg(&mut self, _name: &str, _value: u32) -> Result<(), BackendError> {
-        Err(BackendError::Unsupported("writing registers"))
+    fn set_banked_reg(&mut self, name: &str, value: u32) -> Result<(), BackendError> {
+        self.machine
+            .write_reg(name, value)
+            .map_err(|_| BackendError::BadRegister(name.to_owned()))
     }
 
     fn set_breakpoints(&mut self, addrs: Vec<u32>) {
         self.machine.breakpoints = addrs.into_iter().collect();
     }
 
-    fn begin_goal(&mut self, _goal: Goal) -> Result<bool, BackendError> {
-        Err(BackendError::Unsupported("step over, step out and run to"))
+    fn begin_goal(&mut self, goal: Goal) -> Result<bool, BackendError> {
+        Ok(match goal {
+            Goal::StepOver => self.machine.arm_step_over(),
+            Goal::StepOut => {
+                self.machine.arm_step_out();
+                true
+            }
+            Goal::RunTo(addr) => {
+                self.machine.arm_run_to(addr);
+                true
+            }
+        })
     }
 
-    fn cancel_goal(&mut self) {}
+    fn cancel_goal(&mut self) {
+        self.machine.disarm();
+    }
 
     fn watchpoints(&self) -> Vec<Watchpoint> {
-        Vec::new()
+        self.machine
+            .watchpoints()
+            .into_iter()
+            .map(watchpoint)
+            .collect()
     }
 
-    fn set_watchpoints(&mut self, _w: Vec<Watchpoint>) -> Result<(), BackendError> {
-        Err(BackendError::Unsupported("watchpoints"))
+    fn set_watchpoints(&mut self, w: Vec<Watchpoint>) -> Result<(), BackendError> {
+        self.machine
+            .set_watchpoints(w.into_iter().map(watch_range).collect())
+            .map_err(|e| BackendError::Invalid(e.to_string()))
     }
 
-    fn set_bus_monitor(&mut self, _range: Option<(u32, u32)>) {}
+    fn set_bus_monitor(&mut self, range: Option<(u32, u32)>) {
+        self.monitor = range;
+        self.machine.bus.set_bus_monitor(range);
+    }
 
     fn bus_records(&self) -> Vec<BusRecord> {
-        Vec::new()
+        self.machine
+            .bus
+            .bus_records()
+            .into_iter()
+            .map(bus_record)
+            .collect()
     }
 
-    fn clear_bus_records(&mut self) {}
+    fn clear_bus_records(&mut self) {
+        self.machine.bus.clear_bus_records();
+    }
 
     fn peripherals(&self) -> Vec<DeviceView> {
-        Vec::new()
+        self.machine
+            .peripherals()
+            .into_iter()
+            .map(|d| DeviceView {
+                name: d.name.to_owned(),
+                base: d.base,
+                regs: d
+                    .regs
+                    .into_iter()
+                    .map(|r| RegRow {
+                        name: r.name,
+                        offset: r.offset,
+                        value: r.value,
+                        note: r.note,
+                    })
+                    .collect(),
+            })
+            .collect()
     }
+
+    // Not wired to the core yet (Plan 4, Task W2): each returns `Unsupported`, an empty
+    // value, or does nothing.
 
     fn take_uart2(&mut self) -> Vec<u8> {
         Vec::new()

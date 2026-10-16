@@ -11,7 +11,9 @@ use evo_core::{Key, NvState};
 use evo_gui::backend::machine::{
     MachineBackend, OpenError, core_key, fnv1a64, inspect_bundle, rgb888_to_rgba,
 };
-use evo_gui::backend::{BackendError, EmuBackend, RunStatus};
+use evo_gui::backend::{
+    AccessDir, BackendError, EmuBackend, Goal, RunStatus, WatchKinds, Watchpoint,
+};
 use evo_gui::keypad::KeyId;
 use evo_hw::dev::keypad::KEY_NAMES;
 
@@ -425,18 +427,218 @@ fn inspect_bundle_reads_metadata() {
 }
 
 #[test]
-fn new_methods_are_unsupported_until_wired() {
+fn io_methods_are_unsupported_until_wired() {
     let mut b = backend(&COUNTER);
-    assert!(matches!(
-        b.poke(0x3000_0000, &[1]),
-        Err(BackendError::Unsupported(_))
-    ));
     assert!(matches!(b.export_ram(), Err(BackendError::Unsupported(_))));
-    assert!(matches!(
-        b.set_watchpoints(vec![]),
-        Err(BackendError::Unsupported(_))
-    ));
-    assert!(b.memory_regions().is_empty());
-    assert!(b.peripherals().is_empty());
     assert!(b.take_key_events().is_empty());
+}
+
+// ---- Task W1: the debugger on the real machine ----
+
+/// The store program at 0x100B_0600: `movs r1,#0x41; movs r2,#0x30; lsls r2,r2,#24;
+/// str r1,[r2]` (at 0x100B_0606, to 0x3000_0000), then `b.` forever.
+const STORE: [u16; 5] = [0x2141, 0x2230, 0x0612, 0x6011, 0xE7FE];
+const STORE_PC: u32 = 0x100B_0606;
+const STORE_ADDR: u32 = 0x3000_0000;
+
+/// The call program at 0x100B_0600: `bl 0x100B_0610`; `movs r0,#7` (0x0604); `b.` (0x0606);
+/// four `nop`s; at 0x0610 `adds r1,#1; bx lr`.
+const CALL: [u16; 10] = [
+    0xF000, 0xF806, 0x2007, 0xE7FE, 0xBF00, 0xBF00, 0xBF00, 0xBF00, 0x3101, 0x4770,
+];
+
+fn write_watch(start: u32, len: u32) -> Watchpoint {
+    Watchpoint {
+        start,
+        len,
+        kinds: WatchKinds {
+            read: false,
+            write: true,
+            exec: false,
+        },
+    }
+}
+
+#[test]
+fn poke_writes_sram_and_refuses_devices() {
+    let mut b = backend(&COUNTER);
+    b.poke(0x3000_0010, &[1, 2, 3]).unwrap();
+    assert_eq!(b.peek(0x3000_0010, 3), vec![Some(1), Some(2), Some(3)]);
+    // The debugger may patch flash.
+    b.poke(0x0009_0000, &[0xA5]).unwrap();
+    assert_eq!(b.peek(0x0009_0000, 1), vec![Some(0xA5)]);
+    assert!(matches!(
+        b.poke(0x4010_6000, &[1]),
+        Err(BackendError::Unwritable(0x4010_6000))
+    ));
+    // All or nothing: the byte in SRAM is not written when the next one is past its end.
+    let before = b.peek(0x3017_FFFF, 1);
+    assert!(matches!(
+        b.poke(0x3017_FFFF, &[9, 9]),
+        Err(BackendError::Unwritable(0x3018_0000))
+    ));
+    assert_eq!(b.peek(0x3017_FFFF, 1), before);
+    // A write past 0xffffffff is refused at the first address that does not exist.
+    assert!(matches!(
+        b.poke(0xFFFF_FFFF, &[1, 2]),
+        Err(BackendError::Unwritable(_))
+    ));
+    b.poke(0x3000_0000, &[]).unwrap();
+}
+
+#[test]
+fn regions_cover_flash_and_sram() {
+    let b = backend(&COUNTER);
+    let regions: Vec<(String, u32, u32)> = b
+        .memory_regions()
+        .into_iter()
+        .map(|r| (r.name, r.start, r.len))
+        .collect();
+    assert_eq!(
+        regions,
+        vec![
+            ("Flash (NS)".into(), 0x0000_0000, 16 << 20),
+            ("Flash (S)".into(), 0x1000_0000, 16 << 20),
+            ("SRAM (NS)".into(), 0x2000_0000, 0x18_0000),
+            ("SRAM (S)".into(), 0x3000_0000, 0x18_0000),
+        ]
+    );
+    for (_, start, len) in regions {
+        assert!(b.peek(start, 1)[0].is_some(), "{start:#x}");
+        assert!(b.peek(start + len - 1, 1)[0].is_some(), "{start:#x}");
+    }
+}
+
+#[test]
+fn register_writes_reach_the_cpu() {
+    let mut b = backend(&COUNTER);
+    b.set_core_reg(0, 0x1234).unwrap();
+    b.set_core_reg(12, 0xC0DE).unwrap();
+    b.set_core_reg(13, 0x3000_0700).unwrap();
+    b.set_core_reg(14, 0x100B_0601).unwrap();
+    b.set_core_reg(15, 0x100B_0605).unwrap();
+    b.set_core_reg(16, 0x6100_0000).unwrap();
+    b.set_banked_reg("msp_ns", 0x2000_0400).unwrap();
+    let cpu = b.cpu();
+    assert_eq!(cpu.core[0], 0x1234);
+    assert_eq!(cpu.core[12], 0xC0DE);
+    assert_eq!(cpu.core[13], 0x3000_0700);
+    assert_eq!(cpu.core[14], 0x100B_0601);
+    assert_eq!(cpu.core[15], 0x100B_0604, "pc drops the Thumb bit");
+    assert_eq!(cpu.xpsr, 0x6100_0000);
+    assert!(cpu.banked.contains(&("msp_ns", 0x2000_0400)));
+    assert!(matches!(
+        b.set_banked_reg("nope", 1),
+        Err(BackendError::BadRegister(_))
+    ));
+    assert!(matches!(
+        b.set_core_reg(17, 1),
+        Err(BackendError::BadRegister(_))
+    ));
+    assert_eq!(b.cpu(), cpu, "a refused write changes nothing");
+}
+
+#[test]
+fn watchpoint_stops_run_for() {
+    let mut b = backend(&STORE);
+    let set = vec![write_watch(STORE_ADDR, 4)];
+    b.set_watchpoints(set.clone()).unwrap();
+    assert_eq!(b.watchpoints(), set);
+    assert_eq!(
+        b.run_for(1000),
+        RunStatus::Watchpoint {
+            addr: STORE_ADDR,
+            dir: AccessDir::Write,
+            value: 0x41,
+            pc: STORE_PC,
+        }
+    );
+    // An invalid set is refused and changes nothing.
+    assert!(matches!(
+        b.set_watchpoints(vec![write_watch(0x3000_0100, 4), write_watch(0, 0)]),
+        Err(BackendError::Invalid(_))
+    ));
+    assert_eq!(b.watchpoints(), set);
+    // Continue moves on: the store does not run again.
+    assert_eq!(b.run_for(1000), RunStatus::Running);
+    b.set_watchpoints(vec![]).unwrap();
+    assert!(b.watchpoints().is_empty());
+}
+
+#[test]
+fn bus_monitor_records_the_store() {
+    let mut b = backend(&STORE);
+    b.set_bus_monitor(Some((STORE_ADDR, 4)));
+    b.run_for(1000);
+    let recs = b.bus_records();
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    let r = recs[0];
+    assert_eq!(
+        (r.addr, r.width, r.dir, r.value, r.pc),
+        (STORE_ADDR, 4, AccessDir::Write, 0x41, STORE_PC)
+    );
+    assert!(r.cycle > 0 && r.cycle <= b.cycles());
+    // Off keeps the records; clear drops them.
+    b.set_bus_monitor(None);
+    assert_eq!(b.bus_records().len(), 1);
+    b.clear_bus_records();
+    assert!(b.bus_records().is_empty());
+}
+
+#[test]
+fn step_over_and_run_to_goals() {
+    let mut b = backend(&CALL);
+    // Over the call: it runs, and the run stops after it.
+    assert!(b.begin_goal(Goal::StepOver).unwrap());
+    assert_eq!(b.run_for(1000), RunStatus::Goal { pc: 0x100B_0604 });
+    assert_eq!(b.cpu().core[1], 1);
+    // Over a plain instruction: done at once.
+    assert!(!b.begin_goal(Goal::StepOver).unwrap());
+    assert_eq!(b.cpu().core[15], 0x100B_0606);
+    assert_eq!(b.cpu().core[0], 7);
+    // Run to an address the program never reaches: armed until cancelled.
+    assert!(b.begin_goal(Goal::RunTo(0x100B_0608)).unwrap());
+    assert_eq!(b.run_for(1000), RunStatus::Running);
+    b.cancel_goal();
+    assert_eq!(b.run_for(1000), RunStatus::Running);
+
+    let mut b = backend(&CALL);
+    assert!(b.begin_goal(Goal::RunTo(0x100B_0611)).unwrap());
+    assert_eq!(b.run_for(1000), RunStatus::Goal { pc: 0x100B_0610 });
+    // Step out of the function returns to the instruction after the call.
+    assert!(b.begin_goal(Goal::StepOut).unwrap());
+    assert_eq!(b.run_for(1000), RunStatus::Goal { pc: 0x100B_0604 });
+}
+
+#[test]
+fn peripherals_include_uart0_and_nvic() {
+    let b = backend(&COUNTER);
+    let devs = b.peripherals();
+    let names: Vec<&str> = devs.iter().map(|d| d.name.as_str()).collect();
+    assert!(names.contains(&"uart0"), "{names:?}");
+    assert!(names.contains(&"nvic"), "{names:?}");
+    let uart0 = devs.iter().find(|d| d.name == "uart0").unwrap();
+    assert_eq!(uart0.base, 0x4010_6000);
+    assert!(!uart0.regs.is_empty());
+    let nvic = devs.iter().find(|d| d.name == "nvic").unwrap();
+    assert_eq!(nvic.base, 0xE000_E100);
+}
+
+#[test]
+fn reset_keeps_watchpoints() {
+    let mut b = backend(&STORE);
+    let set = vec![write_watch(STORE_ADDR, 4)];
+    b.set_watchpoints(set.clone()).unwrap();
+    b.set_breakpoints(vec![0x100B_0700]);
+    b.set_bus_monitor(Some((STORE_ADDR, 4)));
+    b.run_for(1000);
+    b.clear_bus_records();
+    // A goal armed before the reset is dropped.
+    assert!(b.begin_goal(Goal::RunTo(0x100B_0602)).unwrap());
+    b.reset();
+    assert_eq!(b.watchpoints(), set);
+    assert_eq!(b.breakpoints(), vec![0x100B_0700]);
+    assert!(matches!(b.run_for(1000), RunStatus::Watchpoint { .. }));
+    // The monitor range survived the reset too.
+    assert_eq!(b.bus_records().len(), 1, "{:?}", b.bus_records());
 }
