@@ -11,16 +11,24 @@
 
 mod common;
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use common::{TempDir, test_options};
+use common::{TempDir, open_action, test_options};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use evo_gui::app::EvoApp;
+use evo_gui::app::{AppOptions, EvoApp};
 use evo_gui::backend::machine::MachineBackend;
-use evo_gui::backend::{CLOCK_HZ, EmuBackend};
+use evo_gui::backend::placeholder::Placeholder;
+use evo_gui::backend::{AccessDir, CLOCK_HZ, EmuBackend, RunStatus, WatchKinds, Watchpoint};
 use evo_gui::platform::FakePlatform;
+use evo_gui::toolbar::Action;
+use evo_gui::tools::macros::{MACROS_TITLE, MacroResult, screen_sha256};
+use evo_gui::wizard::Page;
+use evo_gui::wizard::validate::SUPPORTED_OS;
+
+/// The OS's LCD framebuffer (LCDUPBASE, `docs/hardware/lcdc.md`): 320×240 RGB565.
+const FRAMEBUFFER: u32 = 0x2004_8000;
 
 /// The selected tile's colour on the OS 7.1.0.4421 app launcher (RGB565 0x035E,
 /// `docs/hardware/lcdc.md` "Colour order"); with red and blue swapped it would be orange.
@@ -99,6 +107,27 @@ fn run_guest(h: &mut Harness<'static, EvoApp>, cycles: u64) {
     }
 }
 
+/// Runs the app until the OS app launcher shows its blue selection, then lets it settle.
+fn boot_to_launcher(h: &mut Harness<'static, EvoApp>) {
+    let mut blue = 0;
+    while blue < 1000 {
+        assert!(
+            h.state().backend().cycles() < 5_000_000_000,
+            "no launcher: {blue} blue pixels at cycle {}",
+            h.state().backend().cycles()
+        );
+        run_guest(h, guest_ms(100));
+        blue = blue_pixels(h).unwrap_or(0);
+    }
+    run_guest(h, guest_ms(500));
+    let blue = blue_pixels(h).unwrap_or(0);
+    println!(
+        "launcher at cycle {}: {blue} selection-blue pixels",
+        h.state().backend().cycles()
+    );
+    assert!(blue >= 1000, "{blue}");
+}
+
 fn guest_ms(ms: u64) -> u64 {
     CLOCK_HZ / 1000 * ms
 }
@@ -158,23 +187,7 @@ fn real_os_home_screen_and_keypad() {
     assert!(!h.state().backend().needs_provision());
 
     // The OS boots to the app launcher: the selected tile is blue.
-    let mut blue = 0;
-    while blue < 1000 {
-        assert!(
-            h.state().backend().cycles() < 5_000_000_000,
-            "no launcher: {blue} blue pixels at cycle {}",
-            h.state().backend().cycles()
-        );
-        run_guest(&mut h, guest_ms(100));
-        blue = blue_pixels(&mut h).unwrap_or(0);
-    }
-    run_guest(&mut h, guest_ms(500));
-    let blue = blue_pixels(&mut h).unwrap_or(0);
-    println!(
-        "launcher at cycle {}: {blue} selection-blue pixels",
-        h.state().backend().cycles()
-    );
-    assert!(blue >= 1000, "{blue}");
+    boot_to_launcher(&mut h);
     save_png(&mut h, "home");
     let home = lcd_rgba(&mut h);
 
@@ -197,4 +210,215 @@ fn real_os_home_screen_and_keypad() {
     let result = lcd_rgba(&mut h);
     assert_ne!(result, typed, "ENTER changed nothing");
     save_png(&mut h, "result");
+}
+
+/// A real-OS backend in `dir`, provisioned (as the app's first run does on its worker).
+fn provisioned(path: &Path, dir: &Path) -> MachineBackend {
+    let mut b = MachineBackend::open(path, dir).unwrap();
+    b.provision().expect("provisioning succeeds");
+    b
+}
+
+/// The app on `backend` with `opts`: 520×960, 1 pixel per point, 60 frames per second.
+fn app(backend: Box<dyn EmuBackend>, opts: AppOptions) -> Harness<'static, EvoApp> {
+    Harness::builder()
+        .with_size([520.0, 960.0])
+        .with_theme(egui::Theme::Light)
+        .with_pixels_per_point(1.0)
+        .with_step_dt(1.0 / 60.0)
+        .build_eframe(|cc| EvoApp::new(&cc.egui_ctx, backend, opts))
+}
+
+fn click(h: &mut Harness<'static, EvoApp>, label: &str) {
+    h.get_by_label(label).click();
+    h.run_steps(2);
+}
+
+/// First launch without a ROM: the ROM Setup Wizard takes the bundle through Browse, opens
+/// it with the instance's flash dir, provisions it on Prepare and ends on Done; after Finish
+/// the OS boots to its launcher.
+#[test]
+fn real_os_wizard_provisions_to_home_screen() {
+    let Some(path) = bundle() else {
+        return;
+    };
+    let data = TempDir::new("evo-gui-tests-real-os-wizard", true);
+    let platform = FakePlatform::shared();
+    platform.set_backend_factory(Box::new(|bundle: &Path, nv_dir: &Path| {
+        MachineBackend::open(bundle, nv_dir)
+            .map(|b| Box::new(b) as Box<dyn EmuBackend>)
+            .map_err(|e| e.to_string())
+    }));
+    let opts = AppOptions {
+        open_wizard: true,
+        ..test_options(&data, platform.clone())
+    };
+    let mut h = app(Box::new(Placeholder::no_rom()), opts);
+    h.run_steps(2);
+    assert_eq!(h.state().features().rom.page(), Some(Page::Welcome));
+    click(&mut h, "Next");
+    assert_eq!(h.state().features().rom.page(), Some(Page::Choose));
+    platform.queue_open(Some(path.clone()));
+    click(&mut h, "Browse\u{2026}");
+    // The bundle passed the check: its version line is shown and no warning or error.
+    h.get_by_label(&format!("OS {SUPPORTED_OS} \u{b7} 84US"));
+    click(&mut h, "Next");
+    assert_eq!(platform.opened(), std::slice::from_ref(&path));
+    assert_eq!(h.state().rom(), Some(path.as_path()));
+
+    let start = Instant::now();
+    while h.state().features().rom.page() != Some(Page::Done) {
+        assert_eq!(
+            h.state().features().rom.page(),
+            Some(Page::Prepare),
+            "the wizard left Prepare"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "provisioning did not finish in 120 s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        h.run_steps(1);
+    }
+    println!("provisioned in {:.1} s", start.elapsed().as_secs_f32());
+    h.run_steps(2);
+    h.get_by_label("The calculator is ready.");
+    click(&mut h, "Finish");
+    assert_eq!(h.state().features().rom.page(), None);
+    assert!(!h.state().backend().needs_provision());
+    boot_to_launcher(&mut h);
+}
+
+/// The OS draws into the LCD framebuffer, so a write watchpoint over it stops the run with
+/// the written address inside the range.
+#[test]
+fn real_os_framebuffer_watchpoint_stops() {
+    let Some(path) = bundle() else {
+        return;
+    };
+    let dir = TempDir::new("evo-gui-tests-real-os", true);
+    let mut b = provisioned(&path, &dir);
+    let w = Watchpoint {
+        start: FRAMEBUFFER,
+        len: 320 * 240 * 2,
+        kinds: WatchKinds {
+            read: false,
+            write: true,
+            exec: false,
+        },
+    };
+    b.set_watchpoints(vec![w]).unwrap();
+    let start = b.cycles();
+    loop {
+        assert!(
+            b.cycles() - start < 3_000_000_000,
+            "no framebuffer write in 3 G cycles"
+        );
+        match b.run_for(10_000_000) {
+            RunStatus::Watchpoint { addr, dir, pc, .. } => {
+                println!(
+                    "framebuffer write at {addr:#010x} by pc {pc:#010x}, cycle {}",
+                    b.cycles()
+                );
+                assert_eq!(dir, AccessDir::Write);
+                assert!(
+                    (w.start..w.start + w.len).contains(&addr),
+                    "{addr:#010x} is outside the framebuffer"
+                );
+                break;
+            }
+            RunStatus::Running | RunStatus::Idle => {}
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+}
+
+/// Plays the Macros window's script from the paused machine and waits for its result.
+fn play_macro(h: &mut Harness<'static, EvoApp>) -> MacroResult {
+    assert!(h.state().paused());
+    click(h, "Play");
+    let start = Instant::now();
+    while h.state().features().tools.macros().is_playing() {
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "the macro did not finish"
+        );
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+    let result = h
+        .state()
+        .features()
+        .tools
+        .macros()
+        .result()
+        .cloned()
+        .expect("a result");
+    h.get_by_label(&result.label());
+    result
+}
+
+/// AutoTester on the real OS: "2 add 3 enter" in the calculator, played from a saved state,
+/// yields a screen hash; played again from the same state with that hash expected, it passes
+/// (playback lands its keys at the same cycles, so the screen is the same).
+#[test]
+fn real_os_macro_screen_check_passes() {
+    let Some(path) = bundle() else {
+        return;
+    };
+    let nv = TempDir::new("evo-gui-tests-real-os", true);
+    let data = TempDir::new("evo-gui-tests-real-os-data", true);
+    let backend = provisioned(&path, &nv);
+    let mut h = app(
+        Box::new(backend),
+        test_options(&data, FakePlatform::shared()),
+    );
+    h.run_steps(1);
+    boot_to_launcher(&mut h);
+    // ENTER opens the first app, the calculator, where the macro types.
+    tap(&mut h, "enter");
+    run_guest(&mut h, guest_ms(700));
+
+    h.state_mut().set_paused(true);
+    h.run_steps(1);
+    let state = h.state().backend().save_state().unwrap();
+    let saved_at = h.state().backend().cycles();
+    let before = screen_sha256(
+        h.state_mut()
+            .backend_mut()
+            .framebuffer()
+            .expect("the LCD is on"),
+    );
+    open_action(&mut h, Action::Macros);
+    h.get_by_label(MACROS_TITLE);
+    h.state_mut()
+        .features_mut()
+        .tools
+        .macros_mut()
+        .set_script("2 add 3 enter");
+    // "Check screen at end" with no hash yet: the FAIL result shows the screen's hash.
+    h.state_mut()
+        .features_mut()
+        .tools
+        .macros_mut()
+        .set_check(true, "");
+    h.run_steps(1);
+    let MacroResult::Fail { got } = play_macro(&mut h) else {
+        panic!("an empty expected hash matches no screen");
+    };
+    println!("screen sha256 after the macro: {got}");
+    assert_ne!(got, before, "the macro's keys changed nothing on screen");
+
+    h.state_mut().set_paused(true);
+    h.run_steps(1);
+    h.state_mut().backend_mut().load_state(&state).unwrap();
+    assert_eq!(h.state().backend().cycles(), saved_at);
+    h.state_mut()
+        .features_mut()
+        .tools
+        .macros_mut()
+        .set_check(true, &got);
+    h.run_steps(1);
+    assert_eq!(play_macro(&mut h), MacroResult::Pass);
+    h.get_by_label("Result: PASS");
 }

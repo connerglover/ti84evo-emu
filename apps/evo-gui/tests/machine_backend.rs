@@ -954,3 +954,17 @@ fn load_state_from_other_backend_is_refused_unchanged() {
     assert_eq!(b.cpu(), cpu);
     assert_eq!(b.peek(0x3000_0000, 16), ram);
 }
+
+/// The GUI's key scripts copy the core's tap timing (`tools/script.rs` cannot name the core):
+/// a script must mean the same in the CLI and the GUI.
+#[test]
+fn gui_and_core_tap_constants_agree() {
+    assert_eq!(
+        evo_gui::tools::script::TAP_HOLD_MS,
+        evo_core::keys::TAP_HOLD_MS
+    );
+    assert_eq!(
+        evo_gui::tools::script::TAP_GAP_MS,
+        evo_core::keys::TAP_GAP_MS
+    );
+}
