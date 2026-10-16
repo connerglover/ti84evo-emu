@@ -1,9 +1,6 @@
-# ti84evo-emu
+# TI-84 Evo Emulator
 
-A low-level emulator for the TI-84 Evo graphing calculator, written in Rust. It emulates the
-calculator's Cortex-M33 (with TrustZone) and its peripherals closely enough to boot TI's own,
-unmodified OS — the secure firmware, the board-support layer and the calculator OS — to the
-home screen.
+A low-level emulator for the TI-84 Evo graphing calculator, written in Rust.
 
 This repository contains no TI code, OS images or artwork. **You must supply your own OS
 bundle** (`.84b2`) to run anything beyond the unit tests.
@@ -34,9 +31,6 @@ cargo run --release -p evo-cli -- run <bundle.84b2> --flash-file calc.flash \
 cargo run --release -p evo-cli -- run <bundle.84b2> --gdb 3333   # attach arm-none-eabi-gdb
 ```
 
-`provision` uses the calculator's own engineering menu to switch a fresh unit from its
-factory self-test to the calculator OS, as a new unit leaves the factory.
-
 ## Testing
 
 ```sh
@@ -49,8 +43,7 @@ unset.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The bundled DejaVu fonts (`apps/evo-gui/assets`) keep their own
-license. TI-84 Evo is a trademark of Texas Instruments; this project is not affiliated with or
+MIT — see [LICENSE](LICENSE). TI-84 Evo is a trademark of Texas Instruments; this project is not affiliated with or
 endorsed by Texas Instruments.
 
 MP4 recording uses OpenH264 compiled from source; Cisco's patent licence for OpenH264 applies
