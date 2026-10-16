@@ -18,7 +18,9 @@ use evo_core::{AccessDir as CoreDir, BusRecord as CoreRecord};
 use evo_core::{
     Key, Machine, NvError, NvState, StopReason, UartPort, WatchKinds as CoreKinds, WatchRange,
 };
+use evo_hw::dev::gpio::Gpio;
 use evo_hw::dev::lcdc::Pwm;
+use evo_hw::dev::usb::UsbTypeC;
 use evo_image::{Bundle, ImageError, Layout};
 
 use crate::backend::{
@@ -129,8 +131,9 @@ const PIN_BATTERY: u8 = 11;
 const DAY_SECONDS: u32 = 86_400;
 
 /// The board conditions the host sets: they belong to the board, not the guest, so the
-/// backend keeps them and drives them again into every new machine (reset, flash import) and
-/// after a state load.
+/// backend keeps them and drives them again into every new machine (reset, flash import). A
+/// state load does not drive them: it restores the state exactly, and the backend reads the
+/// levels back from it ([`Board::read`]).
 #[derive(Clone, Copy, Debug)]
 struct Board {
     /// GPIO 9 level.
@@ -158,6 +161,18 @@ impl Board {
             m.set_usb_cc(1, 0);
         } else {
             m.set_usb_cc(0, 0);
+        }
+    }
+
+    /// The conditions `m` has now: the levels of pins 9 and 11, and whether CC1 is attached.
+    /// A device that `m` does not have keeps the value in `self`.
+    fn read(self, m: &Machine) -> Self {
+        let gpio = m.bus.device::<Gpio>("gpio");
+        let usb = m.bus.device::<UsbTypeC>("usbtc");
+        Self {
+            charger_line: gpio.map_or(self.charger_line, |g| g.pin_level(PIN_CHARGER)),
+            battery_ok: gpio.map_or(self.battery_ok, |g| g.pin_level(PIN_BATTERY)),
+            usb_attached: usb.map_or(self.usb_attached, |u| u.cc().0 != 0),
         }
     }
 }
@@ -396,8 +411,9 @@ impl EmuBackend for MachineBackend {
         self.machine
             .load_state(bytes)
             .map_err(|e| BackendError::BadState(e.to_string()))?;
-        // The state holds the input levels of its own time; the board's are the panel's.
-        self.board.apply(&mut self.machine);
+        // A pure restore. Driving the panel's levels in would latch level-type GPIO status
+        // that the guest had cleared; the panel follows the loaded state's levels instead.
+        self.board = self.board.read(&self.machine);
         Ok(())
     }
 

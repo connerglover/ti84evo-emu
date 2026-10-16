@@ -755,6 +755,63 @@ fn hardware_inputs_reach_gpio() {
     assert_eq!(gpio_data_in(&b) >> 9 & 1, 1);
 }
 
+fn gpio_reg(b: &MachineBackend, name: &str) -> u32 {
+    let gpio = b
+        .peripherals()
+        .into_iter()
+        .find(|d| d.name == "gpio")
+        .unwrap();
+    gpio.regs.iter().find(|r| r.name == name).unwrap().value
+}
+
+/// Arms a level-type, active-high interrupt on GPIO 9 and enables it, then spins:
+/// `ldr r2,=0x4010_5000; movs r1,#1; lsls r1,r1,#9; str r1,[r2,#0x3C]` (INT_POL first, so
+/// low pin 9 never matches) `; str r1,[r2,#0x34]` (INT_TYPE) `; str r1,[r2,#0x30]` (INT_CLR:
+/// drops the edge latched when the host pulled pin 9 low) `; str r1,[r2,#0x20]` (INT_EN)
+/// `; b .; literal`.
+const ARM_PIN9_LEVEL_IRQ: [u16; 10] = [
+    0x4A03, 0x2101, 0x0249, 0x63D1, 0x6351, 0x6311, 0x6211, 0xE7FE, 0x5000, 0x4010,
+];
+
+#[test]
+fn load_state_is_a_pure_restore_and_the_panel_follows_it() {
+    let mut b = backend(&ARM_PIN9_LEVEL_IRQ);
+    b.set_hardware(HwChange::ChargerLine(false)).unwrap();
+    b.set_hardware(HwChange::UsbAttached(true)).unwrap();
+    b.run_for(100);
+    assert_eq!(
+        gpio_reg(&b, "int_en") >> 9 & 1,
+        1,
+        "the program armed pin 9"
+    );
+    assert_eq!(gpio_reg(&b, "int_status") >> 9 & 1, 0, "pin 9 is low");
+    let saved = b.save_state().unwrap();
+    let cpu = b.cpu();
+    let cycles = b.cycles();
+
+    // The panel moves on: pin 9 goes high and latches the armed interrupt; the cable goes.
+    b.set_hardware(HwChange::ChargerLine(true)).unwrap();
+    b.set_hardware(HwChange::UsbAttached(false)).unwrap();
+    assert_eq!(gpio_reg(&b, "int_status") >> 9 & 1, 1);
+
+    b.load_state(&saved).unwrap();
+    // Nothing the state did not hold: no latched status, the same CPU.
+    assert_eq!(gpio_reg(&b, "int_status"), 0);
+    assert_eq!(gpio_reg(&b, "data_in") >> 9 & 1, 0);
+    assert_eq!(b.cpu(), cpu);
+    assert_eq!(b.cycles(), cycles);
+    // The Hardware panel shows the loaded state's levels.
+    let hw = b.hardware();
+    assert!(
+        !hw.charger_line && hw.battery_ok && hw.usb_attached,
+        "{hw:?}"
+    );
+    // A reset drives the panel's (now the state's) levels into the new machine.
+    b.reset();
+    assert_eq!(gpio_reg(&b, "data_in") >> 9 & 1, 0);
+    assert!(b.hardware().usb_attached);
+}
+
 #[test]
 fn rtc_set_reads_back() {
     let mut b = backend(&COUNTER);
