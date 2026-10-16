@@ -3,6 +3,7 @@
 mod inspect;
 mod run;
 mod score;
+mod usb_bridge;
 
 use std::io::{self, BufWriter, Write};
 use std::ops::Range;
@@ -24,6 +25,17 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
+    /// Serve USB bus tokens over newline-delimited JSON on stdin/stdout.
+    /// Used by the TI Connect serial adapter; no network port is opened.
+    UsbBridge {
+        bundle: PathBuf,
+        /// Persist calculator storage, including variables received over USB.
+        #[arg(long)]
+        flash_file: Option<PathBuf>,
+        /// Perform first-use provisioning before accepting requests.
+        #[arg(long)]
+        provision: bool,
+    },
     /// Show a .84b2 bundle's metadata, images, and the vector tables and
     /// reset handlers of images 0 and 1 placed per Layout::EVO_7_1.
     Inspect {
@@ -164,6 +176,11 @@ fn main() -> ExitCode {
         }
     };
     match cli.command {
+        Command::UsbBridge {
+            bundle,
+            flash_file,
+            provision,
+        } => usb_bridge::main(&bundle, flash_file.as_deref(), provision),
         Command::Run {
             bundle,
             max_cycles,

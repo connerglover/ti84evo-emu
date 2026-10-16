@@ -1488,6 +1488,8 @@ dependencies = [
  "evo-core",
  "evo-image",
  "png 0.17.16",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

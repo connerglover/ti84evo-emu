@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>TI-84 Evo USB connection</title>
+<style>
+body{font:16px system-ui;max-width:900px;margin:40px auto;padding:0 20px;background:#f6f7f9;color:#162137}
+button,input{font:inherit;padding:8px;margin:4px}button{cursor:pointer}button:disabled{cursor:wait}
+canvas{width:640px;max-width:100%;image-rendering:pixelated;background:white;border:1px solid #b5bdc9}
+section{margin:24px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere}li{margin:6px 0}
+</style>
+<h1>TI-84 Evo USB connection</h1>
+<p>This local adapter runs the official TI Connect communications library against your emulated calculator.</p>
+<button id="connect">Connect calculator</button><button id="disconnect" disabled>Disconnect</button>
+<p id="status" role="status">Ready to connect. Internet access loads the TI library.</p>
+<fieldset id="actions" disabled><legend>Calculator</legend>
+<section><button id="capture">Capture screen</button><label><input type="checkbox" id="refresh">Auto-refresh</label><br>
+<canvas id="screen" width="320" height="240"></canvas></section>
+<section><button id="directory">Refresh files</button><ul id="files"></ul>
+<label>Send calculator variable <input type="file" id="upload"></label></section>
+<section><button id="exit-ptt">Exit exam mode</button>
+<label>Install OS bundle <input type="file" accept=".84b2" id="os"></label></section>
+</fieldset>
+<pre id="attributes"></pre>
+<script type="module" src="/client.mjs"></script></html>

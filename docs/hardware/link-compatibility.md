@@ -1,9 +1,9 @@
 # USB/link compatibility and TI-Planet evidence
 
-Status: 2026-10-15. This checklist separates a modeled device mechanism from a
-verified TI Connect Evo operation. Controller development does **not** by itself
-establish browser compatibility. End-to-end rows remain pending until exercised
-through the actual guest firmware and host protocol.
+Status: 2026-10-16. This checklist separates a modeled device mechanism from a
+verified TI Connect Evo operation. End-to-end checks use the unchanged official
+communications library, the local [USB adapter](../../tools/usb-connect/README.md),
+and actual OS 7.1.0.4421 guest firmware.
 
 ## Acceptance matrix
 
@@ -11,9 +11,9 @@ through the actual guest firmware and host protocol.
 |---|---|---|
 | Read either USB-C orientation | Self-tests [episode 5](https://tiplanet.org/forum/viewtopic.php?f=41&t=27368), PDF p5 shows CC pairs (3,0), (0,2), (0,0) | Supported: core exposes both fields; GUI attachment recognizes either field after state load. Regression test covers both orientations, detach, guest readback and reset attachment. Full electrical meaning of each code remains unverified. |
 | Retain cable presence across system reset | Core host/device contract in [usb.md](usb.md) | Supported by model tests; not a claim about every Type-C role transition. |
-| Connect TI Connect Evo to the emulator | [Episode 10](https://tiplanet.org/forum/viewtopic.php?f=41&t=27399), PDF pp1-2 | Pending: host-visible CDC/serial integration, enumeration and guest exchange. The app uses an Evo-specific protocol; CE link packets and UART2 traffic are not substitutes. |
-| List, send and retrieve variables | Episode 10, PDF p2 | Pending end-to-end directory/read/write, completion, rejection, cancellation and reconnect checks. |
-| Capture screenshots repeatedly | Episode 10, PDF pp2-4; [official TI page](https://education.ti.com/en/products/calculators/graphing-calculators/ti-84-evo/ti-connect-evo) advertises auto-refresh | Pending over USB. Existing direct framebuffer screenshots verify display output, not the transfer command. |
+| Connect TI Connect Evo to the emulator | [Episode 10](https://tiplanet.org/forum/viewtopic.php?f=41&t=27399), PDF pp1-2 | Verified enumeration, CDC activation and attributes through the official library in Node and stock Chromium. Local WebSerial adapter required; not an OS-level virtual USB device. Real-firmware regression also covers detach/reconnect and renewed CDC handshake. |
+| List, send and retrieve variables | Episode 10, PDF p2 | Verified directory and L1 read/write/read with identical 67-byte contents through the official library. Rejection and mid-transfer cancellation remain pending. |
+| Capture screenshots repeatedly | Episode 10, PDF pp2-4; [official TI page](https://education.ti.com/en/products/calculators/graphing-calculators/ti-84-evo/ti-connect-evo) advertises auto-refresh | Verified two successive 320x240 RGBA captures through the official USB protocol, plus browser display. |
 | Send Python and images | Episode 10, PDF pp5-6 | Pending. TI Connect converts `.py` and ordinary images on the host before transfer. |
 | Update OS and Apps | Episode 10, PDF p2; [episode 3](https://tiplanet.org/forum/viewtopic.php?f=41&t=27363), PDF p7 | Pending package transfer, verification, interrupted-transfer handling and reboot. Flash-file import is not evidence of USB update compatibility. |
 | Exit exam mode explicitly | [Episode 9](https://tiplanet.org/forum/viewtopic.php?f=41&t=27383), PDF p9 | Pending guest state transition through host command. |
@@ -30,15 +30,16 @@ presence in a menu is weaker evidence than successful execution.
 
 The current official client research identifies WebSerial / CDC with TI vendor
 `0x0451`, product `0xE018`, opened at 115200 baud, 8 data bits, no parity and one
-stop bit. This is static client evidence, not a successful connection to the
-emulator. The application is served from
+stop bit. These settings and actual device activation are verified by the local
+adapter. The application is served from
 [TI Connect Evo](https://connectevo.ti.com/ticevo/en/); its connectivity library is
 `assets/library/ticonnect.min.js`. Protocol and controller evidence belongs in
 [usb.md](usb.md) as it is established.
 
-A complete acceptance run needs a host-facing serial bridge or USB device
-presentation as well as the emulated controller. Neither setting CC fields nor
-exposing endpoint test APIs alone makes the emulator selectable in the browser.
+The local host page supplies a WebSerial-compatible port backed by raw USB bus
+tokens sent to `evo-cli usb-bridge`. Descriptors and calculator responses come
+from guest firmware through controller DMA/FIFOs/interrupts. No calculator
+protocol response is synthesized by the adapter.
 The PDFs supply no descriptor bytes, endpoint numbers, packet layouts or register
 maps. Derive those from client code, firmware and observed exchanges.
 
