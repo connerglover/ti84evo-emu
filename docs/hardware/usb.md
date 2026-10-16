@@ -74,8 +74,9 @@ pending transfers; new SETUP aborts old control data and clears control stall.
 boots and provisions the guest, attaches through Type-C, resets the bus, reads
 device/configuration descriptors, sets address/configuration, programs CDC
 line coding (115200 8N1), asserts DTR/RTS and exchanges the TI Connect Evo Kermit
-send-init and its guest-generated acknowledgment. It does not force guest memory,
-NVIC or USB-control-register state.
+send-init and its guest-generated acknowledgment. It repeats enumeration and
+the serial handshake after detach, reattach and bus reset. It does not force
+guest memory, NVIC or USB-control-register state.
 
 The guest advertises VID:PID **0451:E018** and four interfaces:
 
@@ -84,10 +85,25 @@ The guest advertises VID:PID **0451:E018** and four interfaces:
 - Interface 2: vendor interface, bulk OUT endpoint 5 and IN endpoint 6.
 - Interface 3: HID keyboard, interrupt IN endpoint 4.
 
-The vendor interface echoed a small test payload; this alone does not establish
-its complete protocol. HID reports, calculator-as-host, isochronous traffic,
-high-speed negotiation and electrical timing are not established by the CDC
-test. See the [link acceptance matrix](link-compatibility.md) for broader coverage.
+The main OS supplies the 63-byte HID keyboard report descriptor. In the tested
+7.1 firmware, `GET_REPORT` and `SET_IDLE` return a guest-generated STALL; the next
+SETUP recovers EP0 normally. Ordinary calculator operation does not turn every
+key press into a computer keyboard report.
+
+A second real-firmware test enters **Engineering > Tests > Link Test > Computer
+Tests > Keyboard Simulator** using the actual boot combo and keypad. It verifies
+an eight-byte Enter press report (HID usage `0x28`) and an all-zero release report
+on endpoint 4. The BSP vendor interface also echoes 285 bytes, covering all byte
+values, full 64-byte packets and a final short packet, through OUT5/IN6. These
+are guest code paths through the same DMA/FIFO model, not host response stubs.
+The keyboard simulator agrees with the observed physical behavior in
+[TI-Planet episode 6](https://tiplanet.org/forum/viewtopic.php?f=41&t=27370).
+
+The vendor echo was verified in the engineering BSP, not as a general-purpose
+service in the main OS. Its complete protocol, calculator-as-host, accessory
+input, peer-calculator transfers, isochronous traffic, high-speed negotiation
+and electrical timing remain unverified. See the
+[link acceptance matrix](link-compatibility.md) for broader coverage.
 
 Save-state format **3** records USB cable, queued packets and DMA registers.
 Versions 1 and 2 are rejected explicitly. Existing `.evoflash` files remain

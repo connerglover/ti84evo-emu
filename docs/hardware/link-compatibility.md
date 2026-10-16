@@ -20,7 +20,7 @@ through the actual guest firmware and host protocol.
 | Exit exam mode by receiving a variable | Episode 9, PDF p9 | Pending separate scenario; article describes this behavior generally, so verify against the loaded firmware. |
 | Recovery reception with 2nd+Del at startup | [Episode 1](https://tiplanet.org/forum/viewtopic.php?f=41&t=27360), PDF p6 | Pending; booting installed OS images directly does not emulate the original BL1/BL2 recovery path. |
 | Peer calculator transfer / exam exit | Episode 9, PDF p9 | Pending host-role and peer integration; peer uses 2nd Link -> Test Mode -> Exit. |
-| USB keyboard, accessory and loopback diagnostics | [Episode 6](https://tiplanet.org/forum/viewtopic.php?f=41&t=27370), PDF pp5-6 | Pending separate USB host/HID behaviors; not prerequisites for the browser's CDC transport. |
+| USB keyboard, accessory and loopback diagnostics | [Episode 6](https://tiplanet.org/forum/viewtopic.php?f=41&t=27370), PDF pp5-6 | Verified device-side engineering Keyboard Simulator: actual Enter press/release reports on HID IN4. BSP vendor OUT5/IN6 echoes all byte values across full and short packets. Main OS HID descriptor and class-request STALL recovery tested. Calculator-as-host, external keyboards/accessories and peer loopback remain pending; these are separate from CDC transport. |
 
 Page numbers refer to the supplied PDF's physical pages, not the printed phpBB
 page count. These articles describe early physical Evo/Evo-T units; feature
