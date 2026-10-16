@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::storage::Storage;
-use crate::{DevCtx, Device, ResetKind, StateError, save_serde};
+use crate::{DevCtx, Device, RegView, ResetKind, StateError, save_serde};
 
 /// Size of each block's register window.
 const WINDOW: u32 = 0x1000;
@@ -22,6 +22,21 @@ const WINDOW: u32 = 0x1000;
 /// `true` for an aligned 32-bit access inside the window.
 fn word_access(off: u32, width: u8) -> bool {
     width == 4 && off.is_multiple_of(4) && off < WINDOW
+}
+
+/// Inspection rows for a word-storage block: every `named` register, plus every other word
+/// that holds a non-zero value (named `w` and its offset in hex, e.g. `w014`), in offset
+/// order. `reg` is the value a guest read of an offset returns.
+fn storage_rows(named: &[(&str, u32)], regs: &Storage, reg: impl Fn(u32) -> u32) -> Vec<RegView> {
+    (0..WINDOW)
+        .step_by(4)
+        .filter_map(|off| match named.iter().find(|&&(_, o)| o == off) {
+            Some(&(name, _)) => Some(RegView::new(name, off, reg(off))),
+            None => {
+                (regs.word(off) != 0).then(|| RegView::new(format!("w{off:03x}"), off, reg(off)))
+            }
+        })
+        .collect()
 }
 
 // --- SPCTRL ---------------------------------------------------------------------------------
@@ -114,6 +129,22 @@ impl Device for Spctrl {
 
     fn load(&mut self, state: &[u8]) -> Result<(), StateError> {
         self.regs.load_checked(state)
+    }
+
+    fn inspect(&self, _now: u64) -> Vec<RegView> {
+        let named = [
+            ("intstat", SPCTRL_INTSTAT),
+            ("intclr", SPCTRL_INTCLR),
+            ("lcs", SPCTRL_LCS),
+            ("deep_sleep", SPCTRL_DEEP_SLEEP),
+        ];
+        let mut rows = storage_rows(&named, &self.regs, |off| self.reg(off));
+        if self.deep_sleep_armed()
+            && let Some(row) = rows.iter_mut().find(|r| r.offset == SPCTRL_DEEP_SLEEP)
+        {
+            row.note = Some("armed".to_owned());
+        }
+        rows
     }
 }
 
@@ -232,5 +263,17 @@ impl Device for Cru {
 
     fn load(&mut self, state: &[u8]) -> Result<(), StateError> {
         self.regs.load_checked(state)
+    }
+
+    fn inspect(&self, _now: u64) -> Vec<RegView> {
+        let named = [
+            ("clksel", CRU_CLKSEL),
+            ("wake_status", CRU_WAKE_STATUS),
+            ("uid", CRU_UID),
+            ("info", CRU_INFO),
+            ("pllctrl", CRU_PLLCTRL),
+            ("idreg", CRU_IDREG),
+        ];
+        storage_rows(&named, &self.regs, |off| self.reg(off))
     }
 }

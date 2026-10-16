@@ -509,6 +509,8 @@ fn summary(
         StopReason::Breakpoint(pc) => ("breakpoint", pc),
         StopReason::Lockup { pc } => ("lockup", pc),
         StopReason::Bkpt { pc, .. } => ("bkpt", pc),
+        StopReason::Watchpoint { pc, .. } => ("watchpoint", pc),
+        StopReason::Goal { pc } => ("goal", pc),
     };
     write!(out, "stop: {reason} pc=0x{pc:08x} cycles={}", m.sched.now)?;
     if let StopReason::Bkpt { imm, .. } = stop {
@@ -552,7 +554,9 @@ fn exit_code(stop: StopReason) -> ExitCode {
         | StopReason::Stepped
         | StopReason::Halted
         | StopReason::Breakpoint(_)
-        | StopReason::Bkpt { .. } => ExitCode::SUCCESS,
+        | StopReason::Bkpt { .. }
+        | StopReason::Watchpoint { .. }
+        | StopReason::Goal { .. } => ExitCode::SUCCESS,
     }
 }
 

@@ -10,12 +10,13 @@ use std::path::{Path, PathBuf};
 
 use armv8m::decode::is_32bit;
 use armv8m::{Sec, decode16, decode32, disasm};
+use evo_core::AccessDir as CoreDir;
 use evo_core::{Key, Machine, NvError, NvState, StopReason, UartPort};
 use evo_hw::dev::lcdc::Pwm;
 use evo_image::{Bundle, ImageError, Layout};
 
 use crate::backend::{
-    BackendError, BusRecord, CpuView, DeviceView, DisasmLine, EmuBackend, Frame, Goal,
+    AccessDir, BackendError, BusRecord, CpuView, DeviceView, DisasmLine, EmuBackend, Frame, Goal,
     HardwareView, HwChange, KeyEvent, MemRegion, RunStatus, UartId, UnmappedRow, Watchpoint,
 };
 use crate::keypad::KeyId;
@@ -185,6 +186,22 @@ fn run_status(stop: StopReason) -> RunStatus {
         StopReason::Breakpoint(a) => RunStatus::Breakpoint(a),
         StopReason::Lockup { pc } => RunStatus::Lockup { pc },
         StopReason::Bkpt { pc, imm } => RunStatus::Bkpt { pc, imm },
+        StopReason::Watchpoint {
+            addr,
+            dir,
+            value,
+            pc,
+        } => RunStatus::Watchpoint {
+            addr,
+            dir: match dir {
+                CoreDir::Read => AccessDir::Read,
+                CoreDir::Write => AccessDir::Write,
+                CoreDir::Exec => AccessDir::Exec,
+            },
+            value,
+            pc,
+        },
+        StopReason::Goal { pc } => RunStatus::Goal { pc },
     }
 }
 

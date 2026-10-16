@@ -208,3 +208,22 @@ fn soc_attaches_rtc() {
     evo_hw::soc::attach(&mut map);
     assert!(map.device::<Rtc>("rtc").is_some());
 }
+
+#[test]
+fn set_seconds_of_day_restarts_count() {
+    let mut h = DevHarness::new();
+    let mut r = Rtc::new();
+    h.now = 10 * CPU_HZ + 7;
+    r.set_seconds_of_day(100, h.now);
+    assert_eq!(r.seconds_of_day(h.now), 100);
+    assert_eq!(h.read(&mut r, TIME, 4), hms(0, 1, 40));
+    // The count restarts from the set time: a partial second since then does not count.
+    assert_eq!(r.seconds_of_day(h.now + CPU_HZ - 1), 100);
+    assert_eq!(r.seconds_of_day(h.now + 5 * CPU_HZ), 105);
+    // Wrapped into one day.
+    r.set_seconds_of_day(86_400 + 5, h.now);
+    assert_eq!(r.seconds_of_day(h.now), 5);
+    r.set_seconds_of_day(u32::MAX, h.now);
+    assert_eq!(r.seconds_of_day(h.now), u32::MAX % 86_400);
+    assert!(h.log.is_empty());
+}

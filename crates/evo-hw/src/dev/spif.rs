@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::nor::{DataPhase, NorFlash};
 use crate::soc::FLASH_BUFFER;
-use crate::{DevCtx, Device, ResetKind, StateError, load_serde, save_serde};
+use crate::{DevCtx, Device, RegView, ResetKind, StateError, load_serde, save_serde};
 
 /// The largest FIFO_LEVEL (+0x54 `[15:8]`) the controller reports, in bytes.
 pub const SPIF_FIFO: u32 = 64;
@@ -205,22 +205,11 @@ impl Spif {
     fn fifo_level(&self) -> u32 {
         self.nor.remaining().min(SPIF_FIFO) << 8
     }
-}
 
-fn reg_access(off: u32, width: u8) -> bool {
-    width == 4 && off.is_multiple_of(4) && off < FIFO
-}
-
-impl Device for Spif {
-    fn read(&mut self, off: u32, width: u8, ctx: &mut DevCtx<'_>) -> u32 {
-        if off == FIFO {
-            return self.pop(width, ctx);
-        }
-        if !reg_access(off, width) {
-            ctx.unhandled(off, width, None);
-            return 0;
-        }
-        match off {
+    /// The value a guest word read of register `off` returns (not the FIFO port), or `None`
+    /// if it is not a register. Reading a register has no side effects.
+    fn reg(&self, off: u32) -> Option<u32> {
+        Some(match off {
             ADDR => self.regs.addr,
             CFG => self.regs.cfg,
             LEN => self.regs.len,
@@ -232,7 +221,23 @@ impl Device for Spif {
             XIP_CFG => self.regs.xip_cfg,
             XIP_CTRL => self.regs.xip_ctrl,
             FIFO_LEVEL => self.fifo_level(),
-            _ => {
+            _ => return None,
+        })
+    }
+}
+
+fn reg_access(off: u32, width: u8) -> bool {
+    width == 4 && off.is_multiple_of(4) && off < FIFO
+}
+
+impl Device for Spif {
+    fn read(&mut self, off: u32, width: u8, ctx: &mut DevCtx<'_>) -> u32 {
+        if off == FIFO {
+            return self.pop(width, ctx);
+        }
+        match self.reg(off).filter(|_| reg_access(off, width)) {
+            Some(v) => v,
+            None => {
                 ctx.unhandled(off, width, None);
                 0
             }
@@ -302,5 +307,27 @@ impl Device for Spif {
         s.nor.set_secregs(self.nor.secregs());
         *self = s;
         Ok(())
+    }
+
+    /// The registers. The FIFO port (+0x100) is left out: its next bytes come from the flash
+    /// buffer, which the device does not hold.
+    fn inspect(&self, _now: u64) -> Vec<RegView> {
+        [
+            ("addr", ADDR),
+            ("cfg", CFG),
+            ("len", LEN),
+            ("op", OP),
+            ("cfg0", CFG0),
+            ("status", STATUS),
+            ("ctrl", CTRL),
+            ("int_status", INT_STATUS),
+            ("xip_cfg", XIP_CFG),
+            ("xip_ctrl", XIP_CTRL),
+            ("fifo_level", FIFO_LEVEL),
+        ]
+        .into_iter()
+        // Every offset listed is a register.
+        .map(|(name, off)| RegView::new(name, off, self.reg(off).unwrap_or(0)))
+        .collect()
     }
 }

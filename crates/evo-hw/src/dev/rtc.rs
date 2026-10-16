@@ -19,7 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CPU_HZ, DevCtx, Device, ResetKind, StateError, load_serde, save_serde};
+use crate::{CPU_HZ, DevCtx, Device, RegView, ResetKind, StateError, load_serde, save_serde};
 
 /// The RTC's IRQ line.
 pub const RTC_IRQ: u16 = 15;
@@ -64,6 +64,13 @@ impl Rtc {
         let elapsed = now.saturating_sub(self.set_at) / CPU_HZ;
         // `% DAY` first: `base + elapsed` cannot overflow and the result fits u32.
         ((u64::from(self.base) + elapsed % DAY) % DAY) as u32
+    }
+
+    /// Set the time (host/debugger): `s % 86_400` seconds of day at cycle `now`, counting on
+    /// from there, as a guest write of +0x44 does.
+    pub fn set_seconds_of_day(&mut self, s: u32, now: u64) {
+        self.base = (u64::from(s) % DAY) as u32;
+        self.set_at = now;
     }
 
     /// Set status bits (host/test): `status |= bits & 0x3F`, then drive IRQ 15.
@@ -155,5 +162,30 @@ impl Device for Rtc {
         s.base = (u64::from(s.base) % DAY) as u32;
         *self = s;
         Ok(())
+    }
+
+    fn inspect(&self, now: u64) -> Vec<RegView> {
+        let named = [
+            ("alarm0", ALARM0),
+            ("alarm1", ALARM1),
+            ("alarm2", ALARM2),
+            ("ctrl", CTRL),
+            ("status", STATUS),
+            ("busy", BUSY),
+            ("time", TIME),
+        ];
+        named
+            .into_iter()
+            .map(|(name, off)| {
+                // Every offset listed is a register.
+                let row = RegView::new(name, off, self.reg(off, now).unwrap_or(0));
+                if off == TIME {
+                    let s = self.seconds_of_day(now);
+                    row.with_note(format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60))
+                } else {
+                    row
+                }
+            })
+            .collect()
     }
 }

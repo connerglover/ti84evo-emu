@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CPU_HZ, DevCtx, Device, ResetKind, StateError, load_serde, save_serde};
+use crate::{CPU_HZ, DevCtx, Device, RegView, ResetKind, StateError, load_serde, save_serde};
 
 /// One key: a matrix position (`row`, `col` in `0..8`, register +0x10 + 2·row, bit `col`) or
 /// the ON key, which has its own IRQ line.
@@ -304,5 +304,33 @@ impl Device for Keypad {
         s.mask &= INT_BITS;
         *self = s;
         Ok(())
+    }
+
+    /// The four control words, then one halfword row per matrix row, noted with the names of
+    /// the keys held in it.
+    fn inspect(&self, _now: u64) -> Vec<RegView> {
+        let mut rows = vec![
+            RegView::new("mode", MODE, self.mode),
+            RegView::new("size", SIZE, self.size),
+            RegView::new("status", STATUS, self.status),
+            RegView::new("mask", MASK, self.mask),
+        ];
+        for (r, &bits) in self.rows.iter().enumerate() {
+            let row = RegView::new(format!("row{r}"), ROW0 + 2 * r as u32, u32::from(bits));
+            let held: Vec<String> = (0..8u8)
+                .filter(|c| bits & (1 << c) != 0)
+                .map(|col| {
+                    let key = Key::Matrix { row: r as u8, col };
+                    key.name()
+                        .map_or_else(|| format!("col{col}"), str::to_owned)
+                })
+                .collect();
+            rows.push(if held.is_empty() {
+                row
+            } else {
+                row.with_note(held.join(" "))
+            });
+        }
+        rows
     }
 }

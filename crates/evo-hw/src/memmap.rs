@@ -12,9 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use armv8m::{Access, AccessKind, Bus, BusError};
 use serde::{Deserialize, Serialize};
 
-use crate::device::{DevCtx, Device, ResetKind, StateError, Written, mask};
+use crate::device::{DevCtx, Device, DeviceInspect, ResetKind, StateError, Written, mask};
 use crate::region::{self, Buffer, Region, Target};
 use crate::unmapped::{UnmappedAccess, UnmappedKind, UnmappedLog};
+use crate::watch::{AccessDir, BusRecord, Watch, WatchError, WatchHit, WatchRange};
 
 /// One device in the map: the device, where it sits, and the IRQ lines it drives.
 struct Slot {
@@ -102,6 +103,9 @@ pub struct MemoryMap {
     /// The OR of every slot's `irq_out`, updated whenever one changes.
     #[serde(skip)]
     irq_lines: u64,
+    /// Data watchpoints and the bus monitor ([`crate::watch`]). Debugger state, not saved.
+    #[serde(skip)]
+    watch: Watch,
 }
 
 /// Source of [`MemoryMap::code_epoch`] values, unique within the process.
@@ -395,6 +399,22 @@ impl MemoryMap {
         })?
     }
 
+    /// Every device's registers at cycle `now` ([`Device::inspect`]), in add order; devices
+    /// with no rows are left out. Changes nothing (no device call, no log entry).
+    pub fn inspect_devices(&self, now: u64) -> Vec<DeviceInspect> {
+        self.slots
+            .iter()
+            .filter_map(|s| {
+                let regs = s.dev.inspect(now);
+                (!regs.is_empty()).then_some(DeviceInspect {
+                    name: s.name,
+                    base: s.base,
+                    regs,
+                })
+            })
+            .collect()
+    }
+
     /// Device `id`'s requested event is due: call its [`Device::event`] at `self.now`. An
     /// unknown id is logged and ignored.
     pub fn device_event(&mut self, id: u16) {
@@ -574,6 +594,68 @@ impl MemoryMap {
         }
     }
 
+    // ---- watchpoints and bus monitor ----
+
+    /// Replace the watchpoints. Every range is validated first; on `Err` nothing changes.
+    /// Read/write ranges are checked on every guest data access; exec ranges are only stored
+    /// (the `Machine` checks them before it steps).
+    pub fn set_watchpoints(&mut self, ranges: Vec<WatchRange>) -> Result<(), WatchError> {
+        self.watch.set_ranges(ranges)
+    }
+
+    /// The watchpoints as last set, exec ranges included.
+    pub fn watchpoints(&self) -> Vec<WatchRange> {
+        self.watch.ranges()
+    }
+
+    /// Record guest data accesses overlapping `(start, len)`; `None` or len 0 turns the monitor
+    /// off. The records are kept either way.
+    pub fn set_bus_monitor(&mut self, range: Option<(u32, u32)>) {
+        self.watch.set_monitor(range);
+    }
+
+    /// The bus monitor's records, oldest first (at most [`crate::BUS_RING_CAP`]).
+    pub fn bus_records(&self) -> Vec<BusRecord> {
+        self.watch.records()
+    }
+
+    pub fn clear_bus_records(&mut self) {
+        self.watch.clear_records();
+    }
+
+    /// The first access that matched a read/write watchpoint since the last call. Later
+    /// matches are ignored until this is taken.
+    pub fn take_watch_hit(&mut self) -> Option<WatchHit> {
+        self.watch.take_hit()
+    }
+
+    /// Whether any read/write watchpoint or an active bus monitor is set, so guest data
+    /// accesses are observed.
+    #[inline]
+    pub fn watching(&self) -> bool {
+        self.watch.watching()
+    }
+
+    /// Hand a guest write to the watcher (only while [`watching`](Self::watching)).
+    #[inline(always)]
+    fn observe_write(&mut self, addr: u32, width: u8, value: u32) {
+        if self.watch.watching() {
+            let (pc, now) = (self.pc_hint, self.now);
+            self.watch
+                .observe(addr, width, AccessDir::Write, value, pc, now);
+        }
+    }
+
+    /// Hand a guest read to the watcher unless it is an instruction fetch.
+    #[inline(always)]
+    fn observe_read(&mut self, addr: u32, width: u8, a: Access, value: u32) {
+        if self.watch.watching() && a.kind != AccessKind::Fetch {
+            let (pc, now) = (self.pc_hint, self.now);
+            self.watch
+                .observe(addr, width, AccessDir::Read, value, pc, now);
+        }
+    }
+
     // ---- guest access ----
 
     fn log_access(
@@ -749,34 +831,42 @@ impl MemoryMap {
 }
 
 /// Every access first tries the page table (whole RAM/ROM pages: a plain copy, nothing to log),
-/// then the general path.
+/// then the general path. While anything is watching, every data access (not fetches) is then
+/// shown to the watcher with the value read or written.
 impl Bus for MemoryMap {
     #[inline]
     fn read8(&mut self, addr: u32, a: Access) -> Result<u8, BusError> {
-        if let Some([b]) = self.fast_read(addr) {
-            return Ok(b);
-        }
-        Ok(self.bus_read(addr, 1, a)? as u8)
+        let v = match self.fast_read(addr) {
+            Some([b]) => b,
+            None => self.bus_read(addr, 1, a)? as u8,
+        };
+        self.observe_read(addr, 1, a, u32::from(v));
+        Ok(v)
     }
     #[inline]
     fn read16(&mut self, addr: u32, a: Access) -> Result<u16, BusError> {
-        if let Some(b) = self.fast_read(addr) {
-            return Ok(u16::from_le_bytes(b));
-        }
-        Ok(self.bus_read(addr, 2, a)? as u16)
+        let v = match self.fast_read(addr) {
+            Some(b) => u16::from_le_bytes(b),
+            None => self.bus_read(addr, 2, a)? as u16,
+        };
+        self.observe_read(addr, 2, a, u32::from(v));
+        Ok(v)
     }
     #[inline]
     fn read32(&mut self, addr: u32, a: Access) -> Result<u32, BusError> {
-        if let Some(b) = self.fast_read(addr) {
-            return Ok(u32::from_le_bytes(b));
-        }
-        self.bus_read(addr, 4, a)
+        let v = match self.fast_read(addr) {
+            Some(b) => u32::from_le_bytes(b),
+            None => self.bus_read(addr, 4, a)?,
+        };
+        self.observe_read(addr, 4, a, v);
+        Ok(v)
     }
     #[inline]
     fn write8(&mut self, addr: u32, v: u8, a: Access) -> Result<(), BusError> {
         if !self.fast_write(addr, &[v]) {
             self.write(addr, 1, u32::from(v), a.secure);
         }
+        self.observe_write(addr, 1, u32::from(v));
         Ok(())
     }
     #[inline]
@@ -784,6 +874,7 @@ impl Bus for MemoryMap {
         if !self.fast_write(addr, &v.to_le_bytes()) {
             self.write(addr, 2, u32::from(v), a.secure);
         }
+        self.observe_write(addr, 2, u32::from(v));
         Ok(())
     }
     #[inline]
@@ -791,6 +882,7 @@ impl Bus for MemoryMap {
         if !self.fast_write(addr, &v.to_le_bytes()) {
             self.write(addr, 4, v, a.secure);
         }
+        self.observe_write(addr, 4, v);
         Ok(())
     }
     fn code_epoch(&self) -> u64 {

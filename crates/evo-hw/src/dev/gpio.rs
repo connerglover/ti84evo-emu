@@ -20,7 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{DevCtx, Device, ResetKind, StateError, load_serde, save_serde};
+use crate::{DevCtx, Device, RegView, ResetKind, StateError, load_serde, save_serde};
 
 /// Number of pins.
 pub const GPIO_PINS: u8 = 13;
@@ -233,5 +233,25 @@ impl Device for Gpio {
         s.ext_level &= s.ext_driven;
         *self = s;
         Ok(())
+    }
+
+    /// The readable registers (SET, CLR and INT_CLR are write-only).
+    fn inspect(&self, _now: u64) -> Vec<RegView> {
+        [
+            ("data_out", DATA_OUT),
+            ("data_in", DATA_IN),
+            ("dir", DIR),
+            ("pull_en", PULL_EN),
+            ("pull_sel", PULL_SEL),
+            ("int_en", INT_EN),
+            ("int_status", INT_STATUS),
+            ("int_type", INT_TYPE),
+            ("int_both", INT_BOTH),
+            ("int_pol", INT_POL),
+        ]
+        .into_iter()
+        // Every offset listed is a register.
+        .map(|(name, off)| RegView::new(name, off, self.reg(off).unwrap_or(0)))
+        .collect()
     }
 }

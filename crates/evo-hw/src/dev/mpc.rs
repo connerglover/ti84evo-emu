@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{DevCtx, Device, ResetKind, StateError, load_serde, save_serde};
+use crate::{DevCtx, Device, RegView, ResetKind, StateError, load_serde, save_serde};
 
 /// `BLK_CFG` reported by every instance: block size `1 << (7 + 5)` = 4 KiB.
 pub const MPC_BLK_CFG: u32 = 7;
@@ -161,5 +161,31 @@ impl Device for Mpc {
         }
         *self = s;
         Ok(())
+    }
+
+    /// Every register a read decodes; `blk_lut` shows the LUT word at the current index
+    /// without advancing it. Write-only INT_CLEAR / INT_SET and the fault info read 0.
+    fn inspect(&self, _now: u64) -> Vec<RegView> {
+        let lut = self.lut.get(self.idx as usize).copied().unwrap_or(0);
+        let ctrl = RegView::new("ctrl", CTRL, self.ctrl);
+        let ctrl = match (self.ctrl & CTRL_AUTOINC != 0, self.locked()) {
+            (false, false) => ctrl,
+            (true, false) => ctrl.with_note("autoinc"),
+            (false, true) => ctrl.with_note("locked"),
+            (true, true) => ctrl.with_note("autoinc locked"),
+        };
+        vec![
+            ctrl,
+            RegView::new("blk_max", BLK_MAX, self.blk_max),
+            RegView::new("blk_cfg", BLK_CFG, MPC_BLK_CFG),
+            RegView::new("blk_idx", BLK_IDX, self.idx),
+            RegView::new("blk_lut", BLK_LUT, lut),
+            RegView::new("int_stat", INT_STAT, self.int_stat),
+            RegView::new("int_clear", INT_CLEAR, 0),
+            RegView::new("int_en", INT_EN, self.int_en),
+            RegView::new("int_info1", INT_INFO1, 0),
+            RegView::new("int_info2", INT_INFO2, 0),
+            RegView::new("int_set", INT_SET, 0),
+        ]
     }
 }
