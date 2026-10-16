@@ -4,7 +4,12 @@
 //! [`validate::check_bundle`] checks), Prepare (the new backend is provisioned on the app's
 //! worker thread) and Done. It opens on the first frame when [`AppOptions::open_wizard`] is set
 //! (no ROM linked yet) and at Choose for Calculator › Change ROM.
+//!
+//! This feature also owns Settings › Instances ([`instances`]) and Settings › Reset everything
+//! ([`reset`]), which ends by opening the wizard at Welcome.
 
+pub mod instances;
+pub mod reset;
 pub mod validate;
 
 use std::path::{Path, PathBuf};
@@ -13,12 +18,15 @@ use egui::{Align, Button, Id, Layout, RichText};
 
 use crate::app::{AppOptions, PROVISION_NOTICE};
 use crate::backend::EmuBackend;
+use crate::backend::placeholder::Placeholder;
 use crate::feature::{AppRequest, Feature, FeatureCtx};
 use crate::platform::FileFilter;
 use crate::prefs::Prefs;
 use crate::toast::ToastKind;
 use crate::toolbar::Action;
 
+use instances::InstancesWindow;
+use reset::{ResetChoice, ResetModal, clear_data_dir};
 use validate::{Checked, check_bundle, display_name};
 
 /// The modal's title.
@@ -50,7 +58,7 @@ pub enum Page {
     Done,
 }
 
-/// The ROM setup feature: the wizard, Change ROM and Reload ROM.
+/// The ROM setup feature: the wizard, Change ROM, Reload ROM, Instances and Reset everything.
 pub struct RomSetup {
     /// The open page; `None` while the wizard is closed.
     page: Option<Page>,
@@ -60,6 +68,10 @@ pub struct RomSetup {
     error: Option<String>,
     /// `ctx` time of the first frame the current provisioning run was shown on.
     prepare_started: Option<f64>,
+    /// Settings › Instances.
+    instances: InstancesWindow,
+    /// Settings › Reset everything.
+    reset: ResetModal,
 }
 
 impl RomSetup {
@@ -69,6 +81,8 @@ impl RomSetup {
             chosen: None,
             error: None,
             prepare_started: None,
+            instances: InstancesWindow::default(),
+            reset: ResetModal::default(),
         };
         if opts.open_wizard {
             s.open_at(Page::Welcome);
@@ -154,6 +168,24 @@ impl RomSetup {
                 .toasts
                 .push(format!("Reload failed: {e}"), ToastKind::Error),
         }
+    }
+
+    /// Reset everything, confirmed: deletes this instance's data and starts over without a ROM.
+    /// The old machine is dropped unsaved (its flash was just deleted).
+    fn reset_everything(&mut self, cx: &mut FeatureCtx<'_>) {
+        for e in clear_data_dir(cx.data_dir) {
+            cx.toasts.push(e, ToastKind::Error);
+        }
+        cx.requests.push(AppRequest::ReplaceBackend {
+            backend: Box::new(Placeholder::no_rom()),
+            rom: None,
+            persist_old: false,
+        });
+        cx.requests.push(AppRequest::ApplyPrefs(Prefs::default()));
+        cx.requests.push(AppRequest::ResetLayout);
+        self.instances = InstancesWindow::default();
+        self.open_at(Page::Welcome);
+        cx.toasts.push("Everything was reset", ToastKind::Info);
     }
 
     /// Draws the content of `page`; `now` is the `ctx` time.
@@ -291,6 +323,14 @@ impl Feature for RomSetup {
                 self.reload(cx);
                 true
             }
+            Action::Instances => {
+                self.instances.open();
+                true
+            }
+            Action::ResetEverything => {
+                self.reset.open();
+                true
+            }
             _ => false,
         }
     }
@@ -303,6 +343,10 @@ impl Feature for RomSetup {
     }
 
     fn ui(&mut self, ctx: &egui::Context, cx: &mut FeatureCtx<'_>) {
+        self.instances.ui(ctx, cx);
+        if self.reset.ui(ctx, cx) == ResetChoice::Confirm {
+            self.reset_everything(cx);
+        }
         let Some(page) = self.page else {
             return;
         };
@@ -314,7 +358,12 @@ impl Feature for RomSetup {
     }
 
     fn active(&self, action: Action) -> bool {
-        action == Action::ChangeRom && self.page.is_some()
+        match action {
+            Action::ChangeRom => self.page.is_some(),
+            Action::Instances => self.instances.is_open(),
+            Action::ResetEverything => self.reset.is_open(),
+            _ => false,
+        }
     }
 
     fn next_deadline(&self) -> Option<u64> {
@@ -322,7 +371,7 @@ impl Feature for RomSetup {
     }
 
     fn blocks_input(&self) -> bool {
-        self.page.is_some()
+        self.page.is_some() || self.reset.is_open()
     }
 
     fn on_exit(&mut self, _cx: &mut FeatureCtx<'_>) {}

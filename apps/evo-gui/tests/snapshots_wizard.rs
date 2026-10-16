@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{TempDir, gpu_lock, snap_harness_with, test_options};
+use common::{TempDir, gpu_lock, open_action, snap_harness_with, test_options};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use evo_gui::app::{AppOptions, EvoApp};
@@ -15,6 +15,7 @@ use evo_gui::backend::EmuBackend;
 use evo_gui::backend::fake::FakeBackend;
 use evo_gui::platform::{FakePlatform, PlatformRef};
 use evo_gui::toast::TOAST_SECS;
+use evo_gui::toolbar::Action;
 use evo_image::testutil::{Img, package, zip_bytes};
 
 const SIZE: [f32; 2] = [520.0, 960.0];
@@ -102,6 +103,47 @@ fn snapshot_wizard_prepare_failed() {
     }
     outlive_toasts(&mut h);
     h.snapshot("wizard_prepare_failed");
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "snapshots"),
+    ignore = "golden images: cargo test -p evo-gui --features snapshots"
+)]
+fn snapshot_wizard_instances() {
+    let _gpu = gpu_lock();
+    let dir = TempDir::new("evo-gui-snap-wizard-instances", true);
+    let platform: PlatformRef = FakePlatform::shared();
+    let opts = AppOptions {
+        start_paused: true,
+        instance: Some("lab".to_owned()),
+        ..test_options(&dir.join("data/instances/lab"), platform)
+    };
+    let mut h = snap_harness_with(FakeBackend::new(), SIZE, opts);
+    open_action(&mut h, Action::Instances);
+    h.run_steps(5);
+    assert!(h.query_by_label("Instance: lab").is_some());
+    h.snapshot("wizard_instances");
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "snapshots"),
+    ignore = "golden images: cargo test -p evo-gui --features snapshots"
+)]
+fn snapshot_wizard_reset_everything() {
+    let _gpu = gpu_lock();
+    let dir = TempDir::new("evo-gui-snap-wizard-reset", true);
+    let platform: PlatformRef = FakePlatform::shared();
+    let opts = AppOptions {
+        start_paused: true,
+        ..test_options(&dir.join("data"), platform)
+    };
+    let mut h = snap_harness_with(FakeBackend::new(), SIZE, opts);
+    open_action(&mut h, Action::ResetEverything);
+    h.run_steps(5);
+    assert!(h.query_by_label("Reset everything?").is_some());
+    h.snapshot("wizard_reset_everything");
 }
 
 /// A synthetic TI-84 Evo bundle (made-up bytes, genuine framing).

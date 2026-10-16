@@ -9,13 +9,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{TempDir, harness_with, open_action, test_options};
+use egui::accesskit::Role;
 use egui::{Event, Key, Modifiers};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use evo_gui::app::{AppOptions, EvoApp, PROVISION_NOTICE};
 use evo_gui::backend::EmuBackend;
 use evo_gui::backend::fake::{FakeBackend, FakeProbe};
+use evo_gui::input::Keymap;
+use evo_gui::instance::{LOCK_FILE, instance_dir};
+use evo_gui::pacer::Speed;
 use evo_gui::platform::{FakePlatform, PlatformRef};
+use evo_gui::prefs::Prefs;
 use evo_gui::toolbar::Action;
 use evo_gui::wizard::Page;
 use evo_gui::wizard::validate::{BUNDLE_MAX_BYTES, EVO_PRODID, SUPPORTED_OS, check_bundle};
@@ -553,4 +558,278 @@ fn reload_without_rom_toasts() {
     h.get_by_label("No ROM to reload");
     assert!(platform.opened().is_empty());
     assert_eq!(h.state().backend().name(), "demo");
+}
+
+// --- Instances window and Reset everything (Task B3) ---
+
+/// Options for instance `id` of the data base `dir/data`.
+fn instance_options(dir: &Path, platform: &Arc<FakePlatform>, id: Option<&str>) -> AppOptions {
+    let platform: PlatformRef = platform.clone();
+    let base = dir.join("data");
+    AppOptions {
+        instance: id.map(str::to_owned),
+        ..test_options(&instance_dir(&base, id), platform)
+    }
+}
+
+/// Replaces the text of the Instances window's "New ID" field with `text`.
+fn type_new_id(h: &mut Harness<'static, EvoApp>, text: &str) {
+    h.get_by_role(Role::TextInput).click();
+    h.run_steps(2);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.run_steps(1);
+    h.key_press(Key::Backspace);
+    h.run_steps(1);
+    h.get_by_role(Role::TextInput).type_text(text);
+    h.run_steps(2);
+}
+
+fn touch(path: &Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, b"x").unwrap();
+}
+
+#[test]
+fn instances_window_shows_the_instance() {
+    let dir = TempDir::new("evo-gui-wizard-inst-show", true);
+    let platform = FakePlatform::shared();
+    let mut h = harness_with(
+        FakeBackend::new(),
+        instance_options(&dir, &platform, Some("lab")),
+    );
+    open_action(&mut h, Action::Instances);
+    h.get_by_label("Instance: lab");
+    assert!(h.state().features().active(Action::Instances));
+
+    let dir2 = TempDir::new("evo-gui-wizard-inst-show-default", true);
+    let mut h = harness_with(FakeBackend::new(), instance_options(&dir2, &platform, None));
+    open_action(&mut h, Action::Instances);
+    h.get_by_label("Instance: default");
+}
+
+#[test]
+fn new_instance_spawns_next_id() {
+    let dir = TempDir::new("evo-gui-wizard-inst-new", true);
+    let platform = FakePlatform::shared();
+    let mut h = harness_with(FakeBackend::new(), instance_options(&dir, &platform, None));
+    open_action(&mut h, Action::Instances);
+    click(&mut h, "New instance");
+    assert_eq!(platform.spawned(), [["--instance", "instance-2"]]);
+    h.get_by_label("Started instance instance-2");
+    assert!(!h.state().close_requested());
+}
+
+#[test]
+fn new_instance_from_named_instance_uses_the_shared_base() {
+    let dir = TempDir::new("evo-gui-wizard-inst-base", true);
+    std::fs::create_dir_all(dir.join("data/instances/instance-2")).unwrap();
+    let platform = FakePlatform::shared();
+    let mut h = harness_with(
+        FakeBackend::new(),
+        instance_options(&dir, &platform, Some("lab")),
+    );
+    open_action(&mut h, Action::Instances);
+    click(&mut h, "New instance");
+    assert_eq!(platform.spawned(), [["--instance", "instance-3"]]);
+}
+
+#[test]
+fn change_id_validates_then_spawns_and_closes() {
+    let dir = TempDir::new("evo-gui-wizard-inst-change", true);
+    let platform = FakePlatform::shared();
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness_with(fake, instance_options(&dir, &platform, Some("lab")));
+    open_action(&mut h, Action::Instances);
+    let before = probe.persists();
+
+    type_new_id(&mut h, "a b");
+    click(&mut h, "Change ID");
+    h.get_by_label("IDs use 1\u{2013}32 letters, digits, - or _");
+    assert!(platform.spawned().is_empty());
+    assert!(!h.state().close_requested());
+    assert_eq!(probe.persists(), before);
+
+    type_new_id(&mut h, "lab2");
+    click(&mut h, "Change ID");
+    assert_eq!(
+        platform.spawned(),
+        [["--instance", "lab2", "--rename-from", "lab"]]
+    );
+    assert_eq!(probe.persists(), before + 1);
+    assert!(h.state().close_requested());
+}
+
+#[test]
+fn change_id_onto_existing_instance_is_refused() {
+    let dir = TempDir::new("evo-gui-wizard-inst-exists", true);
+    std::fs::create_dir_all(dir.join("data/instances/other")).unwrap();
+    let platform = FakePlatform::shared();
+    let mut h = harness_with(
+        FakeBackend::new(),
+        instance_options(&dir, &platform, Some("lab")),
+    );
+    open_action(&mut h, Action::Instances);
+    type_new_id(&mut h, "other");
+    click(&mut h, "Change ID");
+    h.get_by_label("Instance other already exists");
+    assert!(platform.spawned().is_empty());
+    assert!(!h.state().close_requested());
+}
+
+#[test]
+fn change_id_disabled_for_default() {
+    let dir = TempDir::new("evo-gui-wizard-inst-default", true);
+    let platform = FakePlatform::shared();
+    let mut h = harness_with(FakeBackend::new(), instance_options(&dir, &platform, None));
+    open_action(&mut h, Action::Instances);
+    assert!(h.get_by_label("Change ID").accesskit_node().is_disabled());
+    type_new_id(&mut h, "lab2");
+    click(&mut h, "Change ID");
+    assert!(platform.spawned().is_empty());
+    assert!(!h.state().close_requested());
+}
+
+/// A default-instance data dir with something in every kind of entry.
+fn populate(data: &Path) {
+    touch(&data.join("flash/nv.bin"));
+    touch(&data.join("states/slot1.evostate"));
+    touch(&data.join("screenshots/shot.png"));
+    touch(&data.join("loose.txt"));
+    touch(&data.join(LOCK_FILE));
+    touch(&data.join("app.ron"));
+    touch(&data.join("instances/other/flash/x"));
+}
+
+#[test]
+fn reset_everything_cancel_changes_nothing() {
+    let dir = TempDir::new("evo-gui-wizard-reset-cancel", true);
+    let data = dir.join("data");
+    populate(&data);
+    let platform = FakePlatform::shared();
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness_with(fake, instance_options(&dir, &platform, None));
+    open_action(&mut h, Action::ResetEverything);
+    h.get_by_label("Reset everything?");
+    assert!(h.state().features().active(Action::ResetEverything));
+    click(&mut h, "Cancel");
+    assert!(h.query_by_label("Reset everything?").is_none());
+    assert!(data.join("flash/nv.bin").exists());
+    assert!(data.join("states/slot1.evostate").exists());
+    assert!(data.join("loose.txt").exists());
+    assert_eq!(h.state().backend().name(), "demo");
+    assert_eq!(probe.resets(), 0);
+    assert_eq!(page(&h), None);
+}
+
+#[test]
+fn reset_everything_blocks_calculator_keys() {
+    let dir = TempDir::new("evo-gui-wizard-reset-keys", true);
+    let platform = FakePlatform::shared();
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let mut h = harness_with(fake, instance_options(&dir, &platform, None));
+    open_action(&mut h, Action::ResetEverything);
+    h.input_mut().events.push(key(Key::Enter, true));
+    h.run_steps(3);
+    h.input_mut().events.push(key(Key::Enter, false));
+    h.run_steps(10);
+    assert_eq!(presses(&probe), 0, "{:?}", probe.key_log());
+}
+
+#[test]
+fn reset_everything_deletes_and_restarts() {
+    let dir = TempDir::new("evo-gui-wizard-reset", true);
+    let data = dir.join("data");
+    populate(&data);
+    let platform = FakePlatform::shared();
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let opts = AppOptions {
+        prefs: Prefs {
+            speed: Speed::X4,
+            bundle: Some(dir.join("os.84b2")),
+            ..Prefs::default()
+        },
+        rom: Some(dir.join("os.84b2")),
+        ..instance_options(&dir, &platform, None)
+    };
+    let mut h = harness_with(fake, opts);
+    assert_ne!(h.state().prefs(), Prefs::default());
+    open_action(&mut h, Action::ResetEverything);
+    click(&mut h, "Reset everything");
+    h.run_steps(2);
+
+    assert!(!data.join("flash").exists());
+    assert!(!data.join("states").exists());
+    assert!(!data.join("screenshots").exists());
+    assert!(!data.join("loose.txt").exists());
+    assert!(data.join(LOCK_FILE).exists());
+    assert!(data.join("app.ron").exists());
+    assert!(data.join("instances/other/flash/x").exists());
+
+    assert_eq!(h.state().backend().name(), "No ROM");
+    assert_eq!(h.state().rom(), None);
+    assert_eq!(probe.persists(), 0, "the old flash is not saved");
+    assert_eq!(h.state().prefs(), Prefs::default());
+    assert_eq!(h.state().prefs().keymap, Keymap::default_map());
+    assert_eq!(page(&h), Some(Page::Welcome));
+    h.get_by_label("Welcome");
+    h.get_by_label("Everything was reset");
+    assert!(h.query_by_label("Reset everything?").is_none());
+}
+
+#[test]
+fn reset_everything_of_named_instance_keeps_others() {
+    let dir = TempDir::new("evo-gui-wizard-reset-named", true);
+    let data = dir.join("data");
+    touch(&data.join("instances/lab/flash/nv.bin"));
+    touch(&data.join("instances/lab").join(LOCK_FILE));
+    touch(&data.join("instances/other/flash/x"));
+    touch(&data.join("flash/default"));
+    let platform = FakePlatform::shared();
+    let mut h = harness_with(
+        FakeBackend::new(),
+        instance_options(&dir, &platform, Some("lab")),
+    );
+    open_action(&mut h, Action::ResetEverything);
+    click(&mut h, "Reset everything");
+    assert!(!data.join("instances/lab/flash").exists());
+    assert!(data.join("instances/lab").join(LOCK_FILE).exists());
+    assert!(data.join("instances/other/flash/x").exists());
+    assert!(data.join("flash/default").exists());
+    assert_eq!(h.state().backend().name(), "No ROM");
+}
+
+#[test]
+fn export_flash_first_writes_file() {
+    let dir = TempDir::new("evo-gui-wizard-reset-export", true);
+    let data = dir.join("data");
+    populate(&data);
+    let out = dir.join("saved.evoflash");
+    let platform = FakePlatform::shared();
+    let mut h = harness_with(FakeBackend::new(), instance_options(&dir, &platform, None));
+    open_action(&mut h, Action::ResetEverything);
+    platform.queue_save(Some(out.clone()));
+    click(&mut h, "Export flash first\u{2026}");
+    assert_eq!(platform.asked(), ["Export flash image"]);
+    assert!(out.is_file());
+    assert!(std::fs::metadata(&out).unwrap().len() > 0);
+    h.get_by_label("Flash exported");
+    // The modal stays and nothing was deleted.
+    h.get_by_label("Reset everything?");
+    assert!(data.join("flash/nv.bin").exists());
+    assert_eq!(h.state().backend().name(), "demo");
+
+    // A failed export is a toast and the modal stays.
+    platform.queue_save(Some(dir.join("missing-dir").join("x.evoflash")));
+    click(&mut h, "Export flash first\u{2026}");
+    assert!(h.query_by_label_contains("Export failed: ").is_some());
+    h.get_by_label("Reset everything?");
+
+    // A cancelled dialog does nothing.
+    platform.queue_save(None);
+    click(&mut h, "Export flash first\u{2026}");
+    h.get_by_label("Reset everything?");
 }
