@@ -309,6 +309,43 @@ fn history_script_times_from_the_first_event() {
 }
 
 #[test]
+fn history_restarts_when_cycles_go_back() {
+    let ms = CLOCK_HZ / 1000;
+    let s = CLOCK_HZ;
+    // Across two batches: tap enter at 1 s, then (after a reset) tap 2 at 0.5 s.
+    let mut hist = KeyHistory::new();
+    hist.push(&[
+        kev(KeyId::Enter, true, s),
+        kev(KeyId::Enter, false, s + 50 * ms),
+    ]);
+    hist.push(&[
+        kev(KeyId::Two, true, s / 2),
+        kev(KeyId::Two, false, s / 2 + 50 * ms),
+    ]);
+    assert_eq!(hist.len(), 2);
+    assert_eq!(hist.script(), "2");
+
+    // Within one batch: only the events after the last drop are kept.
+    let mut hist = KeyHistory::new();
+    hist.push(&[
+        kev(KeyId::Enter, true, s),
+        kev(KeyId::Enter, false, s + 50 * ms),
+        kev(KeyId::Alpha, true, 10 * ms),
+        kev(KeyId::Alpha, false, 60 * ms),
+        kev(KeyId::Two, true, 5 * ms),
+        kev(KeyId::Two, false, 55 * ms),
+    ]);
+    assert_eq!(hist.len(), 2);
+    assert_eq!(hist.script(), "2");
+
+    // Equal cycles are not a restart.
+    let mut hist = KeyHistory::new();
+    hist.push(&[kev(KeyId::Two, true, s)]);
+    hist.push(&[kev(KeyId::Two, false, s)]);
+    assert_eq!(hist.len(), 2);
+}
+
+#[test]
 fn copy_as_script() {
     let (mut h, _dir) = tools_harness(FakeBackend::new());
     open_action(&mut h, Action::KeyHistory);

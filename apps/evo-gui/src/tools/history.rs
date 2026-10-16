@@ -43,7 +43,21 @@ impl KeyHistory {
     }
 
     /// Appends `events` (oldest first), dropping the oldest beyond [`KEY_HISTORY_CAP`].
+    ///
+    /// Reset, a state load and a ROM import restart the cycle counter. An event whose cycle is
+    /// below the one before it therefore starts a new timeline: the history drops everything
+    /// before it, so the window and the key script never go back in time.
     pub fn push(&mut self, events: &[KeyEvent]) {
+        let mut prev = self.events.back().map(|e| e.cycle);
+        let mut start = 0;
+        for (i, e) in events.iter().enumerate() {
+            if prev.is_some_and(|p| e.cycle < p) {
+                start = i;
+                self.events.clear();
+            }
+            prev = Some(e.cycle);
+        }
+        let events = &events[start..];
         let skip = events.len().saturating_sub(KEY_HISTORY_CAP);
         self.events.extend(&events[skip..]);
         let excess = self.events.len().saturating_sub(KEY_HISTORY_CAP);
