@@ -19,6 +19,7 @@ const { values } = parseArgs({ options: {
   'python-roundtrip': { type: 'boolean' },
   'skip-screenshots': { type: 'boolean' },
   'receive-ptt': { type: 'boolean' },
+  'recovery-checks': { type: 'boolean' },
   keys: { type: 'string' },
 } });
 for (const name of ['cli', 'bundle', 'library']) if (!values[name]) throw new Error(`--${name} is required`);
@@ -59,7 +60,13 @@ try {
   }
   const ti = context.TIConnect;
   let activationError;
-  await ti.init(() => {}, () => {}, () => {}, () => {}, () => { activationError = true; });
+  let cancelOnProgress = false, cancelRequested = false;
+  await ti.init(() => {}, () => {}, (_event, bytes) => {
+    if (cancelOnProgress && bytes > 0) {
+      cancelOnProgress = false; cancelRequested = true;
+      ti.cancelOperation();
+    }
+  }, () => {}, () => { activationError = true; });
   await ti.enableAutoActivate();
   if (activationError || !ti.hasActiveDevice()) throw new Error('TI Connect did not activate the emulated calculator');
   const attributes = await ti.getAttributes();
@@ -117,6 +124,32 @@ try {
     await ti.deleteFile(received);
     if ((await ti.getDirectory()).some(f => f.displayName === name)) throw new Error('Python variable delete failed');
     console.log(`PYTHON_ROUNDTRIP: ${source.length} source bytes identical; deleted test variable`);
+  }
+  if (values['recovery-checks']) {
+    const file = directory.find(f => f.displayName === 'L1');
+    if (!file) throw new Error('recovery test requires L1');
+    await ti.getFileByNameAndType(file);
+    const original = Uint8Array.from(file.contents);
+    file.contents = Uint8Array.of(0);
+    let rejection;
+    try { await ti.sendFile(file, true); }
+    catch (error) { rejection = error; }
+    // This firmware closes the malformed CBOR upload with Kermit DI. A timeout
+    // would not prove rejection; require the observed response and intact data.
+    if (rejection !== 11) throw new Error(`Malformed variable returned ${rejection}, expected disconnect 11`);
+    console.log('REJECTED_VARIABLE', rejection);
+    await ti.getFileByNameAndType(file);
+    if (!Buffer.from(file.contents).equals(Buffer.from(original))) throw new Error('Rejected upload changed L1');
+    cancelOnProgress = true;
+    let cancellation;
+    try { await ti.getScreen(0); }
+    catch (error) { cancellation = error; }
+    finally { cancelOnProgress = false; }
+    if (!cancelRequested || cancellation !== 9) throw new Error(`Screenshot cancellation returned ${cancellation}`);
+    await ti.getDirectory();
+    const recovered = await ti.getScreen(0);
+    if (recovered.length !== 320 * 240 * 4) throw new Error('Screenshot after cancellation failed');
+    console.log('RECOVERY_CHECKS: rejection preserved L1; cancellation followed by directory and screenshot succeeded');
   }
   if (values['install-bundle']) {
     const update = new Uint8Array(await readFile(values['install-bundle']));
