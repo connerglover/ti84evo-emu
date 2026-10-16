@@ -43,6 +43,10 @@ convention is reproduced and tested against the official converter; it is indepe
 of the USB/Kermit transport CRC. Native resource transfers use the CBOR without this
 disk-file suffix. Import accepts raw CBOR or a verified suffix and rejects other trailing
 data. The desktop adapter validates files before sending anything to the guest.
+Parsing limits inputs to 16 MiB, nesting to 64 levels, and total CBOR values to 131,072.
+A header-only preflight checks those structure limits before allocating the value tree;
+the CBOR library still performs semantic validation. Byte strings count as one value,
+so image payloads retain their full size allowance.
 
 ## Python and images
 

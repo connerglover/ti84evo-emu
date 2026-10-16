@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
 const MAX_FILE: usize = 16 * 1024 * 1024;
+const MAX_DEPTH: usize = 64;
+const MAX_ITEMS: u64 = 131_072;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -115,7 +117,7 @@ fn number(value: &Value) -> Result<u64> {
 }
 
 // The official WEB_addCRC routine calls this a CRC, but uses an XOR of LE words
-// excluding its final 3/4 bytes, then appends the result big-endian. Preserve that
+// excluding its final 3 or 6 bytes, then appends the result big-endian. Preserve that
 // observed file convention; the USB/Kermit transport has its own independent CRC.
 fn file_checksum(bytes: &[u8]) -> u16 {
     let n = bytes.len().saturating_sub(3);
@@ -131,9 +133,10 @@ fn parse(bytes: &[u8]) -> Result<(Value, usize)> {
     if bytes.is_empty() || bytes.len() > MAX_FILE {
         return Err(err("File is empty or exceeds 16 MiB"));
     }
+    bound_cbor(bytes)?;
     let mut cursor = Cursor::new(bytes);
-    let value =
-        ciborium::from_reader(&mut cursor).map_err(|e| err(format!("Invalid CBOR: {e}")))?;
+    let value = ciborium::de::from_reader_with_recursion_limit(&mut cursor, MAX_DEPTH)
+        .map_err(|e| err(format!("Invalid CBOR: {e}")))?;
     let used = cursor.position() as usize;
     let trailing = &bytes[used..];
     if !trailing.is_empty()
@@ -142,6 +145,79 @@ fn parse(bytes: &[u8]) -> Result<(Value, usize)> {
         return Err(err("Invalid file checksum or trailing data"));
     }
     Ok((value, used))
+}
+
+/// Bound allocation amplification before constructing a dynamic Value tree. This only
+/// walks headers and skips byte/text strings; ciborium remains the semantic validator.
+fn bound_cbor(bytes: &[u8]) -> Result<()> {
+    let mut frames = vec![Some(1u64)];
+    let mut offset = 0usize;
+    let mut items = 0u64;
+    while !frames.is_empty() {
+        if frames.last() == Some(&Some(0)) {
+            frames.pop();
+            continue;
+        }
+        let initial = *bytes.get(offset).ok_or_else(|| err("Truncated CBOR"))?;
+        offset += 1;
+        if initial == 0xff {
+            if frames.last() != Some(&None) {
+                return Err(err("Unexpected CBOR break"));
+            }
+            frames.pop();
+            continue;
+        }
+        items += 1;
+        if items > MAX_ITEMS {
+            return Err(err("CBOR contains too many values"));
+        }
+        if let Some(Some(remaining)) = frames.last_mut() {
+            *remaining -= 1;
+        }
+        let major = initial >> 5;
+        let info = initial & 31;
+        let argument = match info {
+            0..=23 => Some(u64::from(info)),
+            24..=27 => {
+                let count = 1usize << (info - 24);
+                let end = offset
+                    .checked_add(count)
+                    .ok_or_else(|| err("CBOR length overflow"))?;
+                let word = bytes
+                    .get(offset..end)
+                    .ok_or_else(|| err("Truncated CBOR argument"))?;
+                offset = end;
+                Some(word.iter().fold(0u64, |n, b| (n << 8) | u64::from(*b)))
+            }
+            31 => None,
+            _ => return Err(err("Reserved CBOR header")),
+        };
+        match (major, argument) {
+            (2 | 3, Some(length)) => {
+                let length =
+                    usize::try_from(length).map_err(|_| err("CBOR string length overflow"))?;
+                offset = offset
+                    .checked_add(length)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or_else(|| err("Truncated CBOR string"))?;
+            }
+            (4 | 5, Some(length)) => {
+                let count = length
+                    .checked_mul(if major == 5 { 2 } else { 1 })
+                    .filter(|n| *n <= MAX_ITEMS - items)
+                    .ok_or_else(|| err("CBOR collection contains too many values"))?;
+                frames.push(Some(count));
+            }
+            (2..=5, None) => frames.push(None),
+            (6, Some(_)) => frames.push(Some(1)),
+            (0 | 1 | 7, Some(_)) => {}
+            _ => return Err(err("Invalid indefinite CBOR value")),
+        }
+        if frames.len() > MAX_DEPTH {
+            return Err(err("CBOR nesting exceeds 64 levels"));
+        }
+    }
+    Ok(())
 }
 
 fn encode(value: &Value) -> Result<Vec<u8>> {
@@ -740,7 +816,11 @@ pub fn encode_csv(csv: &str, mode: CsvMode, archived: bool) -> Result<Vec<Variab
                 return Err(err("Select one to six existing CSV columns"));
             }
             let mut files = Vec::new();
+            let mut targets = std::collections::BTreeSet::new();
             for (column, name) in names.iter().enumerate() {
+                if !targets.insert(encode_name(name, 1)?) {
+                    return Err(err("CSV columns must have distinct calculator names"));
+                }
                 let mut values = Vec::new();
                 let mut gap = false;
                 for row in &table {
@@ -1013,6 +1093,47 @@ mod tests {
                 .unwrap()
                 .get("pkg-version")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn bounded_cbor_rejects_depth_and_allocation_amplification() {
+        let mut deep = vec![0x81; MAX_DEPTH + 10];
+        deep.push(0);
+        assert!(
+            parse_info(&deep)
+                .unwrap_err()
+                .to_string()
+                .contains("nesting")
+        );
+        let mut many = vec![0x9f];
+        many.extend(std::iter::repeat_n(0, MAX_ITEMS as usize + 1));
+        many.push(0xff);
+        assert!(
+            parse_info(&many)
+                .unwrap_err()
+                .to_string()
+                .contains("too many")
+        );
+        for header in [0x5b, 0x7b, 0x9b, 0xbb] {
+            let mut declared = vec![header];
+            declared.extend_from_slice(&u64::MAX.to_be_bytes());
+            assert!(parse_info(&declared).is_err());
+        }
+        // An indefinite byte string is valid CBOR and must not be mistaken for a huge array.
+        assert_eq!(
+            parse_info(&[0x5f, 0x42, 1, 2, 0x41, 3, 0xff]).unwrap(),
+            serde_json::json!([1, 2, 3])
+        );
+        assert!(
+            encode_csv(
+                "1,2",
+                CsvMode::Lists {
+                    names: vec!["L1".into(), "l1".into()]
+                },
+                false
+            )
+            .is_err()
         );
     }
 }
