@@ -2,6 +2,7 @@
 //! of [`DebugTab::ALL`]. Only the selected tab is drawn, so hidden tabs make no backend
 //! calls.
 
+mod breakpoints;
 mod control;
 mod disasm;
 mod memory;
@@ -10,6 +11,7 @@ mod search;
 mod uart;
 mod unmapped;
 mod visualizer;
+mod watchpoints;
 
 use egui::{Button, ScrollArea, Sense};
 
@@ -19,6 +21,7 @@ pub use memory::{DEFAULT_MEM_ADDR, MAX_VIEWS};
 pub use search::{SEARCH_CHUNK, SEARCH_CHUNKS_PER_FRAME, Search, find, parse_pattern};
 pub use uart::{UART_CAP, UartConsole};
 pub use visualizer::{DEFAULT_VIS_ADDR, PixelFormat, VIS_MAX, parse_size, render};
+pub use watchpoints::watch_text;
 
 use crate::backend::{EmuBackend, Goal, UartId};
 use crate::logbuf::LOG_CAP;
@@ -143,6 +146,8 @@ pub struct DebugPanel {
     disasm: disasm::DisasmState,
     memory: memory::MemoryState,
     visualizer: visualizer::VisualizerState,
+    breakpoints: breakpoints::BreakpointsState,
+    watchpoints: watchpoints::WatchpointsState,
     uart: UartConsole,
     uart2: UartConsole,
     /// The newest log lines, at most [`LOG_CAP`].
@@ -244,11 +249,13 @@ impl DebugPanel {
             DebugTab::Console => uart::show(ui, &mut self.uart),
             DebugTab::Unmapped => unmapped::show(ui, &backend.unmapped()),
             DebugTab::Visualizer => visualizer::show(ui, &mut self.visualizer, backend),
-            DebugTab::Breakpoints
-            | DebugTab::Watchpoints
-            | DebugTab::Peripherals
-            | DebugTab::BusMonitor
-            | DebugTab::Stacks => not_yet(ui),
+            DebugTab::Breakpoints => {
+                breakpoints::show(ui, &mut self.breakpoints, backend, paused);
+            }
+            DebugTab::Watchpoints => {
+                watchpoints::show(ui, &mut self.watchpoints, backend, paused, &mut out.notes);
+            }
+            DebugTab::Peripherals | DebugTab::BusMonitor | DebugTab::Stacks => not_yet(ui),
         }
         out
     }

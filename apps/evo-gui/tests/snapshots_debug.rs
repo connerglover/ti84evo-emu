@@ -9,6 +9,7 @@ use egui::{Key, Modifiers};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use evo_gui::app::EvoApp;
+use evo_gui::backend::EmuBackend;
 use evo_gui::backend::fake::FakeBackend;
 use evo_gui::platform::FakePlatform;
 use evo_gui::toolbar::Action;
@@ -109,4 +110,42 @@ fn snapshot_debug_visualizer() {
     h.hover_at(egui::pos2(300.0, 950.0));
     h.run_steps(10);
     h.snapshot("debug_visualizer");
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "snapshots"),
+    ignore = "golden images: cargo test -p evo-gui --features snapshots"
+)]
+fn snapshot_debug_breakpoints() {
+    let _gpu = gpu_lock();
+    let mut fake = FakeBackend::new();
+    fake.set_breakpoints(vec![0x1000_0204, 0x1000_0300]);
+    let mut h = snap_harness(fake, [1060.0, 960.0], FakePlatform::shared());
+    open_action(&mut h, Action::ToggleDebug);
+    h.get_by_label("Breakpoints").click();
+    h.run_steps(3);
+    h.hover_at(egui::pos2(300.0, 950.0));
+    h.run_steps(10);
+    h.snapshot("debug_breakpoints");
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "snapshots"),
+    ignore = "golden images: cargo test -p evo-gui --features snapshots"
+)]
+fn snapshot_debug_watchpoints() {
+    let _gpu = gpu_lock();
+    let mut h = dock_on("Watchpoints");
+    // One write watchpoint added through the add row: Enter in the length field adds it
+    // (Enter in the start field, with no length yet, is refused and cleared by the edit).
+    set_field(&mut h, 0, "0x20000100");
+    set_field(&mut h, 1, "4");
+    // Click off the field so no caret shows.
+    h.get_by_label("0x20000100..0x20000103 -W-").click();
+    h.run_steps(3);
+    h.hover_at(egui::pos2(300.0, 950.0));
+    h.run_steps(10);
+    h.snapshot("debug_watchpoints");
 }

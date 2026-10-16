@@ -1,5 +1,6 @@
 //! The debug dock: tab registry, run row, the Control tab, register editing, the
-//! Memory tab (views, editing, search) and the Visualizer, on `FakeBackend`.
+//! Memory tab (views, editing, search), the Visualizer and the Breakpoints and Watchpoints
+//! tabs, on `FakeBackend`.
 
 mod common;
 
@@ -10,10 +11,10 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use evo_gui::app::{AppOptions, EvoApp};
 use evo_gui::backend::fake::FakeBackend;
-use evo_gui::backend::{EmuBackend, Goal, RunStatus};
+use evo_gui::backend::{AccessDir, EmuBackend, Goal, RunStatus, WatchKinds, Watchpoint};
 use evo_gui::debug::{
     DebugTab, MAX_VIEWS, PixelFormat, SEARCH_CHUNK, SEARCH_CHUNKS_PER_FRAME, Search, VIS_MAX,
-    cycle_text, find, parse_pattern, parse_size, parse_value, render,
+    cycle_text, find, parse_pattern, parse_size, parse_value, render, watch_text,
 };
 use evo_gui::platform::FakePlatform;
 
@@ -847,4 +848,276 @@ fn visualizer_fields_take_keys_from_calculator() {
     set_field(&mut h, 1, "64");
     press(&mut h, Key::Enter);
     assert!(probe.key_log().is_empty(), "{:?}", probe.key_log());
+}
+
+// --- Breakpoints and Watchpoints ---
+
+#[test]
+fn watch_text_format() {
+    let w = Watchpoint {
+        start: 0x2000_0100,
+        len: 4,
+        kinds: WatchKinds {
+            write: true,
+            ..WatchKinds::default()
+        },
+    };
+    assert_eq!(watch_text(&w), "0x20000100..0x20000103 -W-");
+    let all = Watchpoint {
+        start: 0xFFFF_FFFF,
+        len: 1,
+        kinds: WatchKinds {
+            read: true,
+            write: true,
+            exec: true,
+        },
+    };
+    assert_eq!(watch_text(&all), "0xffffffff..0xffffffff RWX");
+}
+
+/// The dock open on tab `tab`.
+fn dock_on(fake: FakeBackend, tab: &str) -> (Harness<'static, EvoApp>, TempDir) {
+    let (mut h, dir) = dock(fake);
+    click(&mut h, tab);
+    (h, dir)
+}
+
+/// Clicks the `n`th widget labelled `label` (drawing order).
+fn click_nth(h: &mut Harness<'static, EvoApp>, label: &str, n: usize) {
+    h.get_all_by_label(label).nth(n).expect(label).click();
+    h.run_steps(3);
+}
+
+#[test]
+fn add_and_remove_breakpoints() {
+    let (mut h, _dir) = dock_on(FakeBackend::new(), "Breakpoints");
+    h.get_by_label("No breakpoints");
+    set_field(&mut h, 0, "0x10000300");
+    click(&mut h, "Add");
+    assert_eq!(h.state().backend().breakpoints(), [0x1000_0300]);
+    h.get_by_label("0x10000300");
+    // Adding one already set keeps it (no toggle off).
+    set_field(&mut h, 0, "0x10000300");
+    click(&mut h, "Add");
+    assert_eq!(h.state().backend().breakpoints(), [0x1000_0300]);
+    // Enter in the field adds too.
+    set_field(&mut h, 0, "1000_0400");
+    press(&mut h, Key::Enter);
+    assert_eq!(
+        h.state().backend().breakpoints(),
+        [0x1000_0300, 0x1000_0400]
+    );
+    assert_eq!(h.get_all_by_label("Remove").count(), 2);
+    click_nth(&mut h, "Remove", 0);
+    assert_eq!(h.state().backend().breakpoints(), [0x1000_0400]);
+    assert!(h.query_by_label("0x10000300").is_none());
+    h.get_by_label("0x10000400");
+}
+
+#[test]
+fn breakpoint_garbage_is_refused() {
+    let (mut h, _dir) = dock_on(FakeBackend::new(), "Breakpoints");
+    set_field(&mut h, 0, "zz");
+    click(&mut h, "Add");
+    h.get_by_label("Not a hex address");
+    assert!(h.state().backend().breakpoints().is_empty());
+    // The next edit clears the message.
+    set_field(&mut h, 0, "0x10000300");
+    assert!(h.query_by_label("Not a hex address").is_none());
+}
+
+#[test]
+fn breakpoints_tab_lists_disassembly_breakpoints() {
+    let mut fake = FakeBackend::new();
+    fake.toggle_breakpoint(0x1000_0204);
+    let (h, _dir) = dock_on(fake, "Breakpoints");
+    h.get_by_label("0x10000204");
+    assert!(h.query_by_label("No breakpoints").is_none());
+}
+
+#[test]
+fn remove_all_breakpoints() {
+    let mut fake = FakeBackend::new();
+    fake.set_breakpoints(vec![0x1000_0300, 0x1000_0400, 0x1000_0500]);
+    let (mut h, _dir) = dock_on(fake, "Breakpoints");
+    assert_eq!(h.get_all_by_label("Remove").count(), 3);
+    click(&mut h, "Remove all");
+    assert!(h.state().backend().breakpoints().is_empty());
+    assert_eq!(h.query_all_by_label("Remove").count(), 0);
+    h.get_by_label("No breakpoints");
+}
+
+#[test]
+fn breakpoint_edits_only_while_paused() {
+    let (mut h, _dir) = dock_on(FakeBackend::new(), "Breakpoints");
+    click(&mut h, "Continue");
+    set_field(&mut h, 0, "0x10000300");
+    click(&mut h, "Add");
+    assert!(h.state().backend().breakpoints().is_empty());
+    click(&mut h, "Pause");
+    click(&mut h, "Add");
+    assert_eq!(h.state().backend().breakpoints(), [0x1000_0300]);
+}
+
+/// Fills the Watchpoints add row: start, length.
+fn fill_watch(h: &mut Harness<'static, EvoApp>, start: &str, len: &str) {
+    set_field(h, 0, start);
+    set_field(h, 1, len);
+}
+
+#[test]
+fn watchpoints_tab_add_row() {
+    let (h, _dir) = dock_on(FakeBackend::new(), "Watchpoints");
+    for label in ["Start", "Length", "R", "W", "X", "Add", "Remove all"] {
+        h.get_by_label(label);
+    }
+    assert_eq!(inputs(&h), 2);
+    h.get_by_label("No watchpoints");
+}
+
+#[test]
+fn add_watchpoint_then_run_stops() {
+    let (mut h, _dir) = dock_on(FakeBackend::new(), "Watchpoints");
+    fill_watch(&mut h, "0x20000100", "4");
+    click(&mut h, "Add");
+    let w = Watchpoint {
+        start: 0x2000_0100,
+        len: 4,
+        kinds: WatchKinds {
+            write: true,
+            ..WatchKinds::default()
+        },
+    };
+    assert_eq!(h.state().backend().watchpoints(), [w]);
+    h.get_by_label("0x20000100..0x20000103 -W-");
+    click(&mut h, "Continue");
+    h.run_steps(3);
+    assert!(h.state().paused());
+    assert!(h.state().debug_open());
+    assert_eq!(
+        h.state().status(),
+        RunStatus::Watchpoint {
+            addr: 0x2000_0100,
+            dir: AccessDir::Write,
+            value: 0x2A,
+            pc: 0x1000_0200,
+        }
+    );
+    h.get_by_label("Watchpoint (write) at 0x20000100, pc 0x10000200");
+}
+
+#[test]
+fn add_appends_to_existing_watchpoints() {
+    let (mut h, _dir) = dock_on(FakeBackend::new(), "Watchpoints");
+    fill_watch(&mut h, "0x20000000", "#16");
+    click(&mut h, "R");
+    click(&mut h, "W");
+    click(&mut h, "Add");
+    fill_watch(&mut h, "0x10000200", "2");
+    click(&mut h, "R");
+    click(&mut h, "X");
+    click(&mut h, "Add");
+    let texts: Vec<String> = h
+        .state()
+        .backend()
+        .watchpoints()
+        .iter()
+        .map(watch_text)
+        .collect();
+    assert_eq!(
+        texts,
+        ["0x20000000..0x2000000f R--", "0x10000200..0x10000201 --X"]
+    );
+    h.get_by_label("0x20000000..0x2000000f R--");
+    h.get_by_label("0x10000200..0x10000201 --X");
+}
+
+#[test]
+fn invalid_watchpoint_is_refused() {
+    let (mut h, _dir) = dock_on(FakeBackend::new(), "Watchpoints");
+    // Length 0.
+    fill_watch(&mut h, "0x20000100", "0");
+    click(&mut h, "Add");
+    h.get_by_label("Invalid watchpoint");
+    assert!(h.state().backend().watchpoints().is_empty());
+    // Past the end of the address space; an edit first clears the message.
+    fill_watch(&mut h, "0xffffffff", "2");
+    assert!(h.query_by_label("Invalid watchpoint").is_none());
+    click(&mut h, "Add");
+    h.get_by_label("Invalid watchpoint");
+    // Not an address, not a length.
+    fill_watch(&mut h, "zz", "4");
+    click(&mut h, "Add");
+    h.get_by_label("Invalid watchpoint");
+    fill_watch(&mut h, "0x20000100", "four");
+    click(&mut h, "Add");
+    h.get_by_label("Invalid watchpoint");
+    // No kind ticked.
+    fill_watch(&mut h, "0x20000100", "4");
+    click(&mut h, "W");
+    click(&mut h, "Add");
+    h.get_by_label("Invalid watchpoint");
+    assert!(h.state().backend().watchpoints().is_empty());
+    // Valid again.
+    click(&mut h, "W");
+    click(&mut h, "Add");
+    assert!(h.query_by_label("Invalid watchpoint").is_none());
+    assert_eq!(h.state().backend().watchpoints().len(), 1);
+}
+
+#[test]
+fn remove_and_remove_all_watchpoints() {
+    let mut fake = FakeBackend::new();
+    let kinds = WatchKinds {
+        read: true,
+        ..WatchKinds::default()
+    };
+    let ws: Vec<Watchpoint> = [0x2000_0000, 0x2000_0010, 0x2000_0020]
+        .into_iter()
+        .map(|start| Watchpoint {
+            start,
+            len: 4,
+            kinds,
+        })
+        .collect();
+    fake.set_watchpoints(ws.clone()).unwrap();
+    let (mut h, _dir) = dock_on(fake, "Watchpoints");
+    assert_eq!(h.get_all_by_label("Remove").count(), 3);
+    click_nth(&mut h, "Remove", 1);
+    assert_eq!(h.state().backend().watchpoints(), [ws[0], ws[2]]);
+    assert!(h.query_by_label("0x20000010..0x20000013 R--").is_none());
+    click(&mut h, "Remove all");
+    assert!(h.state().backend().watchpoints().is_empty());
+    h.get_by_label("No watchpoints");
+}
+
+#[test]
+fn watchpoint_edits_only_while_paused() {
+    let (mut h, _dir) = dock_on(FakeBackend::new(), "Watchpoints");
+    click(&mut h, "Continue");
+    fill_watch(&mut h, "0x20000000", "4");
+    click(&mut h, "Add");
+    assert!(h.state().backend().watchpoints().is_empty());
+    assert!(!h.state().paused());
+}
+
+#[test]
+fn watch_fields_take_keys_from_calculator() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = dock_on(fake, "Watchpoints");
+    set_field(&mut h, 0, "0x20000000");
+    set_field(&mut h, 1, "4");
+    press(&mut h, Key::Enter);
+    // Enter in a field adds the watchpoint and stays away from the calculator.
+    assert_eq!(h.state().backend().watchpoints().len(), 1);
+    assert!(probe.key_log().is_empty(), "{:?}", probe.key_log());
+}
+
+#[test]
+fn breakpoint_thumb_bit_is_dropped() {
+    let (mut h, _dir) = dock_on(FakeBackend::new(), "Breakpoints");
+    set_field(&mut h, 0, "0x10000301");
+    click(&mut h, "Add");
+    assert_eq!(h.state().backend().breakpoints(), [0x1000_0300]);
 }
