@@ -42,6 +42,21 @@ pub fn parse_addr(s: &str) -> Option<u32> {
     u32::from_str_radix(&digits, 16).ok()
 }
 
+/// Parses a register value: hex by the [`parse_addr`] rules, or decimal after a
+/// leading `#` (`#10` is 10; `_` separators are ignored, nothing may sit between `#`
+/// and the digits). `None` for anything else, including values above `u32::MAX`.
+pub fn parse_value(s: &str) -> Option<u32> {
+    let s = s.trim();
+    let Some(dec) = s.strip_prefix('#') else {
+        return parse_addr(s);
+    };
+    let digits: String = dec.chars().filter(|&c| c != '_').collect();
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// The debug dock's tabs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DebugTab {
@@ -120,6 +135,7 @@ pub struct DebugOutput {
 pub struct DebugPanel {
     tab: DebugTab,
     control: control::ControlState,
+    regs: regs::RegsState,
     disasm: disasm::DisasmState,
     memory: memory::MemoryState,
     uart: UartConsole,
@@ -209,11 +225,12 @@ impl DebugPanel {
             }
             DebugTab::Registers => {
                 // Scrolls instead of widening the panel past its cap.
-                let cpu = backend.cpu();
                 ScrollArea::both()
                     .id_salt("evo-regs-scroll")
                     .auto_shrink([false, false])
-                    .show(ui, |ui| regs::show(ui, &cpu));
+                    .show(ui, |ui| {
+                        regs::show(ui, &mut self.regs, backend, paused, &mut out.notes);
+                    });
             }
             DebugTab::Disassembly => disasm::show(ui, &mut self.disasm, backend),
             DebugTab::Memory => memory::show(ui, &mut self.memory, backend),

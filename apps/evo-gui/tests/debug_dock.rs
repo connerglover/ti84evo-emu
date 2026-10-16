@@ -1,16 +1,17 @@
-//! The debug dock: tab registry, run row and the Control tab, on `FakeBackend`.
+//! The debug dock: tab registry, run row, the Control tab and register editing, on
+//! `FakeBackend`.
 
 mod common;
 
 use common::{TempDir, harness_with, test_options};
-use egui::Key;
 use egui::accesskit::Role;
+use egui::{Key, Modifiers};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use evo_gui::app::{AppOptions, EvoApp};
 use evo_gui::backend::fake::FakeBackend;
 use evo_gui::backend::{Goal, RunStatus};
-use evo_gui::debug::{DebugTab, cycle_text};
+use evo_gui::debug::{DebugTab, cycle_text, parse_value};
 use evo_gui::platform::FakePlatform;
 
 /// Every tab label, in selector order.
@@ -219,4 +220,169 @@ fn mark_resets_since_mark() {
     click(&mut h, "Step");
     h.get_by_label("Cycles 3");
     h.get_by_label("Since mark 1");
+}
+
+#[test]
+fn parse_value_cases() {
+    // Hex follows `parse_addr`.
+    assert_eq!(parse_value("0x20001000"), Some(0x2000_1000));
+    assert_eq!(parse_value("  ff "), Some(0xff));
+    assert_eq!(parse_value("0XDEAD_BEEF"), Some(0xdead_beef));
+    assert_eq!(parse_value("ffffffff"), Some(u32::MAX));
+    assert_eq!(parse_value("100000000"), None);
+    // A leading `#` is decimal.
+    assert_eq!(parse_value("#10"), Some(10));
+    assert_eq!(parse_value(" #4294967295 "), Some(u32::MAX));
+    assert_eq!(parse_value("#1_000"), Some(1000));
+    assert_eq!(parse_value("#0"), Some(0));
+    for bad in [
+        "",
+        "   ",
+        "0x",
+        "zz",
+        "-1",
+        "+1",
+        "1 2",
+        "#",
+        "#4294967296",
+        "#ff",
+        "#-1",
+        "#+1",
+        "##1",
+        "#0x10",
+        "# 1",
+    ] {
+        assert_eq!(parse_value(bad), None, "{bad:?}");
+    }
+}
+
+/// Opens the Registers tab and clicks the value `value`, which opens its edit field.
+fn open_edit(h: &mut Harness<'static, EvoApp>, value: &str) {
+    click(h, "Registers");
+    click(h, value);
+}
+
+/// Replaces the open edit field's text with `text`.
+fn retype(h: &mut Harness<'static, EvoApp>, text: &str) {
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.run_steps(2);
+    h.get_by_role(Role::TextInput).type_text(text);
+    h.run_steps(2);
+}
+
+fn press(h: &mut Harness<'static, EvoApp>, key: Key) {
+    h.key_press(key);
+    h.run_steps(3);
+}
+
+#[test]
+fn edit_sp_applies() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = dock(fake);
+    open_edit(&mut h, "0x20008000");
+    let value = h.get_by_role(Role::TextInput).value();
+    assert_eq!(value.as_deref(), Some("0x20008000"));
+    retype(&mut h, "0x20001000");
+    press(&mut h, Key::Enter);
+    assert!(h.query_by_role(Role::TextInput).is_none());
+    h.get_by_label("0x20001000");
+    assert!(h.query_by_label("0x20008000").is_none());
+    assert!(h.state().paused());
+    // The field had the keyboard: no calculator key was pressed.
+    assert!(probe.key_log().is_empty(), "{:?}", probe.key_log());
+}
+
+#[test]
+fn edit_xpsr_takes_decimal() {
+    let (mut h, _dir) = dock(FakeBackend::new());
+    open_edit(&mut h, "0x01000000");
+    retype(&mut h, "#16");
+    press(&mut h, Key::Enter);
+    h.get_by_label("0x00000010");
+    assert!(h.query_by_label("0x01000000").is_none());
+}
+
+#[test]
+fn edit_banked_applies() {
+    let (mut h, _dir) = dock(FakeBackend::new());
+    // msp_ns resets to 0x20093000 in the fake.
+    open_edit(&mut h, "0x20093000");
+    retype(&mut h, "0x20090000");
+    press(&mut h, Key::Enter);
+    assert!(h.query_by_role(Role::TextInput).is_none());
+    h.get_by_label("0x20090000");
+    assert!(h.query_by_label("0x20093000").is_none());
+    // msp_s is untouched.
+    h.get_by_label("0x30000800");
+}
+
+#[test]
+fn unparsable_value_keeps_field() {
+    let (mut h, _dir) = dock(FakeBackend::new());
+    open_edit(&mut h, "0x20008000");
+    retype(&mut h, "zz");
+    press(&mut h, Key::Enter);
+    h.get_by_label("Not a value");
+    let value = h.get_by_role(Role::TextInput).value();
+    assert_eq!(value.as_deref(), Some("zz"));
+    // The field keeps the keyboard, so a fix can be typed at once.
+    retype(&mut h, "0x20002000");
+    assert!(h.query_by_label("Not a value").is_none());
+    press(&mut h, Key::Enter);
+    assert!(h.query_by_role(Role::TextInput).is_none());
+    h.get_by_label("0x20002000");
+}
+
+#[test]
+fn unparsable_then_escape_leaves_register() {
+    let (mut h, _dir) = dock(FakeBackend::new());
+    open_edit(&mut h, "0x20008000");
+    retype(&mut h, "zz");
+    press(&mut h, Key::Enter);
+    h.get_by_label("Not a value");
+    press(&mut h, Key::Escape);
+    assert!(h.query_by_role(Role::TextInput).is_none());
+    assert!(h.query_by_label("Not a value").is_none());
+    h.get_by_label("0x20008000");
+}
+
+#[test]
+fn escape_cancels_edit() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = dock(fake);
+    open_edit(&mut h, "0x20008000");
+    retype(&mut h, "0x20001000");
+    press(&mut h, Key::Escape);
+    assert!(h.query_by_role(Role::TextInput).is_none());
+    h.get_by_label("0x20008000");
+    assert!(h.query_by_label("0x20001000").is_none());
+    // Escape is the calculator's CLEAR; the field kept it.
+    assert!(probe.key_log().is_empty(), "{:?}", probe.key_log());
+}
+
+#[test]
+fn no_edit_while_running() {
+    let (mut h, _dir) = dock(FakeBackend::new());
+    click(&mut h, "Registers");
+    click(&mut h, "Continue");
+    click(&mut h, "0x20008000");
+    assert!(h.query_by_role(Role::TextInput).is_none());
+    click(&mut h, "Pause");
+    click(&mut h, "0x20008000");
+    assert!(h.query_by_role(Role::TextInput).is_some());
+}
+
+#[test]
+fn edit_closes_when_run_starts() {
+    let (mut h, _dir) = dock(FakeBackend::new());
+    open_edit(&mut h, "0x20008000");
+    retype(&mut h, "0x20001000");
+    click(&mut h, "Continue");
+    assert!(h.query_by_role(Role::TextInput).is_none());
+    h.get_by_label("0x20008000");
+    click(&mut h, "Pause");
+    // The cancelled edit does not come back.
+    assert!(h.query_by_role(Role::TextInput).is_none());
 }
