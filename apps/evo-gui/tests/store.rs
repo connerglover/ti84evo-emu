@@ -275,6 +275,7 @@ fn group_and_action_tables() {
     assert_eq!(
         by_group(Files),
         [
+            "USB tools\u{2026}",
             "Import RAM image\u{2026}",
             "Export RAM image\u{2026}",
             "Import calculator state\u{2026}",

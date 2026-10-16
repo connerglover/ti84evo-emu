@@ -28,6 +28,9 @@ OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 Apache License 2.0 (Apache-2.0)
 
 Used by:
+  ciborium 0.2.2
+  ciborium-io 0.2.2
+  ciborium-ll 0.2.2
   ring 0.17.14
 
 

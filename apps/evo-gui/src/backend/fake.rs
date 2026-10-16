@@ -48,6 +48,7 @@ const UART_PERIOD: u64 = 100_000_000;
 
 #[derive(Default)]
 struct Shared {
+    usb_calls: Vec<String>,
     cycles: u64,
     held: BTreeSet<KeyId>,
     key_log: Vec<(KeyId, bool)>,
@@ -82,6 +83,9 @@ fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
 pub struct FakeProbe(Arc<Mutex<Shared>>);
 
 impl FakeProbe {
+    pub fn usb_calls(&self) -> Vec<String> {
+        lock(&self.0).usb_calls.clone()
+    }
     /// Keys currently held, in `KeyId` order.
     pub fn held(&self) -> Vec<KeyId> {
         lock(&self.0).held.iter().copied().collect()
@@ -161,6 +165,9 @@ struct SavedState {
 /// A fake machine: cycles advance as asked, the screen shows the held keys and
 /// a cycle bar, and the UART prints a line every 100 Mcycles.
 pub struct FakeBackend {
+    persist_fails: bool,
+    usb_results: Option<VecDeque<Result<crate::connect::types::UsbResult, String>>>,
+    usb_gate: Option<Receiver<()>>,
     shared: Arc<Mutex<Shared>>,
     display: Display,
     frame: Frame,
@@ -199,8 +206,31 @@ impl Default for FakeBackend {
 }
 
 impl FakeBackend {
+    pub fn failing_persist(mut self) -> Self {
+        self.persist_fails = true;
+        self
+    }
+    /// Scripted USB is opt-in; the ordinary demonstration backend has none.
+    pub fn with_usb_results(
+        mut self,
+        results: Vec<Result<crate::connect::types::UsbResult, String>>,
+    ) -> Self {
+        self.usb_results = Some(results.into());
+        self
+    }
+
+    /// Holds a scripted transfer until released, while still responding to cancellation.
+    pub fn usb_gate(&mut self) -> Sender<()> {
+        let (tx, rx) = channel();
+        self.usb_gate = Some(rx);
+        tx
+    }
+
     pub fn new() -> Self {
         Self {
+            persist_fails: false,
+            usb_results: None,
+            usb_gate: None,
             shared: Arc::new(Mutex::new(Shared::default())),
             display: Display::Rendered,
             frame: Frame {
@@ -504,7 +534,11 @@ impl EmuBackend for FakeBackend {
     fn persist(&mut self) -> Result<(), BackendError> {
         let mut s = self.shared();
         s.persists = s.persists.saturating_add(1);
-        Ok(())
+        if self.persist_fails {
+            Err(BackendError::Persist("scripted disk error".into()))
+        } else {
+            Ok(())
+        }
     }
 
     fn needs_provision(&self) -> bool {
@@ -529,6 +563,47 @@ impl EmuBackend for FakeBackend {
         s.cycles = 0;
         s.held.clear();
         Ok(())
+    }
+
+    fn usb_available(&self) -> bool {
+        self.usb_results.is_some()
+    }
+    fn usb(
+        &mut self,
+        operation: crate::connect::types::UsbOperation,
+        progress: &mut dyn FnMut(crate::connect::types::UsbProgress) -> bool,
+    ) -> Result<crate::connect::types::UsbResult, BackendError> {
+        if self.usb_results.is_none() {
+            return Err(BackendError::Unsupported(
+                "USB in the demonstration calculator",
+            ));
+        }
+        self.shared().usb_calls.push(operation.label().into());
+        loop {
+            if !progress(crate::connect::types::UsbProgress {
+                phase: "Transferring".into(),
+                transferred: 1,
+                total: Some(2),
+                detail: None,
+            }) {
+                return Err(BackendError::Invalid("transfer cancelled".into()));
+            }
+            if let Some(gate) = &self.usb_gate {
+                match gate.recv_timeout(std::time::Duration::from_millis(5)) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    _ => break,
+                }
+            } else {
+                break;
+            }
+        }
+        self.advance(1234);
+        self.usb_results
+            .as_mut()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| Err("No scripted USB response".into()))
+            .map_err(BackendError::Invalid)
     }
 
     fn cpu(&self) -> CpuView {

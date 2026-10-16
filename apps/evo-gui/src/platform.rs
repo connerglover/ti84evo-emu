@@ -35,6 +35,9 @@ pub struct FileFilter {
 pub trait Platform: Send + Sync + fmt::Debug {
     /// Asks for a file to open; `None` when the user cancels.
     fn pick_open(&self, title: &str, filters: &[FileFilter]) -> Option<PathBuf>;
+    fn pick_open_many(&self, title: &str, filters: &[FileFilter]) -> Vec<PathBuf>;
+    /// Chooses a folder for a batch of received calculator files.
+    fn pick_folder(&self, title: &str) -> Option<PathBuf>;
     /// Asks for a file to save to; `None` when the user cancels.
     fn pick_save(&self, title: &str, default_name: &str, filters: &[FileFilter])
     -> Option<PathBuf>;
@@ -47,6 +50,8 @@ pub trait Platform: Send + Sync + fmt::Debug {
     /// Fetches `url` as text. Blocking: call it from a worker thread. A non-2xx reply is
     /// `Err("HTTP {code}")`.
     fn http_get(&self, url: &str) -> Result<String, String>;
+    /// Bounded binary download; an oversized body is an error, never a truncated success.
+    fn http_get_bytes(&self, url: &str, limit: usize) -> Result<Vec<u8>, String>;
     /// Starts the current executable again with `args`.
     fn spawn_instance(&self, args: &[String]) -> Result<(), String>;
 }
@@ -73,6 +78,27 @@ fn dialog(title: &str, filters: &[FileFilter]) -> rfd::FileDialog {
 }
 
 impl Platform for DesktopPlatform {
+    fn pick_open_many(&self, title: &str, filters: &[FileFilter]) -> Vec<PathBuf> {
+        dialog(title, filters).pick_files().unwrap_or_default()
+    }
+
+    fn http_get_bytes(&self, url: &str, limit: usize) -> Result<Vec<u8>, String> {
+        let mut response = update_agent().get(url).call().map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        response
+            .body_mut()
+            .as_reader()
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > limit {
+            return Err(format!("Download exceeds the {} byte limit", limit));
+        }
+        Ok(bytes)
+    }
+    fn pick_folder(&self, title: &str) -> Option<PathBuf> {
+        rfd::FileDialog::new().set_title(title).pick_folder()
+    }
     fn pick_open(&self, title: &str, filters: &[FileFilter]) -> Option<PathBuf> {
         dialog(title, filters).pick_file()
     }
@@ -157,6 +183,8 @@ impl fmt::Debug for FakeFactory {
 
 #[derive(Debug, Default)]
 struct FakeState {
+    binary_http: std::collections::BTreeMap<String, Result<Vec<u8>, String>>,
+    open_many_answers: VecDeque<Vec<PathBuf>>,
     open_answers: VecDeque<Option<PathBuf>>,
     save_answers: VecDeque<Option<PathBuf>>,
     http: Option<Result<String, String>>,
@@ -177,6 +205,12 @@ pub struct FakePlatform {
 }
 
 impl FakePlatform {
+    pub fn queue_open_many(&self, paths: Vec<PathBuf>) {
+        self.state().open_many_answers.push_back(paths);
+    }
+    pub fn set_http_bytes(&self, url: &str, reply: Result<Vec<u8>, String>) {
+        self.state().binary_http.insert(url.into(), reply);
+    }
     /// A new fake; `.clone()` of the result coerces to [`PlatformRef`].
     pub fn shared() -> Arc<FakePlatform> {
         Arc::new(Self::default())
@@ -239,6 +273,28 @@ impl FakePlatform {
 }
 
 impl Platform for FakePlatform {
+    fn pick_open_many(&self, title: &str, _filters: &[FileFilter]) -> Vec<PathBuf> {
+        let mut s = self.state();
+        s.asked.push(title.into());
+        s.open_many_answers.pop_front().unwrap_or_default()
+    }
+    fn http_get_bytes(&self, url: &str, limit: usize) -> Result<Vec<u8>, String> {
+        let bytes = self
+            .state()
+            .binary_http
+            .get(url)
+            .cloned()
+            .unwrap_or_else(|| Err("offline".into()))?;
+        if bytes.len() > limit {
+            return Err("Download exceeds byte limit".into());
+        }
+        Ok(bytes)
+    }
+    fn pick_folder(&self, title: &str) -> Option<PathBuf> {
+        let mut s = self.state();
+        s.asked.push(title.to_owned());
+        s.open_answers.pop_front().flatten()
+    }
     fn pick_open(&self, title: &str, _filters: &[FileFilter]) -> Option<PathBuf> {
         let mut s = self.state();
         s.asked.push(title.to_owned());

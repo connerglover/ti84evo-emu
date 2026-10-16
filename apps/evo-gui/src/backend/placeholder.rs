@@ -76,6 +76,16 @@ impl EmuBackend for Placeholder {
     fn provision(&mut self) -> Result<(), BackendError> {
         Err(BackendError::Unsupported("provisioning without a machine"))
     }
+    fn usb_available(&self) -> bool {
+        false
+    }
+    fn usb(
+        &mut self,
+        _: crate::connect::types::UsbOperation,
+        _: &mut dyn FnMut(crate::connect::types::UsbProgress) -> bool,
+    ) -> Result<crate::connect::types::UsbResult, BackendError> {
+        Err(BackendError::Unsupported("USB without a calculator"))
+    }
     fn cpu(&self) -> CpuView {
         CpuView::default()
     }

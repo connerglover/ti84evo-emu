@@ -29,6 +29,9 @@ use crate::backend::{
     HardwareView, HwChange, KeyEvent, MemRegion, RegRow, RunStatus, UartId, UnmappedRow,
     WatchKinds, Watchpoint,
 };
+use crate::connect::types::{
+    CalculatorFile, CsvTarget, ReceivedFile, SendOptions, UsbOperation, UsbProgress, UsbResult,
+};
 use crate::keypad::KeyId;
 
 /// Why a bundle could not be opened.
@@ -130,6 +133,540 @@ const PIN_CHARGER: u8 = 9;
 const PIN_BATTERY: u8 = 11;
 /// Seconds in a day: the RTC counts seconds of day below it.
 const DAY_SECONDS: u32 = 86_400;
+
+fn usb_error(error: impl std::fmt::Display) -> BackendError {
+    BackendError::Invalid(error.to_string())
+}
+
+/// URI values use UTF-8 percent encoding; calculator names are token code points.
+fn uri_value(value: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            write!(out, "%{byte:02X}").expect("writing into a String");
+        }
+    }
+    out
+}
+
+fn variable_uri(path: &str, token: &str, kind: u32) -> Result<String, BackendError> {
+    if token.is_empty() || !token.len().is_multiple_of(4) || !token.is_ascii() {
+        return Err(usb_error("Invalid calculator token name"));
+    }
+    let mut name = String::new();
+    for word in token.as_bytes().as_chunks::<4>().0 {
+        let text = std::str::from_utf8(word).map_err(usb_error)?;
+        let value = u32::from_str_radix(text, 16).map_err(usb_error)?;
+        name.push(char::from_u32(value).ok_or_else(|| usb_error("Invalid calculator token"))?);
+    }
+    Ok(format!(
+        "hh01/{path}/var?name={}&type={kind}",
+        uri_value(&name)
+    ))
+}
+
+fn calculator_file(v: evo_core::connect_files::Variable) -> CalculatorFile {
+    CalculatorFile {
+        name: v.name,
+        token_name: v.token_name,
+        kind: v.kind,
+        size: v.size,
+        archived: v.archived,
+        extension: v.extension,
+    }
+}
+
+fn prepare_send(
+    filename: &str,
+    bytes: &[u8],
+    options: &SendOptions,
+) -> Result<Vec<evo_core::connect_files::VariableFile>, BackendError> {
+    use evo_core::connect_files as files;
+    let path = Path::new(filename);
+    let extension = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let name = if options.name.trim().is_empty() {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("PROGRAM")
+    } else {
+        options.name.trim()
+    };
+    let file = match extension.as_str() {
+        "py" => files::encode_python(name, bytes, options.archived).map_err(usb_error)?,
+        "png" => {
+            let mut reader = image::ImageReader::with_format(
+                std::io::Cursor::new(bytes),
+                image::ImageFormat::Png,
+            );
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(8192);
+            limits.max_image_height = Some(8192);
+            limits.max_alloc = Some(64 * 1024 * 1024);
+            reader.limits(limits);
+            let image = reader.decode().map_err(usb_error)?;
+            let fitted = image
+                .resize(160, 105, image::imageops::FilterType::Nearest)
+                .to_rgba8();
+            let mut rgba =
+                image::RgbaImage::from_pixel(160, 105, image::Rgba([255, 255, 255, 255]));
+            image::imageops::overlay(
+                &mut rgba,
+                &fitted,
+                i64::from((160 - fitted.width()) / 2),
+                i64::from((105 - fitted.height()) / 2),
+            );
+            files::encode_image(options.image_slot, rgba.as_raw()).map_err(usb_error)?
+        }
+        "csv" => {
+            let csv = std::str::from_utf8(bytes).map_err(usb_error)?;
+            let mode = match options.csv_target {
+                CsvTarget::Lists => files::CsvMode::Lists {
+                    names: options
+                        .name
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                },
+                CsvTarget::Matrix => files::CsvMode::Matrix {
+                    name: if options.name.trim().is_empty() {
+                        "A".into()
+                    } else {
+                        options.name.trim().into()
+                    },
+                    rows: 0,
+                    columns: 0,
+                },
+            };
+            return files::encode_csv(csv, mode, options.archived).map_err(usb_error);
+        }
+        _ => {
+            let kind = files::decode_variable(bytes)
+                .map_err(usb_error)?
+                .variable
+                .kind;
+            let archived = match kind {
+                4 | 5 | 9 | 11 | 18 => true,
+                7 | 12 | 13 | 14 => false,
+                _ => options.archived,
+            };
+            files::prepare_native(
+                bytes,
+                (!options.name.trim().is_empty()).then_some(options.name.trim()),
+                Some(archived),
+            )
+            .map_err(usb_error)?
+        }
+    };
+    Ok(vec![file])
+}
+
+/// The OS can enumerate USB before its initial home screen is ready. Retry only
+/// read requests explicitly rejected as busy; uploads may already have mutated data.
+fn get_ready(
+    connection: &mut evo_core::connect::Connect<'_>,
+    uri: &str,
+) -> Result<Vec<u8>, evo_core::connect::ConnectError> {
+    for attempt in 0..20 {
+        match connection.get(uri) {
+            Err(evo_core::connect::ConnectError::Remote(message))
+                if message == "BZ" && attempt < 19 =>
+            {
+                connection.advance(evo_core::CPU_HZ / 4)?;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final attempt always returns")
+}
+
+fn run_usb(
+    machine: &mut Machine,
+    operation: UsbOperation,
+    progress: &mut dyn FnMut(UsbProgress) -> bool,
+) -> Result<UsbResult, BackendError> {
+    use evo_core::connect::{Connect, ConnectError, Phase};
+    use evo_core::connect_files as files;
+    use std::ops::ControlFlow;
+    // Decode host files before attaching, so invalid input never changes guest state.
+    let prepared = match &operation {
+        UsbOperation::Send {
+            filename,
+            bytes,
+            options,
+        } => Some(
+            prepare_send(filename, bytes, options)?
+                .into_iter()
+                .map(|file| (file, options.overwrite))
+                .collect::<Vec<_>>(),
+        ),
+        UsbOperation::SendMany(uploads) => {
+            let mut prepared = Vec::new();
+            for upload in uploads {
+                let files = prepare_send(&upload.filename, &upload.bytes, &upload.options)
+                    .map_err(|error| usb_error(format!("{}: {error}", upload.filename)))?;
+                prepared.extend(
+                    files
+                        .into_iter()
+                        .map(|file| (file, upload.options.overwrite)),
+                );
+            }
+            Some(prepared)
+        }
+        _ => None,
+    };
+    let bundle = match &operation {
+        UsbOperation::InstallOs(bytes) => Some(Bundle::from_bytes(bytes).map_err(usb_error)?),
+        _ => None,
+    };
+    let mut callback = |p: evo_core::connect::Progress| {
+        let phase = match p.phase {
+            Phase::Connecting => "Connecting",
+            Phase::Sending => "Sending",
+            Phase::Receiving => "Receiving",
+            Phase::Finishing => "Finishing",
+        }
+        .into();
+        if progress(UsbProgress {
+            phase,
+            transferred: p.transferred,
+            total: p.total,
+            detail: p.detail,
+        }) {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
+        }
+    };
+    let mut connection = Connect::new(machine, &mut callback).map_err(usb_error)?;
+    let result = (|| {
+        match operation {
+            UsbOperation::Refresh => {
+                let directory =
+                    get_ready(&mut connection, "hh01/inf/res?name=directory&gotohome=1")
+                        .map_err(usb_error)?;
+                let attributes =
+                    get_ready(&mut connection, "hh01/sys/attributes").map_err(usb_error)?;
+                let dynamic = get_ready(&mut connection, "hh01/inf/res?name=dynamicinfo")
+                    .map_err(usb_error)?;
+                let info = serde_json::json!({"attributes": files::parse_info(&attributes).map_err(usb_error)?, "status": files::parse_info(&dynamic).map_err(usb_error)?});
+                Ok(UsbResult::Directory {
+                    files: files::parse_directory(&directory)
+                        .map_err(usb_error)?
+                        .into_iter()
+                        .map(calculator_file)
+                        .collect(),
+                    info: device_summary(&info)?,
+                })
+            }
+            UsbOperation::DeviceInfo => {
+                let attributes =
+                    get_ready(&mut connection, "hh01/sys/attributes").map_err(usb_error)?;
+                let dynamic = get_ready(&mut connection, "hh01/inf/res?name=dynamicinfo")
+                    .map_err(usb_error)?;
+                let info = serde_json::json!({"attributes": files::parse_info(&attributes).map_err(usb_error)?, "status": files::parse_info(&dynamic).map_err(usb_error)?});
+                Ok(UsbResult::Text(device_summary(&info)?))
+            }
+            UsbOperation::Receive(selected) => {
+                let mut received = Vec::new();
+                let total = selected.len();
+                for file in selected {
+                    let result = (|| {
+                        let bytes = get_ready(
+                            &mut connection,
+                            &variable_uri("xfr", &file.token_name, file.kind)?,
+                        )
+                        .map_err(usb_error)?;
+                        let (name, bytes) = files::export_variable(&bytes).map_err(usb_error)?;
+                        Ok::<_, BackendError>(ReceivedFile { name, bytes })
+                    })();
+                    match result {
+                        Ok(file) => received.push(file),
+                        Err(error) => {
+                            return Ok(UsbResult::Batch {
+                                message: format!(
+                                    "Received {} of {total} files; remaining files were not received",
+                                    received.len()
+                                ),
+                                errors: vec![format!("{}: {error}", file.name)],
+                                files: received,
+                            });
+                        }
+                    }
+                }
+                Ok(UsbResult::Files(received))
+            }
+            UsbOperation::Send { .. } | UsbOperation::SendMany(_) => {
+                let prepared = prepared.expect("Send was prepared before connection");
+                for (index, (file, overwrite)) in prepared.iter().enumerate() {
+                    // CSV uses an ASCII conversion envelope; its header supplies name/type.
+                    let uri = format!(
+                        "hh01/xfr/var?memtarget={}&policy={}",
+                        u8::from(file.variable.archived),
+                        u8::from(*overwrite)
+                    );
+                    if let Err(error) = connection.put(&uri, &file.bytes) {
+                        return Ok(UsbResult::Batch {
+                            files: Vec::new(),
+                            errors: vec![format!("{}: {error}", file.variable.name)],
+                            message: format!(
+                                "Sent {index} of {} files; later files were not sent",
+                                prepared.len()
+                            ),
+                        });
+                    }
+                }
+                Ok(UsbResult::Done(format!("Sent {} file(s)", prepared.len())))
+            }
+            UsbOperation::Delete(selected) => {
+                for (index, file) in selected.iter().enumerate() {
+                    if let Err(error) =
+                        connection.put(&variable_uri("del", &file.token_name, file.kind)?, &[0])
+                    {
+                        return Ok(UsbResult::Batch {
+                            files: Vec::new(),
+                            errors: vec![format!("{}: {error}", file.name)],
+                            message: format!(
+                                "Deleted {index} of {} files; later files were not deleted",
+                                selected.len()
+                            ),
+                        });
+                    }
+                }
+                Ok(UsbResult::Done(format!(
+                    "Deleted {} file(s)",
+                    selected.len()
+                )))
+            }
+            UsbOperation::Screen => {
+                let bytes = get_ready(&mut connection, "hh01/sys/screen").map_err(usb_error)?;
+                Ok(UsbResult::Screen(Frame {
+                    width: 320,
+                    height: 240,
+                    rgba: files::decode_screen(&bytes).map_err(usb_error)?,
+                }))
+            }
+            UsbOperation::ExitExam => {
+                let info = files::parse_info(
+                    &get_ready(&mut connection, "hh01/inf/res?name=dynamicinfo")
+                        .map_err(usb_error)?,
+                )
+                .map_err(usb_error)?;
+                if !exam_enabled(&info)? {
+                    return Ok(UsbResult::Done(
+                        "Calculator is already out of exam mode".into(),
+                    ));
+                }
+                match connection.put("hh01/xfr/var?policy=4", b"x") {
+                    Ok(()) => (),
+                    Err(ConnectError::Remote(message)) if message == "DI" => (),
+                    Err(error) => return Err(usb_error(error)),
+                }
+                connection
+                    .advance(evo_core::CPU_HZ * 5)
+                    .map_err(usb_error)?;
+                let info = files::parse_info(
+                    &get_ready(&mut connection, "hh01/inf/res?name=dynamicinfo")
+                        .map_err(usb_error)?,
+                )
+                .map_err(usb_error)?;
+                if exam_enabled(&info)? {
+                    return Err(usb_error("Calculator remains in exam mode"));
+                }
+                Ok(UsbResult::Done("Calculator exited exam mode".into()))
+            }
+            UsbOperation::InstallOs(_) => {
+                let bundle = bundle.expect("OS bundle was parsed before connection");
+                let uri = format!(
+                    "hh01/upd/pkg?bundle=1&prodnum={}&version={}",
+                    bundle.metadata.prodid,
+                    uri_value(&bundle.metadata.build_version)
+                );
+                connection
+                    .put(&uri, &bundle.package.bytes)
+                    .map_err(usb_error)?;
+                Ok(UsbResult::Done(
+                "OS package transferred. Reset the calculator to activate the installed update."
+                    .into(),
+            ))
+            }
+            UsbOperation::GetResource(uri) => {
+                validate_resource(&uri)?;
+                Ok(UsbResult::Bytes(
+                    get_ready(&mut connection, &uri).map_err(usb_error)?,
+                ))
+            }
+            UsbOperation::PutResource { uri, bytes } => {
+                validate_resource(&uri)?;
+                connection.put(&uri, &bytes).map_err(usb_error)?;
+                Ok(UsbResult::Done("Resource written".into()))
+            }
+            UsbOperation::Logs => {
+                let info =
+                    get_ready(&mut connection, "hh01/dbg/Get Event Info").map_err(usb_error)?;
+                let events =
+                    get_ready(&mut connection, "hh01/dbg/Get Events").map_err(usb_error)?;
+                Ok(UsbResult::Files(vec![
+                    ReceivedFile {
+                        name: "info.bin".into(),
+                        bytes: info,
+                    },
+                    ReceivedFile {
+                        name: "events.bin".into(),
+                        bytes: events,
+                    },
+                ]))
+            }
+            UsbOperation::DebugMessage(message) => {
+                if message.is_empty() {
+                    return Err(usb_error("Enter a debug message"));
+                }
+                let uri = format!("hh01/dbg/{message}");
+                validate_resource(&uri)?;
+                connection.put(&uri, b"x").map_err(usb_error)?;
+                Ok(UsbResult::Done("Debug message sent".into()))
+            }
+        }
+    })();
+    let cleanup = connection.finish().map_err(usb_error);
+    match (result, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(UsbResult::Files(files)), Err(error)) => Ok(UsbResult::Batch {
+            files,
+            errors: vec![error.to_string()],
+            message: "Files received, but calculator disconnect did not finish normally".into(),
+        }),
+        (
+            Ok(UsbResult::Batch {
+                files,
+                mut errors,
+                message,
+            }),
+            Err(error),
+        ) => {
+            errors.push(error.to_string());
+            Ok(UsbResult::Batch {
+                files,
+                errors,
+                message,
+            })
+        }
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(result), Ok(())) => Ok(result),
+    }
+}
+
+fn device_summary(info: &serde_json::Value) -> Result<String, BackendError> {
+    let attributes = &info["attributes"];
+    let status = &info["status"];
+    let text = |value: &serde_json::Value| {
+        value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.to_string())
+    };
+    // These are firmware CBOR keys, before the official JS library renames them.
+    let version = attributes["pkg-version"].as_str().unwrap_or("Unknown");
+    let exam = exam_enabled(status)
+        .map(|active| if active { "On" } else { "Off" })
+        .unwrap_or("Unknown");
+    Ok(format!(
+        "OS version: {version}\nSerial number: {}\nFree RAM: {} bytes\nFree archive: {} bytes\nExam mode: {exam}\n\nDevice details\n{}",
+        text(&attributes["id"]),
+        text(&status["ram"]),
+        text(&status["archive"]),
+        serde_json::to_string_pretty(info).map_err(usb_error)?
+    ))
+}
+
+fn validate_resource(uri: &str) -> Result<(), BackendError> {
+    if !uri.starts_with("hh01/") || uri.len() > 2048 || uri.chars().any(char::is_control) {
+        return Err(usb_error(
+            "Resource must start with hh01/ and contain no control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn exam_enabled(info: &serde_json::Value) -> Result<bool, BackendError> {
+    for key in ["p2t", "ptt"] {
+        if let serde_json::Value::Bool(value) = &info[key] {
+            return Ok(*value);
+        }
+        if let Some(value) = info[key].as_str() {
+            if value == "true" {
+                return Ok(true);
+            }
+            if value == "false" {
+                return Ok(false);
+            }
+        }
+    }
+    Err(usb_error("Calculator did not report its exam-mode state"))
+}
+
+#[cfg(test)]
+mod usb_adapter_tests {
+    use super::*;
+
+    #[test]
+    fn token_query_uses_unicode_not_hex_text() {
+        assert_eq!(
+            variable_uri("xfr", "E830", 1).unwrap(),
+            "hh01/xfr/var?name=%EE%A0%B0&type=1"
+        );
+        assert!(variable_uri("xfr", "E830&policy=1", 1).is_err());
+        assert!(variable_uri("xfr", "D800", 1).is_err());
+        assert_eq!(uri_value("a&b=?"), "a%26b%3D%3F");
+    }
+
+    #[test]
+    fn png_dimensions_are_limited_before_pixel_expansion() {
+        let mut png = Vec::new();
+        image::ImageEncoder::write_image(
+            image::codecs::png::PngEncoder::new(&mut png),
+            &vec![255; 9000 * 4],
+            9000,
+            1,
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+        assert!(
+            png.len() < 1000,
+            "compressed input is small despite its width"
+        );
+        let error = prepare_send("wide.png", &png, &SendOptions::default()).unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("limit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn archive_only_native_image_ignores_generic_ram_default() {
+        let image = evo_core::connect_files::encode_image(1, &vec![255; 160 * 105 * 4]).unwrap();
+        let prepared = prepare_send("Image1.8ca2", &image.bytes, &SendOptions::default()).unwrap();
+        assert_eq!(prepared.len(), 1);
+        assert!(prepared[0].variable.archived);
+    }
+
+    #[test]
+    fn information_uses_actual_firmware_attribute_names() {
+        let info = serde_json::json!({"attributes": {"pkg-version": "7.1.0.4421", "id": 1163284273u32}, "status": {"ram": 502100, "archive": 3107976, "ptt": false}});
+        let summary = device_summary(&info).unwrap();
+        assert!(summary.contains("OS version: 7.1.0.4421"));
+        assert!(summary.contains("Serial number: 1163284273"));
+        assert!(summary.contains("Exam mode: Off"));
+    }
+}
 
 /// The board conditions the host sets: they belong to the board, not the guest, so the
 /// backend keeps them and drives them again into every new machine (reset, flash import). A
@@ -451,6 +988,26 @@ impl EmuBackend for MachineBackend {
 
     fn needs_provision(&self) -> bool {
         self.fresh
+    }
+
+    fn usb_available(&self) -> bool {
+        !self.fresh
+    }
+
+    fn usb(
+        &mut self,
+        operation: UsbOperation,
+        progress: &mut dyn FnMut(UsbProgress) -> bool,
+    ) -> Result<UsbResult, BackendError> {
+        if self.fresh {
+            return Err(BackendError::Invalid(
+                "Finish calculator setup before using USB".into(),
+            ));
+        }
+        let result = run_usb(&mut self.machine, operation, progress);
+        // Connect owns cable transitions, including cleanup on failure/cancellation.
+        self.board = self.board.read(&self.machine);
+        result
     }
 
     fn provision(&mut self) -> Result<(), BackendError> {

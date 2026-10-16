@@ -37,9 +37,14 @@ cargo run --release -p evo-cli -- run <bundle.84b2> --gdb 3333   # attach arm-no
 `provision` uses the calculator's own engineering menu to switch a fresh unit from its
 factory self-test to the calculator OS, as a new unit leaves the factory.
 
-For TI Connect Evo file transfers and screenshots over emulated USB, see the
-[local USB adapter](tools/usb-connect/README.md). It runs the official communications
-library against the guest firmware and includes a browser interface.
+Open **Files → USB tools** in the desktop app for calculator files, Python programs,
+images, CSV lists/matrices, screenshots, exam exit, and OS updates. These native tools
+use the calculator already open in the app; no browser, Node installation, or physical
+cable is needed. The Developer tab includes resource inspection and diagnostics.
+See the [USB tools guide](docs/usb-tools.md).
+
+The [local USB adapter](tools/usb-connect/README.md) remains available for testing the
+official TI communications library against the emulator.
 
 ## Testing
 

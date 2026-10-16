@@ -5,6 +5,7 @@ mod mp4;
 mod sampler;
 
 pub use self::mp4::{Mp4Recorder, scale2x_rgb};
+pub(crate) use apng::encode_still;
 pub use apng::{APNG_MAX_FRAMES, ApngRecorder, CaptureError};
 pub use sampler::{FrameSampler, LCD_FRAME_CYCLES};
 

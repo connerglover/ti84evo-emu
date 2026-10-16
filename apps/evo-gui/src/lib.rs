@@ -5,6 +5,7 @@
 pub mod app;
 pub mod backend;
 pub mod capture;
+pub mod connect;
 pub mod debug;
 pub mod feature;
 pub mod features;

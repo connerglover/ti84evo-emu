@@ -137,7 +137,7 @@ fn delays(ticks: u64) -> impl Iterator<Item = u16> {
 }
 
 /// `frame` as a standalone RGBA 8-bit PNG.
-fn encode_still(frame: &Frame) -> Result<Vec<u8>, CaptureError> {
+pub(crate) fn encode_still(frame: &Frame) -> Result<Vec<u8>, CaptureError> {
     let mut out = Vec::new();
     let mut enc = png::Encoder::new(&mut out, frame.width, frame.height);
     enc.set_color(png::ColorType::Rgba);

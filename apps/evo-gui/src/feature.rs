@@ -42,6 +42,8 @@ pub struct FeatureCtx<'a> {
 
 /// A change a feature asks the app to make.
 pub enum AppRequest {
+    /// Lends the running calculator to an exclusive USB worker.
+    Usb(crate::connect::types::UsbTask),
     /// Releases every key and forgets the last stop status, as after a state load.
     Resync,
     /// Writes flash to disk.
@@ -70,6 +72,7 @@ pub enum AppRequest {
 impl std::fmt::Debug for AppRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            AppRequest::Usb(task) => f.debug_tuple("Usb").field(&task.operation.label()).finish(),
             AppRequest::Resync => f.write_str("Resync"),
             AppRequest::Persist => f.write_str("Persist"),
             AppRequest::Reset => f.write_str("Reset"),

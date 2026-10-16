@@ -92,6 +92,7 @@ impl Group {
 /// Something the user can do from the sidebar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
+    UsbTools,
     Reset,
     Reprovision,
     ReloadRom,
@@ -132,7 +133,8 @@ pub enum Action {
 
 impl Action {
     /// Every action, in popover order.
-    pub const ALL: [Action; 39] = [
+    pub const ALL: [Action; 40] = [
+        Action::UsbTools,
         Action::Reset,
         Action::Reprovision,
         Action::ReloadRom,
@@ -178,6 +180,7 @@ impl Action {
     pub fn group(self) -> Group {
         use Action::*;
         match self {
+            UsbTools => Group::Files,
             Reset | Reprovision | ReloadRom | ChangeRom | SaveState | LoadState | TogglePause
             | Speed(_) => Group::Calculator,
             Screenshot | CopyScreen | RecordApng | RecordVideo => Group::Capture,
@@ -196,6 +199,7 @@ impl Action {
     pub fn label(self) -> &'static str {
         use Action::*;
         match self {
+            UsbTools => "USB tools…",
             Reset => "Reset",
             Reprovision => "Re-provision",
             ReloadRom => "Reload ROM",

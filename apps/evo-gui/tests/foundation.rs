@@ -228,7 +228,7 @@ fn has_button(h: &Harness<'static, EvoApp>, label: &str) -> bool {
 
 #[test]
 fn group_and_action_tables() {
-    assert_eq!(Action::ALL.len(), 39);
+    assert_eq!(Action::ALL.len(), 40);
     let labels: HashSet<&str> = Action::ALL.iter().map(|a| a.label()).collect();
     assert_eq!(labels.len(), Action::ALL.len(), "labels are unique");
     for g in Group::ALL {
@@ -714,7 +714,7 @@ fn features_are_reachable() {
     let (mut h, _dir) = request_harness("reachable", FakeBackend::new(), true);
     assert_eq!(h.state().features().rom.page(), None);
     assert_eq!(h.state().features().capture.recording(), None);
-    assert_eq!(h.state_mut().features_mut().each().len(), 5);
+    assert_eq!(h.state_mut().features_mut().each().len(), 6);
     assert_eq!(h.state().features().next_deadline(), None);
     assert!(!h.state().features().blocks_input());
 }

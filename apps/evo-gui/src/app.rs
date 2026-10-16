@@ -234,6 +234,7 @@ pub struct EvoApp {
     backend: Box<dyn EmuBackend>,
     /// The thread provisioning the real backend; `backend` is a [`Placeholder`] meanwhile.
     provisioning: Option<JoinHandle<ProvisionResult>>,
+    usb_worker: Option<crate::connect::worker::UsbWorker>,
     data_dir: PathBuf,
     paused: bool,
     debug_open: bool,
@@ -317,6 +318,7 @@ impl EvoApp {
         let mut app = Self {
             backend,
             provisioning: None,
+            usb_worker: None,
             store: Store::new(opts.data_dir.clone()),
             toasts,
             icons: None,
@@ -376,7 +378,7 @@ impl EvoApp {
 
     /// Moves the backend to a worker thread that provisions it; a [`Placeholder`] stands in.
     fn start_provision(&mut self) {
-        if self.provisioning.is_some() {
+        if self.provisioning.is_some() || self.usb_worker.is_some() {
             return;
         }
         self.resync();
@@ -522,7 +524,39 @@ impl EvoApp {
 
     /// Applies one feature request (see [`crate::feature`] for when the app does this).
     pub fn apply_request(&mut self, r: AppRequest) {
+        if self.usb_worker.is_some()
+            && matches!(
+                &r,
+                AppRequest::Reset | AppRequest::Provision | AppRequest::ReplaceBackend { .. }
+            )
+        {
+            self.toasts.push(
+                "Wait for the USB operation to finish, or cancel it in USB tools.",
+                ToastKind::Info,
+            );
+            return;
+        }
         match r {
+            AppRequest::Usb(task) => {
+                if self.provisioning()
+                    || self.usb_worker.is_some()
+                    || self.features.rom.blocks_input()
+                    || self.picker.is_some()
+                {
+                    let _ = task
+                        .events
+                        .send(crate::connect::types::UsbEvent::Finished(Err(
+                            "The calculator is busy. Try again when it is ready.".into(),
+                        )));
+                } else {
+                    self.resync();
+                    self.backend.cancel_goal();
+                    match crate::connect::worker::UsbWorker::start(&mut self.backend, task) {
+                        Ok(worker) => self.usb_worker = Some(worker),
+                        Err(e) => self.toasts.push(e, ToastKind::Error),
+                    }
+                }
+            }
             AppRequest::Resync => self.resync(),
             AppRequest::Persist => self.persist(),
             AppRequest::Reset => self.reset_machine(),
@@ -563,6 +597,7 @@ impl EvoApp {
         }
         self.backend = backend;
         self.rom = rom;
+        self.features.connect.calculator_changed();
         self.resync();
         if self.backend.needs_provision() {
             self.start_provision();
@@ -586,7 +621,7 @@ impl EvoApp {
         mut f: impl FnMut(&mut dyn Feature, &mut FeatureCtx<'_>) -> bool,
     ) -> bool {
         let prefs = self.prefs();
-        let provisioning = self.provisioning();
+        let provisioning = self.provisioning() || self.usb_worker.is_some();
         let mut requests = Vec::new();
         let mut handled = false;
         {
@@ -705,6 +740,7 @@ impl EvoApp {
     fn reset_machine(&mut self) {
         self.persist();
         self.backend.reset();
+        self.features.connect.calculator_changed();
         self.resync();
         self.toasts.push("Reset", ToastKind::Info);
     }
@@ -817,9 +853,17 @@ impl EvoApp {
                 | Action::ExportSettings
                 | Action::ImportFlash
                 | Action::ExportFlash
+                | Action::ResetEverything
         );
         if machine && self.provisioning() {
             self.toasts.push(PROVISION_BUSY, ToastKind::Info);
+            return;
+        }
+        if machine && self.usb_worker.is_some() {
+            self.toasts.push(
+                "Wait for the USB operation to finish, or cancel it in USB tools.",
+                ToastKind::Info,
+            );
             return;
         }
         match a {
@@ -984,7 +1028,7 @@ impl EvoApp {
     /// feature deadline and at the latch's next key release, so scripted key events and
     /// clicked-key releases land at their exact cycles at any speed.
     fn emulate(&mut self, ctx: &egui::Context) {
-        if self.paused || self.provisioning() {
+        if self.paused || self.provisioning() || self.usb_worker.is_some() {
             self.speed.reset();
             return;
         }
@@ -1083,7 +1127,9 @@ impl EvoApp {
     /// [`NAME_MAX_W`] and left out when the slot would be narrower than [`NAME_MIN_W`], and
     /// the status and title are elided to the room that is left.
     fn header(&self, ui: &mut egui::Ui) {
-        let status = if self.provisioning() {
+        let status = if self.usb_worker.is_some() {
+            "USB transfer…".to_owned()
+        } else if self.provisioning() {
             PROVISION_NOTICE.to_owned()
         } else {
             status_text(self.status, self.paused, self.speed.percent())
@@ -1240,6 +1286,18 @@ impl EvoApp {
 
 impl eframe::App for EvoApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.usb_worker.as_ref().is_some_and(|w| w.is_finished()) {
+            match self.usb_worker.take().unwrap().finish() {
+                Ok(backend) => {
+                    self.backend = backend;
+                    self.resync();
+                }
+                Err(e) => self.toasts.push(e, ToastKind::Error),
+            }
+        }
+        if self.usb_worker.is_some() {
+            ctx.request_repaint_after(PROVISION_POLL);
+        }
         self.poll_provision(ctx);
         self.keyboard(ctx);
         self.emulate(ctx);
@@ -1251,9 +1309,11 @@ impl eframe::App for EvoApp {
             f.frame(cx);
             false
         });
-        let backlight = self.backend.backlight();
-        self.lcd
-            .update(ctx, self.backend.framebuffer(), backlight, self.filter);
+        if self.usb_worker.is_none() {
+            let backlight = self.backend.backlight();
+            self.lcd
+                .update(ctx, self.backend.framebuffer(), backlight, self.filter);
+        }
         if !self.paused {
             ctx.request_repaint();
         }
@@ -1295,7 +1355,9 @@ impl eframe::App for EvoApp {
                 .default_size(DEBUG_W)
                 .min_size(DEBUG_MIN_W)
                 .max_size(max_w)
-                .show(ui, |ui| self.debug_panel(ui));
+                .show(ui, |ui| {
+                    ui.add_enabled_ui(self.usb_worker.is_none(), |ui| self.debug_panel(ui));
+                });
         }
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(APP_BG).inner_margin(CENTRAL_MARGIN))
@@ -1319,6 +1381,13 @@ impl eframe::App for EvoApp {
     /// Called once on shutdown, after [`save`](Self::save): the features finish (a recording
     /// is written out), their requests apply, then flash is written a last time.
     fn on_exit(&mut self) {
+        if let Some(worker) = self.usb_worker.take() {
+            worker.cancel();
+            match worker.finish() {
+                Ok(backend) => self.backend = backend,
+                Err(e) => log::error!("{e}"),
+            }
+        }
         self.feature_pass(&[], |f, cx| {
             f.on_exit(cx);
             false

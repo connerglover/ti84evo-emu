@@ -302,6 +302,15 @@ pub trait EmuBackend: Send {
     /// thread; it does not write flash to disk (the app persists afterwards). Breakpoints are
     /// kept. On `Err` the machine is left where provisioning stopped.
     fn provision(&mut self) -> Result<(), BackendError>;
+    /// Whether this backend has a calculator USB device.
+    fn usb_available(&self) -> bool;
+    /// Runs a USB host operation on this same calculator. Called on an exclusive worker;
+    /// the callback returns false to cancel. Guest time advances to service the USB bus.
+    fn usb(
+        &mut self,
+        operation: crate::connect::types::UsbOperation,
+        progress: &mut dyn FnMut(crate::connect::types::UsbProgress) -> bool,
+    ) -> Result<crate::connect::types::UsbResult, BackendError>;
     fn cpu(&self) -> CpuView;
     /// Reads memory without side effects; `None` for unreadable bytes.
     fn peek(&self, addr: u32, len: usize) -> Vec<Option<u8>>;
