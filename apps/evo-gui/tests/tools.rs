@@ -801,6 +801,48 @@ mod macros {
     }
 
     #[test]
+    fn check_with_empty_hash_reports_screen_hash() {
+        let fake = FakeBackend::with_frame(frame());
+        let probe = fake.probe();
+        let (mut h, _dir) = tools_harness(fake);
+        open(&mut h);
+        set_script(&mut h, "2");
+        h.state_mut()
+            .features_mut()
+            .tools
+            .macros_mut()
+            .set_check(true, "  ");
+        h.get_by_label("Play").click();
+        step_until(&mut h, 300, |_| probe.key_events().len() == 2);
+        assert!(playing(&h));
+        let release = probe.key_events()[1].cycle;
+        step_until(&mut h, 300, |h| !playing(h));
+        // The run waited for settle, then checked the screen and showed its hash.
+        assert_eq!(probe.cycles(), release + DEFAULT_SETTLE_MS * MS);
+        let got = screen_sha256(&frame());
+        assert_eq!(
+            h.state().features().tools.macros().result(),
+            Some(&MacroResult::Fail { got: got.clone() })
+        );
+        assert_eq!(h.state().features().tools.macros().error(), None);
+        h.get_by_label(&format!("Result: FAIL (screen sha256 {got})"));
+    }
+
+    #[test]
+    fn save_with_check_and_empty_hash_is_refused() {
+        let (mut h, dir) = tools_harness(FakeBackend::new());
+        open(&mut h);
+        let macros = h.state_mut().features_mut().tools.macros_mut();
+        macros.set_name("sum");
+        macros.set_check(true, "");
+        h.run_steps(1);
+        h.get_by_label("Save").click();
+        h.run_steps(2);
+        assert!(!dir.join("macros").join("sum.keys").exists());
+        h.get_by_label("Saving with the screen check needs an Expected SHA-256");
+    }
+
+    #[test]
     fn save_and_load_macro() {
         let (mut h, dir) = tools_harness(FakeBackend::new());
         open(&mut h);

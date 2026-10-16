@@ -39,6 +39,7 @@ const WINDOW_W: f32 = 380.0;
 const NAME_ERROR: &str = "Macro name must be 1\u{2013}64 letters, digits, spaces, '_' or '-', not starting or \
      ending with a space, and not a reserved device name";
 const HASH_ERROR: &str = "Expected SHA-256 must be 64 hex digits";
+const SAVE_HASH_ERROR: &str = "Saving with the screen check needs an Expected SHA-256";
 const SETTLE_ERROR: &str = "Settle (ms) must be a whole number of milliseconds";
 const NO_FRAME: &str = "No display frame";
 
@@ -390,7 +391,13 @@ impl Macros {
             self.error = Some(SETTLE_ERROR.to_owned());
             return;
         };
-        let expect = if self.check {
+        let expect = if !self.check {
+            None
+        } else if self.expected.trim().is_empty() {
+            // No hash yet: the run still settles and checks, and the FAIL result shows the
+            // screen hash to use as the expectation (an empty string matches no hash).
+            Some(String::new())
+        } else {
             match normalize_hash(&self.expected) {
                 Some(h) => Some(h),
                 None => {
@@ -398,8 +405,6 @@ impl Macros {
                     return;
                 }
             }
-        } else {
-            None
         };
         let start = cx.backend.cycles();
         let at = |ms: u64| start.saturating_add(ms.saturating_mul(CYCLES_PER_MS));
@@ -518,7 +523,13 @@ impl Macros {
             self.error = Some(SETTLE_ERROR.to_owned());
             return;
         };
-        let expect_sha256 = if self.check {
+        let expect_sha256 = if !self.check {
+            None
+        } else if self.expected.trim().is_empty() {
+            // A file cannot say "check, hash unknown": Load would turn the check off.
+            self.error = Some(SAVE_HASH_ERROR.to_owned());
+            return;
+        } else {
             match normalize_hash(&self.expected) {
                 Some(h) => Some(h),
                 None => {
@@ -526,8 +537,6 @@ impl Macros {
                     return;
                 }
             }
-        } else {
-            None
         };
         let file = MacroFile {
             name: self.name.clone(),
