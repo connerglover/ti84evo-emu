@@ -1,6 +1,6 @@
-//! USB OTG minimum and USB Type-C stub (`docs/hardware/usb.md`).
+//! USB controller packets, DMA, interrupt masks and Type-C registers.
 
-use evo_hw::dev::usb::{USB_CONFIG, USB_ID, Usb, UsbTypeC};
+use evo_hw::dev::usb::{USB_CONFIG, USB_ID, Usb, UsbError, UsbTypeC};
 use evo_hw::{DevHarness, Device, MemoryMap, ResetKind, StateError};
 
 const CTRL: u32 = 0x000;
@@ -46,7 +46,7 @@ fn storage_elsewhere() {
     h.write(&mut u, 0x100, 4, 0x220);
     assert_eq!(h.read(&mut u, 0x100, 4), 0x220);
     h.write(&mut u, 0x1B0, 4, 0x1000);
-    assert_eq!(h.read(&mut u, 0x1B0, 4), 0x1000);
+    assert_eq!(h.read(&mut u, 0x1B0, 4), 0, "FIFO reset completes");
     h.write(&mut u, 0xFFC, 4, 0x1234_5678);
     assert_eq!(h.read(&mut u, 0xFFE, 2), 0x1234);
     assert!(h.log.is_empty());
@@ -146,4 +146,128 @@ fn soc_attaches_usb_blocks() {
     evo_hw::soc::attach(&mut map);
     assert!(map.device::<Usb>("usb").is_some());
     assert!(map.device::<UsbTypeC>("usbtc").is_some());
+}
+
+fn connected() -> (DevHarness, Usb) {
+    let mut h = DevHarness::new().with_buffer("sram", vec![0; 4096]);
+    let mut u = Usb::new();
+    h.with_ctx(|ctx| u.attach(true, ctx));
+    h.write(&mut u, 0x100, 4, 0x24);
+    (h, u)
+}
+
+#[test]
+fn reset_and_setup_use_masks_and_write_one_acknowledgement() {
+    let (mut h, mut u) = connected();
+    h.write(&mut u, 0x13C, 4, 1);
+    h.with_ctx(|ctx| u.bus_reset(ctx)).unwrap();
+    assert_eq!(h.irq, 0);
+    assert_eq!(h.read(&mut u, 0x14C, 4), 1);
+    h.write(&mut u, 0x13C, 4, 0);
+    assert_eq!(h.irq, 1 << 16);
+    h.write(&mut u, 0x14C, 1, 1);
+    assert_eq!(h.irq, 0);
+    h.with_ctx(|ctx| u.host_setup([0x80, 6, 0, 1, 0, 0, 18, 0], ctx))
+        .unwrap();
+    assert_eq!(h.irq, 1 << 16);
+    assert_eq!(h.read(&mut u, 0x1D0, 4), 0x01000680);
+    assert_eq!(h.read(&mut u, 0x1D0, 4), 18 << 16);
+    assert_eq!(h.irq, 0);
+}
+
+#[test]
+fn setup_and_response_traverse_virtual_dma() {
+    let (mut h, mut u) = connected();
+    let setup = [0x80, 6, 0, 1, 0, 0, 18, 0];
+    h.with_ctx(|ctx| u.host_setup(setup, ctx)).unwrap();
+    h.write(&mut u, 0x304, 4, 0x20000010);
+    h.write(&mut u, 0x300, 4, (8 << 8) | 1);
+    assert_eq!(&h.buffer("sram")[16..24], &setup);
+    assert_eq!(h.read(&mut u, 0x328, 4), 1);
+    h.write(&mut u, 0x328, 4, 1);
+    h.write(&mut u, 0x304, 4, 0x30000010);
+    h.write(&mut u, 0x300, 4, (8 << 8) | 3);
+    assert_eq!(h.with_ctx(|ctx| u.host_in(0, ctx)).unwrap(), setup);
+    assert_eq!(h.read(&mut u, 0x300, 4) & 1, 0);
+}
+
+#[test]
+fn bulk_out_dma_waits_for_packets_and_ends_on_short_packet() {
+    let (mut h, mut u) = connected();
+    // Endpoint 2 OUT -> FIFO1; FIFO1's virtual DMA is +0x310.
+    h.write(&mut u, 0x184, 4, 64);
+    h.write(&mut u, 0x1A0, 4, 0x1000);
+    h.write(&mut u, 0x1A8, 4, 0x0200);
+    h.write(&mut u, 0x1AC, 4, 0x2200);
+    h.write(&mut u, 0x314, 4, 0x20000100);
+    h.write(&mut u, 0x310, 4, (128 << 8) | 1);
+    assert_eq!(h.read(&mut u, 0x328, 4), 0, "no fabricated completion");
+    h.with_ctx(|ctx| u.host_out(2, &[0x55; 64], ctx)).unwrap();
+    assert_ne!(h.read(&mut u, 0x310, 4) & 1, 0);
+    h.with_ctx(|ctx| u.host_out(2, &[0x66; 3], ctx)).unwrap();
+    assert_eq!(&h.buffer("sram")[0x100..0x140], &[0x55; 64]);
+    assert_eq!(&h.buffer("sram")[0x140..0x143], &[0x66; 3]);
+    assert_eq!(h.read(&mut u, 0x310, 4), 61 << 8);
+    assert_eq!(h.read(&mut u, 0x328, 4), 4);
+}
+
+#[test]
+fn dma_errors_do_not_write_outside_sram_and_pending_packets_restore() {
+    let (mut h, mut u) = connected();
+    let setup = [0x80, 6, 0, 1, 0, 0, 8, 0];
+    h.with_ctx(|ctx| u.host_setup(setup, ctx)).unwrap();
+    h.write(&mut u, 0x304, 4, 0x20000FFF);
+    h.write(&mut u, 0x300, 4, (8 << 8) | 1);
+    assert_eq!(h.read(&mut u, 0x328, 4), 1 << 16);
+    assert!(h.buffer("sram").iter().all(|b| *b == 0));
+    let state = u.save();
+    let mut restored = Usb::new();
+    restored.load(&state).unwrap();
+    assert_eq!(h.read(&mut restored, 0x1D0, 4), 0x01000680);
+    assert!(restored.load(&[state, vec![0]].concat()).is_err());
+    assert_eq!(h.read(&mut restored, 0x1D0, 4), 8 << 16);
+}
+
+#[test]
+fn packet_errors_stall_recovery_and_zero_length_status() {
+    let (mut h, mut u) = connected();
+    assert_eq!(
+        h.with_ctx(|ctx| u.host_in(9, ctx)),
+        Err(UsbError::InvalidEndpoint)
+    );
+    h.write(&mut u, 0x120, 4, 4);
+    assert_eq!(h.with_ctx(|ctx| u.host_in(0, ctx)), Err(UsbError::Stall));
+    h.with_ctx(|ctx| u.host_setup([0, 5, 1, 0, 0, 0, 0, 0], ctx))
+        .unwrap();
+    assert_eq!(h.with_ctx(|ctx| u.host_in(0, ctx)), Err(UsbError::Nak));
+    h.write(&mut u, 0x120, 4, 1);
+    assert_eq!(h.with_ctx(|ctx| u.host_in(0, ctx)), Ok(vec![]));
+    h.with_ctx(|ctx| u.attach(false, ctx));
+    assert_eq!(
+        h.with_ctx(|ctx| u.host_in(0, ctx)),
+        Err(UsbError::Disconnected)
+    );
+}
+
+#[test]
+fn bus_reset_cancels_dma_and_narrow_status_acknowledges_only_its_lane() {
+    let (mut h, mut u) = connected();
+    h.with_ctx(|ctx| u.host_setup([0, 0x20, 0, 0, 0, 0, 7, 0], ctx))
+        .unwrap();
+    // Invalid DMA address raises the CX error at bit 16. Low-byte W1C cannot clear it.
+    h.write(&mut u, 0x304, 4, 0xF000_0010);
+    h.write(&mut u, 0x300, 4, (8 << 8) | 1);
+    assert_eq!(h.read(&mut u, 0x328, 4), 1 << 16);
+    h.write(&mut u, 0x328, 1, 0xFF);
+    assert_eq!(h.read(&mut u, 0x328, 4), 1 << 16);
+    h.write(&mut u, 0x32A, 1, 1);
+    assert_eq!(h.read(&mut u, 0x328, 4), 0);
+    h.write(&mut u, 0x314, 4, 0x2000_0100);
+    h.write(&mut u, 0x310, 4, (128 << 8) | 1);
+    assert_eq!(h.read(&mut u, 0x310, 4) & 1, 1);
+    h.with_ctx(|ctx| u.bus_reset(ctx)).unwrap();
+    assert_eq!(h.read(&mut u, 0x310, 4), 0);
+    assert_eq!(h.read(&mut u, 0x144, 4), 0);
+    assert_eq!(h.read(&mut u, 0x14C, 4), 1);
+    assert_eq!(h.read(&mut u, 0x1D0, 4), 0);
 }

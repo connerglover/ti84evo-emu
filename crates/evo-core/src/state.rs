@@ -21,7 +21,8 @@
 //! the recent trace are host-side debugging aids and are not saved either.
 //!
 //! Version history: 1 had no flash fingerprint and no checksum (bundle id, then the body);
-//! version 1 states are rejected ([`StateError::Version`]).
+//! version 2 added the fingerprints/checksum; version 3 adds USB FIFO and transport state.
+//! Earlier versions are rejected ([`StateError::Version`]); flash files remain compatible.
 
 use armv8m::{Cpu, SleepKind};
 use evo_hw::soc::SRAM_BUFFER;
@@ -35,7 +36,7 @@ use crate::machine::{Machine, RecentSteps};
 /// First bytes of every save state.
 pub const STATE_MAGIC: &[u8; 8] = b"EVOSTATE";
 /// Format version this build writes and reads.
-pub const STATE_VERSION: u32 = 2;
+pub const STATE_VERSION: u32 = 3;
 
 /// Header offsets: bundle id, flash fingerprint, body checksum, body.
 const ID_AT: usize = 8 + 4;

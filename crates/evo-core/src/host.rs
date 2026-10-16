@@ -7,7 +7,8 @@ use evo_hw::dev::keypad::{Key, Keypad};
 use evo_hw::dev::lcdc::{Frame, Lcdc};
 use evo_hw::dev::sysctl::{CRU_WAKE_ON_KEY, Cru, Spctrl};
 use evo_hw::dev::uart::Uart16550;
-use evo_hw::dev::usb::UsbTypeC;
+pub use evo_hw::dev::usb::UsbError;
+use evo_hw::dev::usb::{Usb, UsbTypeC};
 
 use evo_hw::soc::SRAM_BUFFER;
 
@@ -34,6 +35,38 @@ impl UartPort {
 }
 
 impl Machine {
+    /// Connect or disconnect a USB host. Enumeration is performed by subsequent bus tokens.
+    pub fn usb_attach(&mut self, attached: bool) {
+        self.with_dev("usbtc", |t: &mut UsbTypeC, ctx| {
+            t.attach_host(attached, ctx)
+        });
+        self.with_dev("usb", |u: &mut Usb, ctx| u.attach(attached, ctx));
+    }
+
+    /// Reset the USB bus at full speed; the guest handles the reset interrupt.
+    pub fn usb_bus_reset(&mut self) -> Result<(), UsbError> {
+        self.with_dev("usb", |u: &mut Usb, ctx| u.bus_reset(ctx))
+            .unwrap()
+    }
+
+    /// Deliver a control SETUP packet to the guest controller.
+    pub fn usb_setup(&mut self, setup: [u8; 8]) -> Result<(), UsbError> {
+        self.with_dev("usb", |u: &mut Usb, ctx| u.host_setup(setup, ctx))
+            .unwrap()
+    }
+
+    /// Send one OUT packet (endpoint number, without the direction bit).
+    pub fn usb_out(&mut self, endpoint: u8, bytes: &[u8]) -> Result<(), UsbError> {
+        self.with_dev("usb", |u: &mut Usb, ctx| u.host_out(endpoint, bytes, ctx))
+            .unwrap()
+    }
+
+    /// Issue an IN token (endpoint number, without the direction bit).
+    pub fn usb_in(&mut self, endpoint: u8) -> Result<Vec<u8>, UsbError> {
+        self.with_dev("usb", |u: &mut Usb, ctx| u.host_in(endpoint, ctx))
+            .unwrap()
+    }
+
     /// Drain the bytes the guest transmitted on `port` since the last call, oldest first.
     /// At most `evo_hw::dev::uart::UART_TX_CAP` undrained bytes are kept.
     pub fn take_uart_tx(&mut self, port: UartPort) -> Vec<u8> {
@@ -53,7 +86,10 @@ impl Machine {
     /// bits; 0 = unattached. The guest reads it at `0x4010_C01C` bits 9:8 / 11:10. It survives
     /// a System reset (the cable stays plugged in).
     pub fn set_usb_cc(&mut self, cc1: u8, cc2: u8) {
-        self.with_dev("usbtc", |t: &mut UsbTypeC, _| t.set_cc(cc1, cc2));
+        self.with_dev("usbtc", |t: &mut UsbTypeC, ctx| {
+            t.set_cc(cc1, cc2);
+            t.refresh_irq(ctx);
+        });
     }
 
     /// Drive GPIO input `pin` (`docs/hardware/gpio.md`): `Some(level)`, or `None` = undriven

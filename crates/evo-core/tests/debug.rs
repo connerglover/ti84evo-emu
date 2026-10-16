@@ -628,6 +628,7 @@ fn peripherals_lists_devices_in_order() {
             "uart0",
             "uart2",
             "spif",
+            "usb",
             "gpio",
             "lcdc",
             "pwm",

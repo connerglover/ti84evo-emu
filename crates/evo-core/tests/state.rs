@@ -282,13 +282,13 @@ fn load_state_rejects_bad_magic() {
 
 #[test]
 fn load_state_rejects_other_versions() {
-    assert_eq!(STATE_VERSION, 2);
-    for v in [1, 3] {
+    assert_eq!(STATE_VERSION, 3);
+    for v in [1, 2, 4] {
         let (mut state, mut m) = two_machines();
         state[8..12].copy_from_slice(&u32::to_le_bytes(v));
         assert!(matches!(
             rejected(&mut m, &state),
-            StateError::Version { found, expected: 2 } if found == v
+            StateError::Version { found, expected: 3 } if found == v
         ));
     }
 }
