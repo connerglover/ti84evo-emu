@@ -4,8 +4,8 @@
 //! `armv8m`); `tests/boundary.rs` enforces that. Besides Plan 1's `Machine` API (`run`,
 //! `step`, `breakpoints`, `bus.peek`, `bus.log`, `cpu.regs`, `sched.now`) it uses Plan 2's
 //! host API: `screen`, the backlight `Pwm`, `set_key`, `take_uart_tx`, `save_state` /
-//! `load_state`, and the flash file (`from_bundle_nv`, `nv_state`, `NvState`). Plan 4's
-//! debugger API: watchpoints, goals (`arm_*`, `disarm`), `write_reg`, `peripherals`, and the
+//! `load_state`, and the flash file (`from_bundle_or_nv`, `from_nv`, `nv_state`, `NvState`).
+//! Plan 4's debugger API: watchpoints, goals (`arm_*`, `disarm`), `write_reg`, `peripherals`, and the
 //! bus monitor and `poke` on `bus`; and its I/O API: `inject_uart_rx`, `set_gpio_input`,
 //! `set_usb_cc`, `set_rtc` / `rtc_seconds`, `power_state` and `export_ram` / `import_ram`.
 
@@ -16,7 +16,8 @@ use armv8m::{Sec, decode16, decode32, disasm};
 use evo_core::machine::{FLASH_NS, FLASH_S, FLASH_SIZE, SRAM_NS, SRAM_S, SRAM_SIZE};
 use evo_core::{AccessDir as CoreDir, BusRecord as CoreRecord};
 use evo_core::{
-    Key, Machine, NvError, NvState, StopReason, UartPort, WatchKinds as CoreKinds, WatchRange,
+    Key, Machine, NvBootError, NvError, NvState, StopReason, UartPort, WatchKinds as CoreKinds,
+    WatchRange,
 };
 use evo_hw::dev::gpio::Gpio;
 use evo_hw::dev::lcdc::Pwm;
@@ -37,6 +38,8 @@ pub enum OpenError {
     Read(#[from] std::io::Error),
     #[error(transparent)]
     Image(#[from] ImageError),
+    #[error(transparent)]
+    Boot(#[from] NvBootError),
     /// The flash file exists but cannot be read; it is left untouched.
     #[error("{path}: {source}")]
     Flash { path: PathBuf, source: NvError },
@@ -92,11 +95,9 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
         .fold(OFFSET, |h, &b| (h ^ u64::from(b)).wrapping_mul(PRIME))
 }
 
-/// The emulated calculator, booted from an OS bundle.
+/// The emulated calculator, with persistent storage keyed by its original OS bundle.
 pub struct MachineBackend {
     machine: Machine,
-    /// Kept so [`EmuBackend::reset`] can rebuild the machine.
-    bundle: Bundle,
     name: String,
     /// `machine:{fnv1a64 of the bundle bytes}`.
     tag: String,
@@ -104,9 +105,9 @@ pub struct MachineBackend {
     nv_path: PathBuf,
     /// True from an open with no flash file until provisioning succeeds.
     fresh: bool,
-    /// [`Machine::nv_fingerprint`] of the flash the file at `nv_path` holds (read at open or
-    /// last written); `None` when there is no such file yet. `persist` skips the write while
-    /// it matches.
+    /// [`Machine::nv_fingerprint`] last written to `nv_path` by this backend;
+    /// unknown on open because boot may activate a pending update.
+    /// `persist` writes once after open, then skips writes while this matches.
     on_disk: Option<[u8; 32]>,
     /// The last LCD image, converted for the GUI.
     frame: Frame,
@@ -211,16 +212,16 @@ impl MachineBackend {
         } else {
             None
         };
-        let machine = Machine::from_bundle_nv(&bundle, &Layout::EVO_7_1, nv)?;
-        let on_disk = (!fresh).then(|| machine.nv_fingerprint());
+        let machine = Machine::from_bundle_or_nv(&bundle, &Layout::EVO_7_1, nv)?;
         Ok(Self {
             machine,
-            bundle,
             name,
             tag: format!("machine:{hash:016x}"),
             nv_path,
             fresh,
-            on_disk,
+            // A pending USB update may have changed flash while booting. Its new
+            // fingerprint must not stand in for the original file's fingerprint.
+            on_disk: None,
             frame: Frame {
                 width: 0,
                 height: 0,
@@ -232,11 +233,11 @@ impl MachineBackend {
         })
     }
 
-    /// Replaces the machine with a new one booted from the bundle over `nv`. The debugger's
+    /// Replaces the machine with a new one booted from the firmware in `nv`. The debugger's
     /// breakpoints, watchpoints and bus-monitor range and the board inputs carry over; the
     /// goal is dropped. On `Err` the machine is kept.
-    fn rebuild(&mut self, nv: NvState) -> Result<(), ImageError> {
-        let mut m = Machine::from_bundle_nv(&self.bundle, &Layout::EVO_7_1, Some(nv))?;
+    fn rebuild(&mut self, nv: NvState) -> Result<(), NvBootError> {
+        let mut m = Machine::from_nv(nv, &Layout::EVO_7_1)?;
         m.breakpoints = std::mem::take(&mut self.machine.breakpoints);
         if let Err(e) = m.set_watchpoints(self.machine.watchpoints()) {
             // They were validated when set, so this does not happen.
@@ -420,7 +421,7 @@ impl EmuBackend for MachineBackend {
     fn reset(&mut self) {
         // Flash is kept: the new machine starts from the current non-volatile state.
         if let Err(e) = self.rebuild(self.machine.nv_state()) {
-            // The same bundle booted once already, so this does not happen.
+            // Preserve the running machine if its flash no longer contains bootable firmware.
             log::error!("reset failed, machine kept: {e}");
         }
     }

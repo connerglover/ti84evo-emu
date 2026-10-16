@@ -163,13 +163,6 @@ pub fn main(args: RunArgs) -> ExitCode {
 
 /// `main` with the stop request `interrupt` (set by Ctrl-C; checked after every slice).
 fn run(args: RunArgs, interrupt: &AtomicBool) -> ExitCode {
-    let bundle = match Bundle::open(&args.bundle) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("evo-cli: {}: {e}", args.bundle.display());
-            return ExitCode::FAILURE;
-        }
-    };
     // Every input is read before the machine exists: an input error never touches the flash
     // file.
     let nv = match args.flash_file.as_deref().map(read_flash_file) {
@@ -197,10 +190,30 @@ fn run(args: RunArgs, interrupt: &AtomicBool) -> ExitCode {
         },
         None => None,
     };
-    let mut machine = match Machine::from_bundle_nv(&bundle, &Layout::EVO_7_1, nv) {
+    // Existing flash owns its firmware, including USB updates. The original bundle is
+    // needed only to install a fresh unit, and may no longer exist on subsequent runs.
+    let boot_source = if nv.is_some() {
+        args.flash_file.as_deref().unwrap_or(&args.bundle)
+    } else {
+        &args.bundle
+    };
+    let boot = match nv {
+        Some(nv) => Machine::from_nv(nv, &Layout::EVO_7_1),
+        None => {
+            let bundle = match Bundle::open(&args.bundle) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("evo-cli: {}: {e}", args.bundle.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            Machine::from_bundle_or_nv(&bundle, &Layout::EVO_7_1, None)
+        }
+    };
+    let mut machine = match boot {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("evo-cli: {}: {e}", args.bundle.display());
+            eprintln!("evo-cli: {}: {e}", boot_source.display());
             return ExitCode::FAILURE;
         }
     };

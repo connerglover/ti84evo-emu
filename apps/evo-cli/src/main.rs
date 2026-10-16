@@ -56,7 +56,8 @@ enum Command {
     /// 130) and still writes --save-state, --flash-file, --screenshot and --unmapped-out; a
     /// second Ctrl-C quits at once without writing them. Under --gdb, Ctrl-C ends the process.
     Run {
-        /// Path to the .84b2 bundle.
+        /// Path to the .84b2 bundle used to install a fresh unit. Existing --flash-file
+        /// firmware boots directly, even if this original bundle no longer exists.
         bundle: PathBuf,
         /// Cycle budget (decimal; `_` separators allowed).
         #[arg(long, value_name = "N", default_value = "1_000_000_000", value_parser = run::parse_count)]
@@ -94,14 +95,14 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         uart_in: Option<PathBuf>,
         /// Keep the flash and the NOR security registers in PATH across runs: read at the
-        /// start (an erased part if PATH does not exist; an invalid file is an error that
-        /// leaves it untouched), the bundle's images placed over it, and written back however
-        /// the run ends. A failed write-back exits 1.
+        /// start, preserving its installed firmware and USB updates. If PATH does not exist,
+        /// install the bundle into erased flash. Invalid stored firmware is an error that
+        /// leaves the file untouched. Write back however the run ends; a failed write exits 1.
         #[arg(long, value_name = "PATH")]
         flash_file: Option<PathBuf>,
         /// Restore the machine from a save state written by --save-state, after booting the
-        /// bundle (and reading --flash-file). The state must come from the same bundle and the
-        /// same flash: the flash file as the run that saved the state wrote it back. A corrupt,
+        /// installed firmware (and reading --flash-file). The state must use the same firmware
+        /// and flash: the flash file as the run that saved the state wrote it back. A corrupt,
         /// invalid or mismatched state is an error (exit 1) before the run starts, and the flash
         /// file is not touched. The --max-cycles budget counts from the restored cycle.
         #[arg(long, value_name = "FILE")]

@@ -596,6 +596,85 @@ fn cli_flash_file_created_and_reused() {
     assert!(!flash.with_extension("evoflash.tmp").exists());
 }
 
+#[test]
+fn cli_executes_stored_firmware_even_without_its_original_bundle() {
+    let bundle = bundle_file("cli_stored_firmware", looping());
+    let flash = flash_file("cli_stored_firmware");
+    let run = || {
+        stdout(
+            evo_cli()
+                .arg("run")
+                .arg(&bundle)
+                .args(["--max-cycles", "1", "--trace", "--flash-file"])
+                .arg(&flash),
+            0,
+        )
+    };
+    run();
+    let mut bytes = std::fs::read(&flash).unwrap();
+    // Replace the first stored instruction with movs r0,#9. Opening the old bundle
+    // again must not restore adds r0,#1 over it.
+    let code = 16 + 0xB_0600;
+    bytes[code..code + 2].copy_from_slice(&0x2009u16.to_le_bytes());
+    std::fs::write(&flash, &bytes).unwrap();
+    assert!(run().contains("movs r0, #9"));
+    std::fs::remove_file(&bundle).unwrap();
+    assert!(run().contains("movs r0, #9"));
+    assert_eq!(
+        &std::fs::read(&flash).unwrap()[code..code + 2],
+        &0x2009u16.to_le_bytes()
+    );
+}
+
+#[test]
+fn cli_state_from_fresh_flash_loads_after_reopen() {
+    let bundle = bundle_file("cli_state_fresh_flash", looping());
+    let flash = flash_file("cli_state_fresh_flash");
+    let state = flash.with_extension("state");
+    let first = stop_cycles(&stdout(
+        evo_cli()
+            .arg("run")
+            .arg(&bundle)
+            .args(["--max-cycles", "1000", "--flash-file"])
+            .arg(&flash)
+            .arg("--save-state")
+            .arg(&state),
+        0,
+    ));
+    std::fs::remove_file(&bundle).unwrap();
+    let second = stop_cycles(&stdout(
+        evo_cli()
+            .arg("run")
+            .arg(&bundle)
+            .args(["--max-cycles", "1000", "--flash-file"])
+            .arg(&flash)
+            .arg("--load-state")
+            .arg(&state),
+        0,
+    ));
+    assert!((first + 1000..=first + 1010).contains(&second));
+}
+
+#[test]
+fn cli_invalid_stored_firmware_is_not_reinstalled() {
+    let bundle = bundle_file("cli_invalid_stored_firmware", looping());
+    let flash = flash_file("cli_invalid_stored_firmware");
+    evo_core::NvState::erased().write_file(&flash).unwrap();
+    let before = std::fs::read(&flash).unwrap();
+    let out = evo_cli()
+        .arg("run")
+        .arg(&bundle)
+        .args(["--max-cycles", "1", "--flash-file"])
+        .arg(&flash)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid persisted boot image"));
+    assert_eq!(std::fs::read(&flash).unwrap(), before);
+}
+
 /// Review Focus 2: a corrupt flash file is an error that leaves the file as it was.
 #[test]
 fn cli_bad_flash_file_exits_1_and_keeps_file() {

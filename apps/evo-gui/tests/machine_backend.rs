@@ -396,13 +396,7 @@ fn flash_file_is_loaded_and_written_back() {
     let dir = nv_dir();
     let bundle = bundle_bytes(&COUNTER);
     let path = nv_path_for(&dir, &bundle);
-    let erased = NvState::erased();
-    let mut flash = erased.flash().to_vec();
-    flash[0x9_0000] = 0xA5;
-    NvState::new(flash, erased.secregs().to_vec())
-        .unwrap()
-        .write_file(&path)
-        .unwrap();
+    write_marked_flash(&path, 0xA5);
     let mut b = MachineBackend::from_bytes(&bundle, "test.84b2".into(), &dir).unwrap();
     assert_eq!(b.nv_path(), path);
     assert_eq!(b.peek(0x0009_0000, 1), vec![Some(0xA5)]);
@@ -410,12 +404,15 @@ fn flash_file_is_loaded_and_written_back() {
     assert_eq!(NvState::read_file(&path).unwrap().flash()[0x9_0000], 0xA5);
 }
 
-/// Writes erased flash with `marker` at 0x9_0000 to `path`.
+/// Writes bootable counter firmware with `marker` at 0x9_0000 to `path`.
 fn write_marked_flash(path: &Path, marker: u8) {
-    let erased = NvState::erased();
-    let mut flash = erased.flash().to_vec();
+    let bundle = evo_image::Bundle::from_bytes(&bundle_bytes(&COUNTER)).unwrap();
+    let installed = evo_core::Machine::from_bundle(&bundle, &evo_image::Layout::EVO_7_1)
+        .unwrap()
+        .nv_state();
+    let mut flash = installed.flash().to_vec();
     flash[0x9_0000] = marker;
-    NvState::new(flash, erased.secregs().to_vec())
+    NvState::new(flash, installed.secregs().to_vec())
         .unwrap()
         .write_file(path)
         .unwrap();
@@ -438,6 +435,74 @@ fn unprovisioned_unit_is_not_persisted() {
 }
 
 #[test]
+fn stored_firmware_survives_reset_import_and_reopen() {
+    let dir = nv_dir();
+    let bytes = bundle_bytes(&[0x2001, 0xE7FE]); // movs r0,#1; b .
+    let mut b = MachineBackend::from_bytes(&bytes, "original.84b2".into(), &dir).unwrap();
+    b.poke(0x100B_0600, &0x2009u16.to_le_bytes()).unwrap();
+    b.reset();
+    b.step();
+    assert_eq!(
+        b.cpu().core[0],
+        9,
+        "reset must execute the stored instruction"
+    );
+
+    let imported = dir.join("updated.evoflash");
+    b.export_flash(&imported).unwrap();
+    b.poke(0x100B_0600, &0x2003u16.to_le_bytes()).unwrap();
+    b.import_flash(&imported).unwrap();
+    b.step();
+    assert_eq!(b.cpu().core[0], 9, "import must preserve firmware bytes");
+    b.persist().unwrap();
+    drop(b);
+
+    let mut reopened = MachineBackend::from_bytes(&bytes, "original.84b2".into(), &dir).unwrap();
+    reopened.step();
+    assert_eq!(
+        reopened.cpu().core[0],
+        9,
+        "opening must not reinstall the original bundle"
+    );
+    reopened.reset();
+    reopened.step();
+    assert_eq!(reopened.cpu().core[0], 9);
+}
+
+#[test]
+fn fresh_save_state_loads_after_reopening_the_same_flash() {
+    let dir = nv_dir();
+    let bytes = bundle_bytes(&COUNTER);
+    let mut fresh = MachineBackend::from_bytes(&bytes, "test.84b2".into(), &dir).unwrap();
+    fresh.run_for(100);
+    let state = fresh.save_state().unwrap();
+    let cpu = fresh.cpu();
+    fresh.export_flash(&nv_path_for(&dir, &bytes)).unwrap();
+
+    let mut reopened = MachineBackend::from_bytes(&bytes, "test.84b2".into(), &dir).unwrap();
+    reopened.load_state(&state).unwrap();
+    assert_eq!(reopened.cpu(), cpu);
+    assert_eq!(reopened.cycles(), fresh.cycles());
+    reopened.reset();
+    reopened.load_state(&state).unwrap();
+    assert_eq!(reopened.cpu(), cpu);
+}
+
+#[test]
+fn invalid_stored_firmware_is_not_replaced_by_the_bundle() {
+    let dir = nv_dir();
+    let bytes = bundle_bytes(&COUNTER);
+    let path = nv_path_for(&dir, &bytes);
+    NvState::erased().write_file(&path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert!(matches!(
+        MachineBackend::from_bytes(&bytes, "test.84b2".into(), &dir),
+        Err(OpenError::Boot(_))
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
 fn unchanged_flash_is_not_rewritten() {
     let dir = nv_dir();
     let bundle = bundle_bytes(&COUNTER);
@@ -445,6 +510,7 @@ fn unchanged_flash_is_not_rewritten() {
     write_marked_flash(&path, 0xA5);
     let mut b = MachineBackend::from_bytes(&bundle, "test.84b2".into(), &dir).unwrap();
     b.run_for(1000);
+    b.persist().unwrap(); // The first write also covers firmware activated during open.
     // Something else replaces the file: a persist of the unchanged machine leaves it alone.
     write_marked_flash(&path, 0x5A);
     b.persist().unwrap();
@@ -918,7 +984,8 @@ fn load_state_is_a_pure_restore_and_the_panel_follows_it() {
 fn loaded_usb_attachment_recognizes_either_cable_orientation() {
     let bytes = bundle_bytes(&keypad_reader(0xC01C));
     let bundle = evo_image::Bundle::from_bytes(&bytes).unwrap();
-    let mut machine = evo_core::Machine::from_bundle(&bundle, &evo_image::Layout::EVO_7_1).unwrap();
+    let mut machine =
+        evo_core::Machine::from_bundle_or_nv(&bundle, &evo_image::Layout::EVO_7_1, None).unwrap();
     let mut b = backend(&keypad_reader(0xC01C));
 
     for (cc1, cc2, attached) in [(3, 0, true), (0, 2, true), (0, 0, false)] {
