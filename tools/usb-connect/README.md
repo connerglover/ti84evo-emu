@@ -18,8 +18,8 @@ node tools/usb-connect/serve.mjs `
 
 Open the printed loopback URL in Chrome or Edge. The page supports connection,
 screenshots with auto-refresh, variable download/upload, Python and image import,
-exam exit and OS bundle
-transfer. It loads the official communications library into a local host page;
+exam exit and OS bundle transfer. It loads the official communications library
+into a local host page;
 the emulator is not a Windows USB device selectable on TI's public website.
 The server downloads the three public TI scripts into memory at startup, or
 accepts `--library path/to/client-library` for an existing local copy.
@@ -27,8 +27,9 @@ Ctrl-C saves flash and stops the emulator. Do not use the same flash file in two
 running emulators.
 
 Connection, attributes, screenshots, directory listing, Python/image transfers
-and disconnect/reconnect were exercised in stock Chromium. Helium repeatedly reloaded during the TI library's worker
-initialization in testing; use stock Chrome or Edge if that occurs.
+and disconnect/reconnect were exercised in stock Chromium. Helium repeatedly
+reloaded during the TI library's worker initialization in testing; use stock
+Chrome or Edge if that occurs.
 
 ## Protocol verification
 

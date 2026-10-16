@@ -17,7 +17,10 @@ async function action(label, fn) {
   if (busy) return;
   busy = true; $('actions').disabled = true; $('cancel').disabled = !connected; status(label);
   try { await fn(); status('Ready.'); }
-  catch (error) { console.error(error); status(`Failed: ${typeof error === 'number' && ti ? ti.getErrorMessage(error) : error.message || error}`); }
+  catch (error) {
+    if (error === 9) status('Transfer cancelled.');
+    else { console.error(error); status(`Failed: ${typeof error === 'number' && ti ? ti.getErrorMessage(error) : error.message || error}`); }
+  }
   finally { busy = false; $('actions').disabled = !connected; $('cancel').disabled = true; }
 }
 $('cancel').onclick = () => { if (busy && ti) { ti.cancelOperation(); status('Cancelling…'); } };
