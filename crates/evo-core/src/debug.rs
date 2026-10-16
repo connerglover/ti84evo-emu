@@ -1,5 +1,6 @@
-//! Debugger controls on [`Machine`]: run goals (step over, step out, run to) and
-//! side-effect-free peripheral inspection ([`Machine::peripherals`]).
+//! Debugger controls on [`Machine`]: run goals (step over, step out, run to),
+//! side-effect-free peripheral inspection ([`Machine::peripherals`]), register writes
+//! ([`Machine::write_reg`]), setting the RTC and reading the power state.
 //!
 //! A goal is armed by one of the `arm_*` methods and checked by [`Machine::run`] before every
 //! step, ahead of breakpoints and exec watchpoints, except on the instruction the run resumes
@@ -12,7 +13,10 @@
 //! [`StopReason::Goal`]: crate::StopReason::Goal
 
 use armv8m::scs::nvic::NUM_IRQS;
-use armv8m::{Instr, Sec, decode16, decode32};
+use armv8m::{Banked, Instr, Sec, Xpsr, decode16, decode32};
+use evo_hw::dev::gpio::Gpio;
+use evo_hw::dev::rtc::Rtc;
+use evo_hw::dev::sysctl::Spctrl;
 use evo_hw::{DeviceInspect, RegView};
 
 use crate::Machine;
@@ -165,5 +169,105 @@ impl Machine {
             regs,
         });
         devs
+    }
+}
+
+/// Why [`Machine::write_reg`] refused a write.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RegError {
+    #[error("no register {0}")]
+    Unknown(String),
+}
+
+/// What the unit's power logic shows: whether the guest holds its own power on, and whether
+/// it armed deep sleep (the OS switched the unit "off").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PowerState {
+    /// GPIO pin 1 is an output driven high (`Gpio::power_hold`).
+    pub hold: bool,
+    /// SPCTRL +0xD4 bit 4 is set (`Spctrl::deep_sleep_armed`).
+    pub deep_sleep: bool,
+}
+
+/// One of a register's two security banks, from a `_s` / `_ns` name suffix.
+fn bank<T>(b: &mut Banked<T>, ns: bool) -> &mut T {
+    if ns { &mut b.ns } else { &mut b.s }
+}
+
+impl Machine {
+    /// Write a CPU register for the debugger. Names (lower case): `r0`-`r12`, `sp` (the
+    /// stack pointer in use now), `lr`, `pc`, `xpsr`, and the banked `msp psp msplim psplim
+    /// control primask basepri faultmask`, each with `_s` or `_ns`. `pc` drops the Thumb bit,
+    /// ends a WFI/WFE sleep and forgets the breakpoint the last run stopped at (a breakpoint at
+    /// the new PC stops the next run before it executes). The mask registers take bit 0
+    /// (`primask`, `faultmask`) or the low byte (`basepri`). An unknown name changes nothing.
+    pub fn write_reg(&mut self, name: &str, v: u32) -> Result<(), RegError> {
+        let regs = &mut self.cpu.regs;
+        if let Some(n) = name.strip_prefix('r')
+            && let Ok(i) = n.parse::<usize>()
+            && i < regs.r.len()
+            && n == i.to_string()
+        {
+            regs.r[i] = v;
+            return Ok(());
+        }
+        match name {
+            "sp" => regs.set_sp(v),
+            "lr" => regs.lr = v,
+            "pc" => {
+                regs.pc = v & !1;
+                self.stopped_at = None;
+                self.wake();
+            }
+            "xpsr" => regs.xpsr = Xpsr::from_u32(v),
+            _ => {
+                let unknown = || RegError::Unknown(name.to_owned());
+                let (base, ns) = match name.rsplit_once('_') {
+                    Some((base, "s")) => (base, false),
+                    Some((base, "ns")) => (base, true),
+                    _ => return Err(unknown()),
+                };
+                match base {
+                    "msp" => *bank(&mut regs.msp, ns) = v,
+                    "psp" => *bank(&mut regs.psp, ns) = v,
+                    "msplim" => *bank(&mut regs.msplim, ns) = v,
+                    "psplim" => *bank(&mut regs.psplim, ns) = v,
+                    "control" => *bank(&mut regs.control, ns) = v,
+                    "primask" => *bank(&mut regs.primask, ns) = v & 1 != 0,
+                    "faultmask" => *bank(&mut regs.faultmask, ns) = v & 1 != 0,
+                    "basepri" => *bank(&mut regs.basepri, ns) = v as u8,
+                    _ => return Err(unknown()),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set the RTC to `seconds_of_day % 86_400` now; it counts on from there.
+    pub fn set_rtc(&mut self, seconds_of_day: u32) {
+        self.with_dev("rtc", |r: &mut Rtc, ctx| {
+            r.set_seconds_of_day(seconds_of_day, ctx.now)
+        });
+    }
+
+    /// The RTC's seconds of day now (0..86_400).
+    pub fn rtc_seconds(&self) -> u32 {
+        self.bus
+            .device::<Rtc>("rtc")
+            .map_or(0, |r| r.seconds_of_day(self.sched.now))
+    }
+
+    /// The power hold and deep-sleep flags, read without side effects.
+    pub fn power_state(&self) -> PowerState {
+        PowerState {
+            hold: self
+                .bus
+                .device::<Gpio>("gpio")
+                .is_some_and(Gpio::power_hold),
+            deep_sleep: self
+                .bus
+                .device::<Spctrl>("spctrl")
+                .is_some_and(Spctrl::deep_sleep_armed),
+        }
     }
 }

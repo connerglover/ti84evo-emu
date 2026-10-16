@@ -66,6 +66,13 @@ impl Rtc {
         ((u64::from(self.base) + elapsed % DAY) % DAY) as u32
     }
 
+    /// Set the time (host/debugger): `s % 86_400` seconds of day at cycle `now`, counting on
+    /// from there, as a guest write of +0x44 does.
+    pub fn set_seconds_of_day(&mut self, s: u32, now: u64) {
+        self.base = (u64::from(s) % DAY) as u32;
+        self.set_at = now;
+    }
+
     /// Set status bits (host/test): `status |= bits & 0x3F`, then drive IRQ 15.
     pub fn raise_status(&mut self, bits: u32, ctx: &mut DevCtx<'_>) {
         self.status |= bits & STATUS_MASK;

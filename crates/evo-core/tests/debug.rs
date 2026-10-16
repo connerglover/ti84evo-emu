@@ -6,7 +6,8 @@
 //! (test files cannot share private helpers).
 
 use evo_core::{
-    AccessDir, Machine, RunGoal, StopReason, UartPort, WatchError, WatchKinds, WatchRange,
+    AccessDir, CPU_HZ, Machine, PowerState, RAM_HEADER_LEN, RAM_MAGIC, RAM_VERSION, RamError,
+    RegError, RunGoal, StopReason, UartPort, WatchError, WatchKinds, WatchRange,
 };
 use evo_image::testutil::secure_image_bundle;
 use evo_image::{Bundle, Layout};
@@ -674,4 +675,277 @@ fn peripherals_changes_nothing() {
     let first = m.peripherals();
     assert_eq!(m.save_state(), before);
     assert_eq!(m.peripherals(), first);
+}
+
+// ---- RAM images, register writes, RTC set, power state ----
+
+const SRAM_LEN: usize = 0x18_0000;
+const SRAM_LAST: u32 = 0x3000_0000 + SRAM_LEN as u32 - 4;
+
+/// A fresh STORE machine with recognisable bytes at the start and end of the SRAM.
+fn poked() -> Machine {
+    let mut m = store().boot();
+    assert!(m.bus.poke(0x3000_0000, 4, 0x1122_3344));
+    assert!(m.bus.poke(SRAM_LAST, 4, 0x5566_7788));
+    m
+}
+
+fn sram_words(m: &Machine) -> [Option<u32>; 3] {
+    [
+        m.bus.peek(0x3000_0000, 4),
+        m.bus.peek(0x3000_1000, 4),
+        m.bus.peek(SRAM_LAST, 4),
+    ]
+}
+
+#[test]
+fn ram_image_roundtrip() {
+    let mut m = poked();
+    let img = m.export_ram();
+    assert_eq!(img.len(), RAM_HEADER_LEN + SRAM_LEN);
+    assert_eq!(img.len(), 12 + 0x18_0000);
+    assert_eq!(&img[..6], RAM_MAGIC);
+    assert_eq!(u16::from_le_bytes([img[6], img[7]]), RAM_VERSION);
+    assert_eq!(
+        u32::from_le_bytes(img[8..12].try_into().unwrap()) as usize,
+        SRAM_LEN
+    );
+    assert_eq!(&img[12..16], &0x1122_3344u32.to_le_bytes());
+    m.bus.poke(0x3000_0000, 4, 0xAAAA_AAAA);
+    m.bus.poke(0x3000_1000, 4, 0xBBBB_BBBB);
+    m.bus.poke(SRAM_LAST, 4, 0);
+    m.import_ram(&img).unwrap();
+    assert_eq!(
+        sram_words(&m),
+        [Some(0x1122_3344), Some(0), Some(0x5566_7788)]
+    );
+    assert_eq!(m.export_ram(), img);
+}
+
+#[test]
+fn import_ram_is_seen_by_the_guest() {
+    let mut m = store().boot();
+    m.run(1000);
+    let mut img = m.export_ram();
+    let off = RAM_HEADER_LEN + (WORD - 0x3000_0000) as usize;
+    img[off..off + 4].copy_from_slice(&0xCAFEu32.to_le_bytes());
+    m.import_ram(&img).unwrap();
+    assert_eq!(m.bus.peek(WORD, 4), Some(0xCAFE));
+    // The Non-secure alias shows the same bytes.
+    assert_eq!(m.bus.peek(WORD - 0x1000_0000, 4), Some(0xCAFE));
+}
+
+#[test]
+fn import_ram_rejects_bad_magic() {
+    let mut m = poked();
+    let mut img = m.export_ram();
+    img[0] = b'X';
+    m.bus.poke(0x3000_0000, 4, 0xAAAA_AAAA);
+    let before = sram_words(&m);
+    assert_eq!(m.import_ram(&img), Err(RamError::BadMagic));
+    assert_eq!(m.import_ram(&[]), Err(RamError::BadMagic));
+    assert_eq!(m.import_ram(&img[..5]), Err(RamError::BadMagic));
+    // A truncated header is not a RAM image either.
+    assert_eq!(m.import_ram(b"EVORAM\x01\x00"), Err(RamError::BadMagic));
+    assert_eq!(sram_words(&m), before);
+    assert_eq!(RamError::BadMagic.to_string(), "not a RAM image");
+}
+
+#[test]
+fn import_ram_rejects_version_2() {
+    let mut m = poked();
+    let mut img = m.export_ram();
+    img[6..8].copy_from_slice(&2u16.to_le_bytes());
+    m.bus.poke(0x3000_0000, 4, 0xAAAA_AAAA);
+    let before = sram_words(&m);
+    assert_eq!(m.import_ram(&img), Err(RamError::Version(2)));
+    assert_eq!(sram_words(&m), before);
+    assert_eq!(
+        RamError::Version(2).to_string(),
+        "RAM image version 2 is not supported"
+    );
+}
+
+#[test]
+fn import_ram_rejects_short_and_long() {
+    let mut m = poked();
+    let img = m.export_ram();
+    m.bus.poke(0x3000_0000, 4, 0xAAAA_AAAA);
+    let before = sram_words(&m);
+    // Body shorter or longer than the header says.
+    assert_eq!(
+        m.import_ram(&img[..img.len() - 1]),
+        Err(RamError::Size {
+            expected: SRAM_LEN,
+            found: SRAM_LEN - 1
+        })
+    );
+    let mut long = img.clone();
+    long.push(0);
+    assert_eq!(
+        m.import_ram(&long),
+        Err(RamError::Size {
+            expected: SRAM_LEN,
+            found: SRAM_LEN + 1
+        })
+    );
+    // A header (and body) for another SRAM size.
+    let mut small = img[..RAM_HEADER_LEN + 0x1000].to_vec();
+    small[8..12].copy_from_slice(&0x1000u32.to_le_bytes());
+    assert_eq!(
+        m.import_ram(&small),
+        Err(RamError::Size {
+            expected: SRAM_LEN,
+            found: 0x1000
+        })
+    );
+    // Header only.
+    assert_eq!(
+        m.import_ram(&img[..RAM_HEADER_LEN]),
+        Err(RamError::Size {
+            expected: SRAM_LEN,
+            found: 0
+        })
+    );
+    assert_eq!(sram_words(&m), before);
+    assert_eq!(
+        RamError::Size {
+            expected: 2,
+            found: 1
+        }
+        .to_string(),
+        "RAM image holds 1 bytes, this machine has 2"
+    );
+}
+
+#[test]
+fn write_reg_sets_core_and_banked() {
+    let mut m = store().boot();
+    m.write_reg("pc", 0x100B_0603).unwrap();
+    assert_eq!(m.cpu.regs.pc, 0x100B_0602);
+    m.write_reg("r0", 7).unwrap();
+    m.write_reg("r12", 12).unwrap();
+    assert_eq!(m.cpu.regs.r[0], 7);
+    assert_eq!(m.cpu.regs.r[12], 12);
+    m.write_reg("lr", 0xFFFF_FFF9).unwrap();
+    assert_eq!(m.cpu.regs.lr, 0xFFFF_FFF9);
+    m.write_reg("sp", 0x3000_0700).unwrap();
+    assert_eq!(m.cpu.regs.sp(), 0x3000_0700);
+    assert_eq!(m.cpu.regs.msp.s, 0x3000_0700);
+    m.write_reg("xpsr", 0x6100_0000).unwrap();
+    assert_eq!(m.cpu.regs.xpsr.to_u32(), 0x6100_0000);
+    m.write_reg("control_ns", 0b10).unwrap();
+    assert_eq!(m.cpu.regs.control.ns, 0b10);
+    assert_eq!(m.cpu.regs.control.s, 0);
+    m.write_reg("primask_s", 1).unwrap();
+    assert!(m.cpu.regs.primask.s);
+    assert!(!m.cpu.regs.primask.ns);
+    m.write_reg("faultmask_ns", 3).unwrap();
+    assert!(m.cpu.regs.faultmask.ns);
+    m.write_reg("faultmask_ns", 2).unwrap();
+    assert!(!m.cpu.regs.faultmask.ns, "bools come from bit 0");
+    m.write_reg("basepri_s", 0x1E0).unwrap();
+    assert_eq!(m.cpu.regs.basepri.s, 0xE0);
+    for (name, v) in [
+        ("msp_s", 0x10),
+        ("msp_ns", 0x20),
+        ("psp_s", 0x30),
+        ("psp_ns", 0x40),
+        ("msplim_s", 0x50),
+        ("msplim_ns", 0x60),
+        ("psplim_s", 0x70),
+        ("psplim_ns", 0x80),
+        ("control_s", 0x1),
+        ("basepri_ns", 0x40),
+        ("primask_ns", 1),
+        ("faultmask_s", 1),
+    ] {
+        m.write_reg(name, v).unwrap();
+    }
+    let r = &m.cpu.regs;
+    assert_eq!(
+        [
+            r.msp.s,
+            r.msp.ns,
+            r.psp.s,
+            r.psp.ns,
+            r.msplim.s,
+            r.msplim.ns,
+            r.psplim.s,
+            r.psplim.ns,
+            r.control.s,
+            u32::from(r.basepri.ns),
+            u32::from(r.primask.ns),
+            u32::from(r.faultmask.s),
+        ],
+        [
+            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 1, 0x40, 1, 1
+        ]
+    );
+}
+
+#[test]
+fn write_pc_stops_at_a_breakpoint_there() {
+    // Stopped at a breakpoint, a PC write moves on: the next run does not step over the
+    // breakpoint it stopped at, it stops there again.
+    let mut m = store().boot();
+    m.breakpoints.insert(LOOP_HEAD);
+    assert_eq!(m.run(1000), StopReason::Breakpoint(LOOP_HEAD));
+    m.write_reg("pc", LOOP_HEAD).unwrap();
+    assert_eq!(m.run(1000), StopReason::Breakpoint(LOOP_HEAD));
+    assert_eq!(m.cpu.regs.r[1], 0, "nothing ran");
+}
+
+#[test]
+fn write_reg_unknown_is_err() {
+    let mut m = store().boot();
+    let before = m.cpu.regs.clone();
+    for name in ["r13", "foo", "", "msp", "control", "PC"] {
+        assert_eq!(
+            m.write_reg(name, 1),
+            Err(RegError::Unknown(name.to_owned()))
+        );
+    }
+    assert_eq!(m.cpu.regs, before);
+    assert_eq!(RegError::Unknown("x".into()).to_string(), "no register x");
+}
+
+/// `wfi ; b wfi`, woken by a SysTick every 2^24 cycles (handler `bx lr`): time passes in
+/// big sleep jumps, so seconds of guest time cost few steps.
+fn sleeper() -> Payload {
+    let mut p = Payload::new();
+    p.vector(1, CODE)
+        .vector(15, 0x220)
+        .code(CODE, &[0xBF30 /* wfi */, 0xE7FD /* b wfi */])
+        .code(0x220, &[BX_LR]);
+    p
+}
+
+#[test]
+fn set_rtc_reads_back() {
+    let mut m = sleeper().boot();
+    m.cpu.ppb_write32(0xE000_E014, 0x00FF_FFFF); // SYST_RVR
+    m.cpu.ppb_write32(0xE000_E010, 0b111); // SYST_CSR: ENABLE, TICKINT, CLKSOURCE
+    m.run(1000);
+    m.set_rtc(3600);
+    assert_eq!(m.rtc_seconds(), 3600);
+    let start = m.sched.now;
+    while m.sched.now - start < 2 * CPU_HZ {
+        m.run(2 * CPU_HZ - (m.sched.now - start));
+    }
+    assert_eq!(m.rtc_seconds(), 3602);
+    m.set_rtc(86_401);
+    assert_eq!(m.rtc_seconds(), 1);
+}
+
+#[test]
+fn power_state_at_power_on() {
+    let m = store().boot();
+    assert_eq!(
+        m.power_state(),
+        PowerState {
+            hold: false,
+            deep_sleep: false
+        }
+    );
 }
