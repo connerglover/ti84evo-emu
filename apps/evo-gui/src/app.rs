@@ -499,6 +499,13 @@ impl EvoApp {
         self.features.push(f);
     }
 
+    /// Adds a feature ahead of the built-in ones, so it is offered actions they own
+    /// (tests only).
+    #[doc(hidden)]
+    pub fn push_feature_first(&mut self, f: Box<dyn Feature>) {
+        self.features.push_first(f);
+    }
+
     /// The debug panels' state: consoles, log and tabs.
     pub fn debug(&self) -> &DebugPanel {
         &self.debug

@@ -11,6 +11,8 @@ pub struct Features {
     pub tools: crate::tools::Tools,
     pub files: crate::files::Files,
     pub help: crate::help::Help,
+    /// Features added with [`push_first`](Self::push_first) (tests), before the five.
+    first: Vec<Box<dyn Feature>>,
     /// Features added with [`push`](Self::push) (tests), after the five.
     extra: Vec<Box<dyn Feature>>,
 }
@@ -23,19 +25,25 @@ impl Features {
             tools: crate::tools::Tools::new(opts),
             files: crate::files::Files::new(opts),
             help: crate::help::Help::new(opts),
+            first: Vec::new(),
             extra: Vec::new(),
         }
     }
 
-    /// The five features in field order, then the extra ones.
+    /// The `first` features, the five in field order, then the extra ones.
     pub fn each(&mut self) -> Vec<&mut dyn Feature> {
-        let mut all: Vec<&mut dyn Feature> = vec![
-            &mut self.rom,
+        let mut all: Vec<&mut dyn Feature> = self
+            .first
+            .iter_mut()
+            .map(|f| f.as_mut() as &mut dyn Feature)
+            .collect();
+        all.extend([
+            &mut self.rom as &mut dyn Feature,
             &mut self.capture,
             &mut self.tools,
             &mut self.files,
             &mut self.help,
-        ];
+        ]);
         all.extend(
             self.extra
                 .iter_mut()
@@ -46,13 +54,14 @@ impl Features {
 
     /// As [`each`](Self::each), shared.
     fn iter(&self) -> Vec<&dyn Feature> {
-        let mut all: Vec<&dyn Feature> = vec![
-            &self.rom,
+        let mut all: Vec<&dyn Feature> = self.first.iter().map(|f| f.as_ref()).collect();
+        all.extend([
+            &self.rom as &dyn Feature,
             &self.capture,
             &self.tools,
             &self.files,
             &self.help,
-        ];
+        ]);
         all.extend(self.extra.iter().map(|f| f.as_ref()));
         all
     }
@@ -79,5 +88,11 @@ impl Features {
     #[doc(hidden)]
     pub fn push(&mut self, f: Box<dyn Feature>) {
         self.extra.push(f);
+    }
+
+    /// Adds a feature ahead of the five, so it is offered actions they own (tests only).
+    #[doc(hidden)]
+    pub fn push_first(&mut self, f: Box<dyn Feature>) {
+        self.first.push(f);
     }
 }

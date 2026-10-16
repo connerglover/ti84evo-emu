@@ -614,11 +614,10 @@ fn click_release_lands_at_min_hold() {
 
 #[test]
 fn requests_from_action_and_ui_apply_in_the_same_frame() {
-    // Lane E owns KeyHistory now; this needs an action no built-in feature claims yet
-    // (ReportBug until Lane F lands). Once every action has an owner, the merger must give
-    // this test a durable hook (see the Lane E task E2 report).
+    // Every action has a built-in owner, so the test feature goes ahead of them and
+    // takes ReportBug before Help sees it.
     let (mut h, _dir) = request_harness("sameframe", FakeBackend::new(), false);
-    h.state_mut().push_feature(Box::new(TestFeature {
+    h.state_mut().push_feature_first(Box::new(TestFeature {
         owns: Some(Action::ReportBug),
         on_action_push: vec![AppRequest::SetPaused(true)],
         ui_push_compact_once: true,
