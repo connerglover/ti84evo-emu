@@ -1,6 +1,8 @@
-//! The debug panels: run controls, then one tab of registers, disassembly,
-//! memory, UART output or unmapped accesses.
+//! The debug dock: the run row (continue/pause, step, step over, step out), then one tab
+//! of [`DebugTab::ALL`]. Only the selected tab is drawn, so hidden tabs make no backend
+//! calls.
 
+mod control;
 mod disasm;
 mod memory;
 mod regs;
@@ -9,6 +11,7 @@ mod unmapped;
 
 use egui::{Button, ScrollArea, Sense};
 
+pub use control::cycle_text;
 pub use disasm::{DISASM_LINES, format_disasm};
 pub use memory::DEFAULT_MEM_ADDR;
 pub use uart::{UART_CAP, UartConsole};
@@ -39,37 +42,63 @@ pub fn parse_addr(s: &str) -> Option<u32> {
     u32::from_str_radix(&digits, 16).ok()
 }
 
-/// The debug panel's tabs.
+/// The debug dock's tabs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DebugTab {
+    Control,
     #[default]
     Registers,
     Disassembly,
     Memory,
-    Uart,
+    Visualizer,
+    Breakpoints,
+    Watchpoints,
+    Peripherals,
+    BusMonitor,
+    Stacks,
+    Console,
     Unmapped,
 }
 
 impl DebugTab {
     /// Every tab, in selector order.
-    pub const ALL: [DebugTab; 5] = [
+    pub const ALL: [DebugTab; 12] = [
+        DebugTab::Control,
         DebugTab::Registers,
         DebugTab::Disassembly,
         DebugTab::Memory,
-        DebugTab::Uart,
+        DebugTab::Visualizer,
+        DebugTab::Breakpoints,
+        DebugTab::Watchpoints,
+        DebugTab::Peripherals,
+        DebugTab::BusMonitor,
+        DebugTab::Stacks,
+        DebugTab::Console,
         DebugTab::Unmapped,
     ];
 
     /// The selector label.
     pub fn label(self) -> &'static str {
         match self {
+            DebugTab::Control => "Control",
             DebugTab::Registers => "Registers",
             DebugTab::Disassembly => "Disassembly",
             DebugTab::Memory => "Memory",
-            DebugTab::Uart => "UART",
+            DebugTab::Visualizer => "Visualizer",
+            DebugTab::Breakpoints => "Breakpoints",
+            DebugTab::Watchpoints => "Watchpoints",
+            DebugTab::Peripherals => "Peripherals",
+            DebugTab::BusMonitor => "Bus monitor",
+            DebugTab::Stacks => "Stacks",
+            DebugTab::Console => "Console",
             DebugTab::Unmapped => "Unmapped",
         }
     }
+}
+
+/// The body of a tab a later task fills in.
+fn not_yet(ui: &mut egui::Ui) {
+    ui.weak("Not available yet.");
 }
 
 /// What the run controls asked for this frame; the app applies it.
@@ -80,6 +109,7 @@ pub struct DebugOutput {
     /// `Step` was clicked (only possible while paused).
     pub step: bool,
     /// A debugger goal to start (only while paused): the app calls `begin_goal`.
+    /// "Step over", "Step out" and the Control tab's "Run" set it.
     pub goal: Option<Goal>,
     /// Errors to show as Error toasts.
     pub notes: Vec<String>,
@@ -89,6 +119,7 @@ pub struct DebugOutput {
 #[derive(Clone, Debug, Default)]
 pub struct DebugPanel {
     tab: DebugTab,
+    control: control::ControlState,
     disasm: disasm::DisasmState,
     memory: memory::MemoryState,
     uart: UartConsole,
@@ -150,10 +181,17 @@ impl DebugPanel {
         paused: bool,
     ) -> DebugOutput {
         let mut out = DebugOutput::default();
-        ui.horizontal(|ui| {
+        // Wraps in a narrow dock instead of pushing the panel past its width cap.
+        ui.horizontal_wrapped(|ui| {
             let run = if paused { "Continue" } else { "Pause" };
             out.toggle_pause = button(ui, true, Button::new(run));
             out.step = button(ui, paused, Button::new("Step"));
+            if button(ui, paused, Button::new("Step over")) {
+                out.goal = Some(Goal::StepOver);
+            }
+            if button(ui, paused, Button::new("Step out")) {
+                out.goal = Some(Goal::StepOut);
+            }
         });
         ui.horizontal_wrapped(|ui| {
             for tab in DebugTab::ALL {
@@ -164,6 +202,11 @@ impl DebugPanel {
         });
         ui.separator();
         match self.tab {
+            DebugTab::Control => {
+                if let Some(goal) = control::show(ui, &mut self.control, backend, paused) {
+                    out.goal = Some(goal);
+                }
+            }
             DebugTab::Registers => {
                 // Scrolls instead of widening the panel past its cap.
                 let cpu = backend.cpu();
@@ -174,8 +217,14 @@ impl DebugPanel {
             }
             DebugTab::Disassembly => disasm::show(ui, &mut self.disasm, backend),
             DebugTab::Memory => memory::show(ui, &mut self.memory, backend),
-            DebugTab::Uart => uart::show(ui, &mut self.uart),
+            DebugTab::Console => uart::show(ui, &mut self.uart),
             DebugTab::Unmapped => unmapped::show(ui, &backend.unmapped()),
+            DebugTab::Visualizer
+            | DebugTab::Breakpoints
+            | DebugTab::Watchpoints
+            | DebugTab::Peripherals
+            | DebugTab::BusMonitor
+            | DebugTab::Stacks => not_yet(ui),
         }
         out
     }
