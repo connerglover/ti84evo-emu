@@ -57,6 +57,11 @@ requires byte-for-byte equality. Use a disposable flash copy for verification.
 library, transfers it, receives identical source text, then deletes the test
 variable. `--install-bundle path/to/OS.84b2` transfers an OS package. These options
 modify the guest's flash; use a disposable copy for verification.
+OS transfer success confirms staging. Reopening a saved, valid permanent update
+activates it at the boot boundary. Automatic activation is not established:
+letting a same-version reinstall run for five extra guest seconds erased its
+staging slot without an observed system reset. Cross-version upgrades remain
+unverified; see [boot-flow.md](../../docs/hardware/boot-flow.md).
 `--recovery-checks` sends malformed L1 data, requires the guest's rejection and
 unchanged readback, then cancels a screenshot after data begins arriving and
 requires a successful directory read and full screenshot afterward. The observed

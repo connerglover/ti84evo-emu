@@ -43,6 +43,14 @@ An actual official TI Connect Evo `sendBundle` transfer wrote the secondary imag
 its trailer: MCUboot magic at `0x37FFF0`, `image_ok=1` at `0x37FFE8`, and erased
 `copy_done` at `0x37FFE0`. Transfer success alone therefore means staging succeeded.
 
+In two further same-version 7.1.0.4421 reinstalls, advancing five guest seconds
+after `sendBundle` returned success left the entire secondary slot erased and
+the primary trailer erased. The enabled core diagnostics recorded neither
+SYSRESETREQ nor permanent-update activation. This establishes subsequent guest
+cleanup in that scenario, not its reason, automatic activation, or the behavior
+of a different-version upgrade. Saving the staged image at transfer completion
+and activating it on the next explicit boot was verified separately.
+
 Before activation, `evo-core/src/boot.rs` requires that trailer and validates bounded
 MCUboot header/TLV lengths, image flags, SHA-256 over header/body/protected TLVs, a
 nondecreasing protected security counter, and RSA-3072 PSS with SHA-256 and a 32-byte
