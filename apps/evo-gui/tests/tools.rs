@@ -1,7 +1,17 @@
-//! Tools: key scripts (E1).
+//! Tools: key scripts (E1) and key history (E2).
 
-use evo_gui::backend::CLOCK_HZ;
+mod common;
+
+use common::{TempDir, harness_with, open_action, test_options};
+use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
+use evo_gui::app::{AppOptions, EvoApp};
+use evo_gui::backend::fake::FakeBackend;
+use evo_gui::backend::{CLOCK_HZ, KeyEvent};
 use evo_gui::keypad::KeyId;
+use evo_gui::platform::FakePlatform;
+use evo_gui::toolbar::Action;
+use evo_gui::tools::history::{KEY_HISTORY_CAP, KeyHistory, history_line};
 use evo_gui::tools::script::{
     ScriptError, ScriptEvent, TAP_GAP_MS, TAP_HOLD_MS, key_by_name, ms_between, parse_script,
     to_script,
@@ -180,4 +190,136 @@ fn ms_between_cases() {
     let exact = (u128::from(u64::MAX) * 1000 / u128::from(CLOCK_HZ)) as u64;
     assert_eq!(ms_between(0, u64::MAX), exact);
     assert!(exact > u64::MAX / CLOCK_HZ * 1000);
+}
+
+// ---- E2: key history ----
+
+/// A running app on `fake` with its own data dir (kept alive by the returned guard).
+fn tools_harness(fake: FakeBackend) -> (Harness<'static, EvoApp>, TempDir) {
+    let dir = TempDir::new("evo-gui-tools", true);
+    let opts = AppOptions {
+        start_paused: false,
+        ..test_options(&dir, FakePlatform::shared())
+    };
+    (harness_with(fake, opts), dir)
+}
+
+fn kev(key: KeyId, pressed: bool, cycle: u64) -> KeyEvent {
+    KeyEvent {
+        key,
+        pressed,
+        cycle,
+    }
+}
+
+fn history_open(h: &Harness<'static, EvoApp>) -> bool {
+    h.state().features().active(Action::KeyHistory)
+}
+
+#[test]
+fn history_line_format() {
+    assert_eq!(KEY_HISTORY_CAP, 1000);
+    assert_eq!(
+        history_line(&kev(KeyId::Enter, true, 156_000_000)),
+        "     1.000 s  enter    down"
+    );
+    assert_eq!(
+        history_line(&kev(KeyId::Second, false, 7_800_000)),
+        "     0.050 s  2nd      up"
+    );
+}
+
+#[test]
+fn history_window_lists_presses() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = tools_harness(fake);
+    open_action(&mut h, Action::KeyHistory);
+    assert!(history_open(&h));
+    h.get_by_label("enter").click();
+    h.run_steps(8);
+    let events = probe.key_events();
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| (e.key, e.pressed))
+            .collect::<Vec<_>>(),
+        [(KeyId::Enter, true), (KeyId::Enter, false)]
+    );
+    let down = history_line(&events[0]);
+    let up = history_line(&events[1]);
+    assert!(down.ends_with("enter    down"), "{down}");
+    assert!(up.ends_with("enter    up"), "{up}");
+    h.get_by_label(&down);
+    h.get_by_label(&up);
+
+    h.get_by_label("Clear").click();
+    h.run_steps(2);
+    assert!(h.query_by_label(&down).is_none());
+    assert!(h.query_by_label(&up).is_none());
+}
+
+#[test]
+fn history_is_fed_while_closed() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = tools_harness(fake);
+    h.get_by_label("enter").click();
+    h.run_steps(8);
+    assert!(!history_open(&h));
+    open_action(&mut h, Action::KeyHistory);
+    let events = probe.key_events();
+    assert_eq!(events.len(), 2);
+    h.get_by_label(&history_line(&events[0]));
+    h.get_by_label(&history_line(&events[1]));
+    // The action toggles: running it again closes the window.
+    open_action(&mut h, Action::KeyHistory);
+    assert!(!history_open(&h));
+    assert!(h.query_by_label(&history_line(&events[0])).is_none());
+}
+
+#[test]
+fn history_is_capped() {
+    let mut hist = KeyHistory::new();
+    let events: Vec<KeyEvent> = (0..KEY_HISTORY_CAP as u64 + 5)
+        .map(|i| kev(KeyId::Enter, i % 2 == 0, i * 1000))
+        .collect();
+    hist.push(&events[..10]);
+    hist.push(&events[10..]);
+    assert_eq!(hist.len(), KEY_HISTORY_CAP);
+    let kept: Vec<KeyEvent> = hist.events().copied().collect();
+    assert_eq!(kept, events[5..]);
+    hist.clear();
+    assert_eq!(hist.len(), 0);
+}
+
+#[test]
+fn history_script_times_from_the_first_event() {
+    let mut hist = KeyHistory::new();
+    assert_eq!(hist.script(), "");
+    let t0 = 1_000_000_000;
+    let ms = CLOCK_HZ / 1000;
+    hist.push(&[
+        kev(KeyId::Two, true, t0),
+        kev(KeyId::Two, false, t0 + 50 * ms),
+        kev(KeyId::Alpha, true, t0 + 100 * ms),
+        kev(KeyId::Alpha, false, t0 + 400 * ms),
+    ]);
+    assert_eq!(hist.script(), "2 +alpha wait=300 -alpha");
+}
+
+#[test]
+fn copy_as_script() {
+    let (mut h, _dir) = tools_harness(FakeBackend::new());
+    open_action(&mut h, Action::KeyHistory);
+    h.get_by_label("enter").click();
+    h.run_steps(8);
+    h.get_by_label("Copy as key script").click();
+    let want = egui::OutputCommand::CopyText("enter".into());
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        h.step();
+        seen.extend(h.output().platform_output.commands.iter().cloned());
+    }
+    assert!(seen.contains(&want), "{seen:?}");
 }

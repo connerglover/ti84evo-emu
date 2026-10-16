@@ -1,33 +1,60 @@
 //! Tools: key scripts, key history, macros / AutoTester and the Hardware panel.
 //!
 //! [`Tools`] is the feature that owns the Key history, Macros / AutoTester and Hardware
-//! windows; until those land it declines every action. It keeps `new(&AppOptions)`.
+//! windows; it declines the actions whose windows have not landed yet. It keeps
+//! `new(&AppOptions)`.
 
+pub mod history;
 pub mod script;
 
 use crate::app::AppOptions;
 use crate::feature::{Feature, FeatureCtx};
 use crate::toolbar::Action;
+use history::KeyHistory;
 
-/// The tools feature (stub: declines every action).
+/// The tools feature.
 pub struct Tools {
-    _priv: (),
+    history: KeyHistory,
 }
 
 impl Tools {
     pub fn new(_opts: &AppOptions) -> Self {
-        Self { _priv: () }
+        Self {
+            history: KeyHistory::new(),
+        }
+    }
+
+    /// The key history (fed every frame, also while its window is closed).
+    pub fn history(&self) -> &KeyHistory {
+        &self.history
+    }
+
+    pub fn history_mut(&mut self) -> &mut KeyHistory {
+        &mut self.history
     }
 }
 
 impl Feature for Tools {
-    fn on_action(&mut self, _action: Action, _cx: &mut FeatureCtx<'_>) -> bool {
-        false
+    fn on_action(&mut self, action: Action, _cx: &mut FeatureCtx<'_>) -> bool {
+        match action {
+            Action::KeyHistory => {
+                self.history.toggle();
+                true
+            }
+            _ => false,
+        }
     }
-    fn frame(&mut self, _cx: &mut FeatureCtx<'_>) {}
-    fn ui(&mut self, _ctx: &egui::Context, _cx: &mut FeatureCtx<'_>) {}
-    fn active(&self, _action: Action) -> bool {
-        false
+    fn frame(&mut self, cx: &mut FeatureCtx<'_>) {
+        self.history.push(cx.key_events);
+    }
+    fn ui(&mut self, ctx: &egui::Context, _cx: &mut FeatureCtx<'_>) {
+        self.history.ui(ctx);
+    }
+    fn active(&self, action: Action) -> bool {
+        match action {
+            Action::KeyHistory => self.history.is_open(),
+            _ => false,
+        }
     }
     fn next_deadline(&self) -> Option<u64> {
         None
