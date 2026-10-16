@@ -139,6 +139,13 @@ impl KeyLatch {
         std::mem::take(&mut self.edges)
     }
 
+    /// The earliest cycle a pending release is due at (`pressed_at + MIN_HOLD_CYCLES` of a
+    /// key no source holds any more); `None` when no release is pending. A key a source still
+    /// holds has no release pending.
+    pub fn next_release(&self) -> Option<u64> {
+        self.holds.values().filter_map(|h| h.release_at).min()
+    }
+
     /// True while the key is down in the backend (including a pending release).
     pub fn is_down(&self, key: KeyId) -> bool {
         self.holds.contains_key(&key)

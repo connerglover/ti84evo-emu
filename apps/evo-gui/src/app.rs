@@ -14,8 +14,10 @@ use egui::{
 };
 
 use crate::backend::placeholder::Placeholder;
-use crate::backend::{BackendError, CLOCK_HZ, EmuBackend, RunStatus};
+use crate::backend::{BackendError, CLOCK_HZ, EmuBackend, KeyEvent, RunStatus, UartId};
 use crate::debug::{DEBUG_MIN_W, DEBUG_W, DebugPanel};
+use crate::feature::{AppRequest, Feature, FeatureCtx};
+use crate::features::Features;
 use crate::input::{KeyAction, KeyLatch, KeyboardTracker, Keymap, Source, pc_key_label};
 use crate::keymap_window::KeymapWindow;
 use crate::keypad::geometry::{
@@ -24,7 +26,7 @@ use crate::keypad::geometry::{
 use crate::keypad::paint::{body_rect_to_screen, keypad_rect_to_screen, paint_body, paint_key};
 use crate::keypad::{KEYS, KeyId, KeyShape, key_def};
 use crate::lcd::{LcdView, ScaleFilter};
-use crate::pacer::{FrameRunner, Pacer, Speed, SpeedMeter, WALL_BUDGET};
+use crate::pacer::{FrameRunner, Pacer, Speed, SpeedMeter, WALL_BUDGET, capped_budget};
 use crate::platform::{DesktopPlatform, PlatformRef};
 use crate::prefs::{PREFS_KEY, Prefs};
 use crate::store::{Store, StoreError};
@@ -123,10 +125,17 @@ pub struct AppOptions {
     pub notice: Option<String>,
     /// File dialogs, clipboard, browser, network and process spawning.
     pub platform: PlatformRef,
+    /// Open the ROM Setup Wizard on the first frame.
+    pub open_wizard: bool,
+    /// The OS bundle the backend was opened from; `None` without a ROM or for the demo.
+    pub rom: Option<PathBuf>,
+    /// The instance id; `None` for the default instance.
+    pub instance: Option<String>,
 }
 
 impl AppOptions {
-    /// Defaults: not paused, default preferences, no notice, the desktop platform.
+    /// Defaults: not paused, default preferences, no notice, the desktop platform, no wizard,
+    /// no ROM, the default instance.
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             start_paused: false,
@@ -134,6 +143,9 @@ impl AppOptions {
             prefs: Prefs::default(),
             notice: None,
             platform: DesktopPlatform::shared(),
+            open_wizard: false,
+            rom: None,
+            instance: None,
         }
     }
 }
@@ -244,6 +256,16 @@ pub struct EvoApp {
     toolbar_rect: Rect,
     /// The platform services; features reach them through the app.
     platform: PlatformRef,
+    /// The tools, driven through the [`Feature`] seam.
+    features: Features,
+    /// The OS bundle the backend was opened from.
+    rom: Option<PathBuf>,
+    /// The instance id; `None` for the default instance.
+    instance: Option<String>,
+    /// The egui context, for requests that need it (`Close`).
+    ctx: egui::Context,
+    /// Set once a `Close` request was applied.
+    close_requested: bool,
 }
 
 impl EvoApp {
@@ -253,6 +275,7 @@ impl EvoApp {
     pub fn new(cc_ctx: &egui::Context, backend: Box<dyn EmuBackend>, opts: AppOptions) -> Self {
         install_fonts(cc_ctx);
         cc_ctx.set_theme(egui::ThemePreference::Light);
+        let features = Features::new(&opts);
         let mut toasts = Toasts::new();
         if let Some(notice) = opts.notice {
             toasts.push(notice, ToastKind::Info);
@@ -301,6 +324,11 @@ impl EvoApp {
             speed_setting: opts.prefs.speed,
             transform: CalcTransform::fit(egui::Rect::ZERO),
             platform: opts.platform,
+            features,
+            rom: opts.rom,
+            instance: opts.instance,
+            ctx: cc_ctx.clone(),
+            close_requested: false,
         };
         if needs_provision {
             app.start_provision();
@@ -395,8 +423,151 @@ impl EvoApp {
         self.paused
     }
 
+    /// Pauses or resumes. Pausing cancels any debugger goal (also when already paused).
+    /// Resuming from a breakpoint first steps off it, or the run would stop on it at once.
     pub fn set_paused(&mut self, p: bool) {
-        self.paused = p;
+        if p {
+            self.backend.cancel_goal();
+            if !self.paused {
+                self.paused = true;
+                self.speed.reset();
+            }
+            return;
+        }
+        if !self.paused {
+            return;
+        }
+        if matches!(self.status, RunStatus::Breakpoint(_)) {
+            self.status = self.backend.step();
+        }
+        self.paused = false;
+        if !self.status.is_stop() {
+            self.status = RunStatus::Running;
+        }
+        self.speed.reset();
+    }
+
+    /// The OS bundle the backend was opened from; `None` without a ROM or for the demo.
+    pub fn rom(&self) -> Option<&Path> {
+        self.rom.as_deref()
+    }
+
+    pub fn features(&self) -> &Features {
+        &self.features
+    }
+
+    pub fn features_mut(&mut self) -> &mut Features {
+        &mut self.features
+    }
+
+    /// Adds a feature after the built-in ones (tests only).
+    #[doc(hidden)]
+    pub fn push_feature(&mut self, f: Box<dyn Feature>) {
+        self.features.push(f);
+    }
+
+    /// The debug panels' state: consoles, log and tabs.
+    pub fn debug(&self) -> &DebugPanel {
+        &self.debug
+    }
+
+    /// True once a `Close` request was applied.
+    pub fn close_requested(&self) -> bool {
+        self.close_requested
+    }
+
+    /// Applies one feature request (see [`crate::feature`] for when the app does this).
+    pub fn apply_request(&mut self, r: AppRequest) {
+        match r {
+            AppRequest::Resync => self.resync(),
+            AppRequest::Persist => self.persist(),
+            AppRequest::Reset => self.reset_machine(),
+            AppRequest::Provision => self.start_provision(),
+            AppRequest::ReplaceBackend {
+                backend,
+                rom,
+                persist_old,
+            } => self.replace_backend(backend, rom, persist_old),
+            AppRequest::ApplyPrefs(p) => self.apply_prefs(p),
+            AppRequest::SetPaused(p) => self.set_paused(p),
+            AppRequest::ResetLayout => self.pending_reset_layout = true,
+            AppRequest::Close => {
+                self.close_requested = true;
+                self.ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn apply_requests(&mut self, requests: Vec<AppRequest>) {
+        for r in requests {
+            self.apply_request(r);
+        }
+    }
+
+    /// Swaps in `backend`. A provisioning run in progress is abandoned: its thread is detached
+    /// and the backend it holds is dropped when it ends, unsaved.
+    fn replace_backend(
+        &mut self,
+        backend: Box<dyn EmuBackend>,
+        rom: Option<PathBuf>,
+        persist_old: bool,
+    ) {
+        if self.provisioning.take().is_some() {
+            self.toasts.set_progress(None);
+        } else if persist_old {
+            self.persist();
+        }
+        self.backend = backend;
+        self.rom = rom;
+        self.resync();
+        if self.backend.needs_provision() {
+            self.start_provision();
+        }
+    }
+
+    fn apply_prefs(&mut self, p: Prefs) {
+        self.keymap = p.keymap;
+        self.filter = p.filter;
+        self.debug_open = p.debug_open;
+        self.compact = p.compact;
+        self.bundle = p.bundle;
+        self.set_speed(p.speed);
+    }
+
+    /// Runs `f` on each feature in turn, with one [`FeatureCtx`], until `f` returns `true`;
+    /// then applies the requests the pass collected. Returns whether `f` returned `true`.
+    fn feature_pass(
+        &mut self,
+        key_events: &[KeyEvent],
+        mut f: impl FnMut(&mut dyn Feature, &mut FeatureCtx<'_>) -> bool,
+    ) -> bool {
+        let prefs = self.prefs();
+        let provisioning = self.provisioning();
+        let mut requests = Vec::new();
+        let mut handled = false;
+        {
+            let mut cx = FeatureCtx {
+                backend: self.backend.as_mut(),
+                toasts: &mut self.toasts,
+                platform: &self.platform,
+                data_dir: &self.data_dir,
+                prefs: &prefs,
+                rom: self.rom.as_deref(),
+                instance: self.instance.as_deref(),
+                paused: self.paused,
+                provisioning,
+                key_events,
+                requests: &mut requests,
+            };
+            for feature in self.features.each() {
+                if f(feature, &mut cx) {
+                    handled = true;
+                    break;
+                }
+            }
+        }
+        self.apply_requests(requests);
+        handled
     }
 
     pub fn debug_open(&self) -> bool {
@@ -475,8 +646,10 @@ impl EvoApp {
     }
 
     /// Brings the GUI back in line with a machine that was reset or loaded:
-    /// drops keys restored as held and releases pending on the old timeline.
+    /// drops keys restored as held and releases pending on the old timeline, and cancels any
+    /// debugger goal.
     fn resync(&mut self) {
+        self.backend.cancel_goal();
         self.latch.clear();
         for id in KeyId::ALL {
             self.backend.set_key(id, false);
@@ -534,17 +707,9 @@ impl EvoApp {
         }
     }
 
-    /// Pauses, or resumes. Resuming from a breakpoint first steps off it, or the run would
-    /// stop on it at once.
+    /// Pauses, or resumes (see [`set_paused`](Self::set_paused)).
     fn toggle_pause(&mut self) {
-        if self.paused && matches!(self.status, RunStatus::Breakpoint(_)) {
-            self.status = self.backend.step();
-        }
-        self.paused = !self.paused;
-        if !self.paused && !self.status.is_stop() {
-            self.status = RunStatus::Running;
-        }
-        self.speed.reset();
+        self.set_paused(!self.paused);
     }
 
     fn set_speed(&mut self, s: Speed) {
@@ -570,8 +735,9 @@ impl EvoApp {
     }
 
     /// Whether `a` is drawn selected in its popover.
+    /// The app answers for its own actions, then the features.
     fn action_active(&self, a: Action) -> bool {
-        match a {
+        let app = match a {
             Action::TogglePause => self.paused,
             Action::Speed(s) => s == self.speed_setting,
             Action::ToggleDebug => self.debug_open,
@@ -580,11 +746,13 @@ impl EvoApp {
             Action::Compact => self.compact,
             Action::About => self.about_open,
             _ => false,
-        }
+        };
+        app || self.features.active(a)
     }
 
     /// Runs one sidebar action. The slot picker of Save state and Load state opens where
-    /// the last popover sat. An action the app does not handle shows [`not_available`].
+    /// the last popover sat. An action the app does not handle goes to each feature in
+    /// turn; one no feature takes shows [`not_available`].
     pub fn run_action(&mut self, a: Action) {
         let machine = matches!(
             a,
@@ -636,7 +804,11 @@ impl EvoApp {
             }
             Action::ResetLayout => self.pending_reset_layout = true,
             Action::About => self.about_open = !self.about_open,
-            other => self.toasts.push(not_available(other), ToastKind::Info),
+            other => {
+                if !self.feature_pass(&[], |f, cx| f.on_action(other, cx)) {
+                    self.toasts.push(not_available(other), ToastKind::Info);
+                }
+            }
         }
     }
 
@@ -741,7 +913,10 @@ impl EvoApp {
         let events = ctx.input(|i| i.events.clone());
         // `logic` runs before `ui`, so a press the mapping window captures in
         // this frame's `ui` is already dropped here.
-        let typing = ctx.egui_wants_keyboard_input() || self.keymap_window.capturing();
+        // A feature's modal takes the keyboard too.
+        let typing = ctx.egui_wants_keyboard_input()
+            || self.keymap_window.capturing()
+            || self.features.blocks_input();
         let actions = self.tracker.actions(&events, &self.keymap, typing);
         let now = self.backend.cycles();
         for action in actions {
@@ -761,14 +936,24 @@ impl EvoApp {
         }
     }
 
-    /// Step 2 of `logic`: emulate this frame's share of time.
+    /// Step 2 of `logic`: emulate this frame's share of time. The run stops at the earliest
+    /// feature deadline and at the latch's next key release, so scripted key events and
+    /// clicked-key releases land at their exact cycles at any speed.
     fn emulate(&mut self, ctx: &egui::Context) {
         if self.paused || self.provisioning() {
             self.speed.reset();
             return;
         }
         let (stable_dt, unstable_dt) = ctx.input(|i| (i.stable_dt, i.unstable_dt));
-        let budget = self.pacer.budget(f64::from(stable_dt));
+        let deadline = [self.features.next_deadline(), self.latch.next_release()]
+            .into_iter()
+            .flatten()
+            .min();
+        let budget = capped_budget(
+            self.pacer.budget(f64::from(stable_dt)),
+            self.backend.cycles(),
+            deadline,
+        );
         let start = Instant::now();
         let run = self
             .runner
@@ -785,10 +970,16 @@ impl EvoApp {
         }
     }
 
-    /// Step 4 of `logic`: move the UART output into the console.
+    /// Step 4 of `logic`: move the UART output and new log lines into the consoles.
     fn drain_uart(&mut self) {
         let bytes = self.backend.take_uart();
-        self.debug.uart_mut().push(&bytes);
+        self.debug.push_uart(UartId::Uart0, &bytes);
+        let bytes = self.backend.take_uart2();
+        self.debug.push_uart(UartId::Uart2, &bytes);
+        let lines = crate::logbuf::drain();
+        if !lines.is_empty() {
+            self.debug.push_log(lines);
+        }
     }
 
     /// The debug panel's contents; applies its run controls.
@@ -796,6 +987,22 @@ impl EvoApp {
         let out = self.debug.show(ui, self.backend.as_mut(), self.paused);
         if out.step && self.paused {
             self.status = self.backend.step();
+        }
+        if let Some(goal) = out.goal
+            && self.paused
+        {
+            match self.backend.begin_goal(goal) {
+                Ok(true) => {
+                    self.paused = false;
+                    self.status = RunStatus::Running;
+                    self.speed.reset();
+                }
+                Ok(false) => {}
+                Err(e) => self.toasts.push(e.to_string(), ToastKind::Error),
+            }
+        }
+        for note in out.notes {
+            self.toasts.push(note, ToastKind::Error);
         }
         if out.toggle_pause {
             self.toggle_pause();
@@ -994,7 +1201,12 @@ impl eframe::App for EvoApp {
         self.emulate(ctx);
         self.latch.tick(self.backend.cycles());
         self.flush_edges();
+        let events = self.backend.take_key_events();
         self.drain_uart();
+        self.feature_pass(&events, |f, cx| {
+            f.frame(cx);
+            false
+        });
         let backlight = self.backend.backlight();
         self.lcd
             .update(ctx, self.backend.framebuffer(), backlight, self.filter);
@@ -1046,6 +1258,10 @@ impl eframe::App for EvoApp {
             .show(ui, |ui| self.calculator(ui));
         let ctx = ui.ctx().clone();
         self.overlays(&ctx);
+        self.feature_pass(&[], |f, cx| {
+            f.ui(&ctx, cx);
+            false
+        });
         self.sync_window(&ctx);
     }
 
@@ -1054,5 +1270,15 @@ impl eframe::App for EvoApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.persist();
         eframe::set_value(storage, PREFS_KEY, &self.prefs());
+    }
+
+    /// Called once on shutdown, after [`save`](Self::save): the features finish (a recording
+    /// is written out), their requests apply, then flash is written a last time.
+    fn on_exit(&mut self) {
+        self.feature_pass(&[], |f, cx| {
+            f.on_exit(cx);
+            false
+        });
+        self.persist();
     }
 }

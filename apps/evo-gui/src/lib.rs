@@ -4,8 +4,14 @@
 
 pub mod app;
 pub mod backend;
+pub mod capture;
 pub mod debug;
+pub mod feature;
+pub mod features;
+pub mod files;
+pub mod help;
 pub mod input;
+pub mod instance;
 pub mod keymap_window;
 pub mod keypad;
 pub mod lcd;
@@ -17,3 +23,5 @@ pub mod store;
 pub mod theme;
 pub mod toast;
 pub mod toolbar;
+pub mod tools;
+pub mod wizard;

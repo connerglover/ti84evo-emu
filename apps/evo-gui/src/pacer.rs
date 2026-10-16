@@ -82,6 +82,15 @@ impl Pacer {
     }
 }
 
+/// Caps a frame's `budget` so the run stops at `deadline` (an absolute cycle count):
+/// `min(budget, deadline - now)`, and 0 when the deadline is now or past.
+pub fn capped_budget(budget: u64, now: u64, deadline: Option<u64>) -> u64 {
+    match deadline {
+        Some(d) => budget.min(d.saturating_sub(now)),
+        None => budget,
+    }
+}
+
 /// The result of one [`FrameRunner::run`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameRun {

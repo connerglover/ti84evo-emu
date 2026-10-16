@@ -1,5 +1,5 @@
 //! Lane 0 foundation: speed setting, the new preferences, the platform seam, the log buffer
-//! and the grouped sidebar.
+//! and the grouped sidebar; the feature framework, app requests and the debug seam.
 
 mod common;
 
@@ -14,9 +14,13 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use evo_gui::app::{AppOptions, EvoApp};
 use evo_gui::backend::fake::FakeBackend;
-use evo_gui::backend::{CLOCK_HZ, EmuBackend, Frame};
+use evo_gui::backend::{CLOCK_HZ, EmuBackend, Frame, Goal, RunStatus};
+use evo_gui::feature::{AppRequest, Feature, FeatureCtx};
+use evo_gui::input::{KeyLatch, MIN_HOLD_CYCLES, Source};
+use evo_gui::keypad::KeyId;
+use evo_gui::lcd::ScaleFilter;
 use evo_gui::logbuf::{LOG_CAP, LogBuf};
-use evo_gui::pacer::{Pacer, Speed};
+use evo_gui::pacer::{Pacer, Speed, capped_budget};
 use evo_gui::platform::{FakePlatform, FileFilter, Platform, PlatformRef};
 use evo_gui::prefs::Prefs;
 use evo_gui::store::Store;
@@ -393,4 +397,332 @@ fn reset_layout_closes_dock_and_compact() {
     h.run_steps(2);
     assert!(!h.state().compact());
     assert!(has_button(&h, "Calculator"));
+}
+
+// ---------------------------------------------------------------------------
+// Task 0.5a: feature framework, app requests, debug seam.
+
+/// A feature for the tests: owns one action, pushes scripted requests and reports a deadline.
+#[derive(Default)]
+struct TestFeature {
+    owns: Option<Action>,
+    on_action_push: Vec<AppRequest>,
+    ui_push_compact_once: bool,
+    on_exit_push: Vec<AppRequest>,
+    deadline: Option<u64>,
+    blocks: bool,
+}
+
+impl Feature for TestFeature {
+    fn on_action(&mut self, action: Action, cx: &mut FeatureCtx<'_>) -> bool {
+        if self.owns != Some(action) {
+            return false;
+        }
+        cx.requests.append(&mut self.on_action_push);
+        true
+    }
+    fn frame(&mut self, _cx: &mut FeatureCtx<'_>) {}
+    fn ui(&mut self, _ctx: &egui::Context, cx: &mut FeatureCtx<'_>) {
+        if std::mem::take(&mut self.ui_push_compact_once) {
+            cx.requests.push(AppRequest::ApplyPrefs(Prefs {
+                compact: true,
+                ..cx.prefs.clone()
+            }));
+        }
+    }
+    fn active(&self, _action: Action) -> bool {
+        false
+    }
+    fn next_deadline(&self) -> Option<u64> {
+        self.deadline
+    }
+    fn blocks_input(&self) -> bool {
+        self.blocks
+    }
+    fn on_exit(&mut self, cx: &mut FeatureCtx<'_>) {
+        cx.requests.append(&mut self.on_exit_push);
+    }
+}
+
+fn request_harness(
+    test: &str,
+    fake: FakeBackend,
+    paused: bool,
+) -> (Harness<'static, EvoApp>, TempDir) {
+    let dir = TempDir::new(&format!("evo-gui-foundation-{test}"), false);
+    let opts = AppOptions {
+        start_paused: paused,
+        ..test_options(&dir, FakePlatform::shared())
+    };
+    (harness_with(fake, opts), dir)
+}
+
+#[test]
+fn replace_backend_persists_swaps_and_resyncs() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = request_harness("replace", fake, true);
+    let b2 = FakeBackend::new().named("b2");
+    let probe2 = b2.probe();
+    h.state_mut().apply_request(AppRequest::ReplaceBackend {
+        backend: Box::new(b2),
+        rom: Some(PathBuf::from("b2.84b2")),
+        persist_old: true,
+    });
+    assert_eq!(probe.persists(), 1);
+    assert_eq!(h.state().backend().name(), "b2");
+    assert_eq!(h.state().rom(), Some(Path::new("b2.84b2")));
+    assert_eq!(h.state().status(), RunStatus::Running);
+    // Resynced: every key released on the new backend.
+    assert_eq!(probe2.key_log().len(), KeyId::ALL.len());
+    assert!(!h.state().provisioning());
+}
+
+#[test]
+fn replace_backend_without_persist_skips_it() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = request_harness("replacenopersist", fake, true);
+    h.state_mut().apply_request(AppRequest::ReplaceBackend {
+        backend: Box::new(FakeBackend::new().named("b2")),
+        rom: None,
+        persist_old: false,
+    });
+    assert_eq!(probe.persists(), 0);
+    assert_eq!(h.state().backend().name(), "b2");
+    assert_eq!(h.state().rom(), None);
+}
+
+#[test]
+fn replace_with_unprovisioned_starts_provisioning() {
+    let (mut h, _dir) = request_harness("replaceprov", FakeBackend::new(), true);
+    h.state_mut().apply_request(AppRequest::ReplaceBackend {
+        backend: Box::new(FakeBackend::new().needing_provision()),
+        rom: None,
+        persist_old: false,
+    });
+    assert!(h.state().provisioning());
+}
+
+#[test]
+fn apply_prefs_updates_app() {
+    let (mut h, _dir) = request_harness("applyprefs", FakeBackend::new(), true);
+    let prefs = Prefs {
+        speed: Speed::X4,
+        compact: true,
+        filter: ScaleFilter::Smooth,
+        bundle: Some(PathBuf::from("x.84b2")),
+        ..Prefs::default()
+    };
+    h.state_mut()
+        .apply_request(AppRequest::ApplyPrefs(prefs.clone()));
+    assert_eq!(h.state().speed(), Speed::X4);
+    assert!(h.state().compact());
+    assert_eq!(h.state().filter(), ScaleFilter::Smooth);
+    assert_eq!(h.state().prefs(), prefs);
+}
+
+#[test]
+fn set_paused_true_cancels_goal() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = request_harness("pausecancel", fake, false);
+    h.state_mut().apply_request(AppRequest::SetPaused(true));
+    assert!(h.state().paused());
+    assert_eq!(probe.goal_cancels(), 1);
+    h.state_mut().apply_request(AppRequest::SetPaused(false));
+    assert!(!h.state().paused());
+    assert_eq!(probe.goal_cancels(), 1);
+}
+
+#[test]
+fn close_request_is_recorded() {
+    let (mut h, _dir) = request_harness("close", FakeBackend::new(), true);
+    assert!(!h.state().close_requested());
+    h.state_mut().apply_request(AppRequest::Close);
+    assert!(h.state().close_requested());
+}
+
+#[test]
+fn deadline_caps_run_budget() {
+    assert_eq!(capped_budget(5_000, 100, Some(1_100)), 1_000);
+    assert_eq!(capped_budget(5_000, 100, Some(50)), 0);
+    assert_eq!(capped_budget(5_000, 100, None), 5_000);
+    assert_eq!(capped_budget(5_000, 100, Some(100)), 0);
+    assert_eq!(capped_budget(500, 100, Some(1_100)), 500);
+}
+
+#[test]
+fn latch_next_release_is_the_earliest_pending_release() {
+    let mut latch = KeyLatch::new();
+    assert_eq!(latch.next_release(), None);
+    latch.press(KeyId::Enter, Source::Pointer, 100);
+    // Held, no release pending yet.
+    assert_eq!(latch.next_release(), None);
+    latch.press(KeyId::Clear, Source::Pointer, 50);
+    latch.release(KeyId::Enter, Source::Pointer, 200);
+    assert_eq!(latch.next_release(), Some(100 + MIN_HOLD_CYCLES));
+    latch.release(KeyId::Clear, Source::Pointer, 300);
+    assert_eq!(latch.next_release(), Some(50 + MIN_HOLD_CYCLES));
+    latch.tick(100 + MIN_HOLD_CYCLES);
+    assert_eq!(latch.next_release(), None);
+}
+
+#[test]
+fn feature_deadline_stops_the_run() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = request_harness("deadline", fake, false);
+    let start = probe.cycles();
+    h.state_mut().push_feature(Box::new(TestFeature {
+        deadline: Some(start + 1_000),
+        ..TestFeature::default()
+    }));
+    h.step();
+    assert_eq!(probe.cycles(), start + 1_000);
+    // At the deadline the budget is 0: nothing more runs.
+    h.step();
+    assert_eq!(probe.cycles(), start + 1_000);
+}
+
+#[test]
+fn click_release_lands_at_min_hold() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = request_harness("clickhold", fake, false);
+    // At 2x a frame is 5.2 Mcycles, which does not divide MIN_HOLD_CYCLES (7.8 M): without
+    // the cap the release would land late.
+    h.state_mut().run_action(Action::Speed(Speed::X2));
+    h.get_by_label("enter").click();
+    for _ in 0..20 {
+        h.step();
+        if probe.key_events().iter().any(|e| !e.pressed) {
+            break;
+        }
+    }
+    let events = probe.key_events();
+    let press = events
+        .iter()
+        .find(|e| e.key == KeyId::Enter && e.pressed)
+        .expect("press");
+    let release = events
+        .iter()
+        .find(|e| e.key == KeyId::Enter && !e.pressed)
+        .expect("release");
+    assert_eq!(release.cycle, press.cycle + MIN_HOLD_CYCLES);
+}
+
+#[test]
+fn requests_from_action_and_ui_apply_in_the_same_frame() {
+    let (mut h, _dir) = request_harness("sameframe", FakeBackend::new(), false);
+    h.state_mut().push_feature(Box::new(TestFeature {
+        owns: Some(Action::KeyHistory),
+        on_action_push: vec![AppRequest::SetPaused(true)],
+        ui_push_compact_once: true,
+        ..TestFeature::default()
+    }));
+    h.state_mut().run_action(Action::KeyHistory);
+    assert!(h.state().paused());
+    h.step();
+    assert!(h.state().compact());
+    // The feature took the action: no "not available" toast.
+    assert!(
+        h.query_by_label(&not_available(Action::KeyHistory))
+            .is_none()
+    );
+}
+
+#[test]
+fn on_exit_applies_feature_requests_then_persists() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = request_harness("onexit", fake, true);
+    h.state_mut().push_feature(Box::new(TestFeature {
+        on_exit_push: vec![AppRequest::Persist],
+        ..TestFeature::default()
+    }));
+    assert_eq!(probe.persists(), 0);
+    eframe::App::on_exit(h.state_mut());
+    assert_eq!(probe.persists(), 2);
+}
+
+#[test]
+fn blocking_feature_keeps_keys_from_the_calculator() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = request_harness("blocks", fake, false);
+    h.state_mut().push_feature(Box::new(TestFeature {
+        blocks: true,
+        ..TestFeature::default()
+    }));
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert!(probe.key_log().is_empty(), "{:?}", probe.key_log());
+}
+
+#[test]
+fn pause_cancels_goal() {
+    let fake = FakeBackend::new();
+    let probe = fake.probe();
+    let (mut h, _dir) = request_harness("pausegoal", fake, true);
+    let armed = h
+        .state_mut()
+        .backend_mut()
+        .begin_goal(Goal::RunTo(0x1000_0300));
+    assert!(armed.unwrap());
+    h.state_mut().apply_request(AppRequest::SetPaused(false));
+    h.state_mut().apply_request(AppRequest::SetPaused(true));
+    assert_eq!(probe.goal_cancels(), 1);
+    assert_eq!(h.state_mut().backend_mut().run_for(10), RunStatus::Running);
+}
+
+#[test]
+fn endless_goal_keeps_running_until_pause() {
+    let fake = FakeBackend::new().goal_never_reached();
+    let probe = fake.probe();
+    let (mut h, _dir) = request_harness("endlessgoal", fake, true);
+    let armed = h
+        .state_mut()
+        .backend_mut()
+        .begin_goal(Goal::RunTo(0x1000_0300));
+    assert!(armed.unwrap());
+    h.state_mut().apply_request(AppRequest::SetPaused(false));
+    let mut last = probe.cycles();
+    for _ in 0..20 {
+        h.step();
+        assert!(!h.state().paused());
+        assert_eq!(h.state().status(), RunStatus::Running);
+        let now = probe.cycles();
+        assert!(now > last, "cycles stalled at {now}");
+        last = now;
+    }
+    h.state_mut().apply_request(AppRequest::SetPaused(true));
+    assert_eq!(probe.goal_cancels(), 1);
+    assert!(!probe.goal_armed());
+    h.state_mut().apply_request(AppRequest::SetPaused(false));
+    for _ in 0..5 {
+        h.step();
+        assert!(!h.state().paused());
+        assert!(!matches!(h.state().status(), RunStatus::Goal { .. }));
+    }
+}
+
+#[test]
+fn features_are_reachable() {
+    let (mut h, _dir) = request_harness("reachable", FakeBackend::new(), true);
+    assert_eq!(h.state().features().rom.page(), None);
+    assert_eq!(h.state().features().capture.recording(), None);
+    assert_eq!(h.state_mut().features_mut().each().len(), 5);
+    assert_eq!(h.state().features().next_deadline(), None);
+    assert!(!h.state().features().blocks_input());
+}
+
+#[test]
+fn instance_stub_dirs() {
+    let base = TempDir::new("evo-gui-foundation-instance", true);
+    let lock = evo_gui::instance::prepare(&base, None, None).unwrap();
+    assert_eq!(lock.dir, base.to_path_buf());
+    let lock = evo_gui::instance::prepare(&base, Some("a"), None).unwrap();
+    assert_eq!(lock.dir, base.join("instances").join("a"));
+    assert!(lock.dir.is_dir());
 }

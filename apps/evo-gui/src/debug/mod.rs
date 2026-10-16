@@ -13,7 +13,8 @@ pub use disasm::{DISASM_LINES, format_disasm};
 pub use memory::DEFAULT_MEM_ADDR;
 pub use uart::{UART_CAP, UartConsole};
 
-use crate::backend::EmuBackend;
+use crate::backend::{EmuBackend, Goal, UartId};
+use crate::logbuf::LOG_CAP;
 
 /// Default width of the debug panel, in points; also how much the window
 /// grows when the panel opens.
@@ -72,12 +73,16 @@ impl DebugTab {
 }
 
 /// What the run controls asked for this frame; the app applies it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DebugOutput {
     /// `Pause` or `Continue` was clicked.
     pub toggle_pause: bool,
     /// `Step` was clicked (only possible while paused).
     pub step: bool,
+    /// A debugger goal to start (only while paused): the app calls `begin_goal`.
+    pub goal: Option<Goal>,
+    /// Errors to show as Error toasts.
+    pub notes: Vec<String>,
 }
 
 /// The debug panels' state, kept while the panel is closed.
@@ -87,6 +92,9 @@ pub struct DebugPanel {
     disasm: disasm::DisasmState,
     memory: memory::MemoryState,
     uart: UartConsole,
+    uart2: UartConsole,
+    /// The newest log lines, at most [`LOG_CAP`].
+    log: Vec<String>,
 }
 
 /// A button that senses clicks but takes no keyboard focus, so Space and
@@ -104,12 +112,34 @@ impl DebugPanel {
         self.tab
     }
 
-    pub fn uart(&self) -> &UartConsole {
-        &self.uart
+    /// Appends bytes `port` sent to its console.
+    pub fn push_uart(&mut self, port: UartId, bytes: &[u8]) {
+        match port {
+            UartId::Uart0 => self.uart.push(bytes),
+            UartId::Uart2 => self.uart2.push(bytes),
+        }
     }
 
-    pub fn uart_mut(&mut self) -> &mut UartConsole {
-        &mut self.uart
+    /// The console of `port`.
+    pub fn console(&self, port: UartId) -> &UartConsole {
+        match port {
+            UartId::Uart0 => &self.uart,
+            UartId::Uart2 => &self.uart2,
+        }
+    }
+
+    /// Appends log lines, keeping the newest [`LOG_CAP`].
+    pub fn push_log(&mut self, lines: Vec<String>) {
+        self.log.extend(lines);
+        if self.log.len() > LOG_CAP {
+            let excess = self.log.len() - LOG_CAP;
+            self.log.drain(..excess);
+        }
+    }
+
+    /// The kept log lines, oldest first.
+    pub fn log_lines(&self) -> &[String] {
+        &self.log
     }
 
     /// Draws the panel contents into `ui`.
