@@ -10,12 +10,16 @@ section{margin:24px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere}li{margin:
 <h1>TI-84 Evo USB connection</h1>
 <p>This local adapter runs the official TI Connect communications library against your emulated calculator.</p>
 <button id="connect">Connect calculator</button><button id="disconnect" disabled>Disconnect</button>
+<button id="cancel" disabled>Cancel transfer</button>
 <p id="status" role="status">Ready to connect. Internet access loads the TI library.</p>
 <fieldset id="actions" disabled><legend>Calculator</legend>
 <section><button id="capture">Capture screen</button><label><input type="checkbox" id="refresh">Auto-refresh</label><br>
 <canvas id="screen" width="320" height="240"></canvas></section>
 <section><button id="directory">Refresh files</button><ul id="files"></ul>
-<label>Send calculator variable <input type="file" id="upload"></label></section>
+<label>Send calculator variable or Python file <input type="file" id="upload"></label>
+<br><label>Image slot <select id="image-slot"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>0</option></select></label>
+<label>Send image <input type="file" id="image-upload" accept="image/png,image/jpeg,image/bmp"></label>
+<canvas id="imageVarCanvas" width="160" height="105" hidden></canvas></section>
 <section><button id="exit-ptt">Exit exam mode</button>
 <label>Install OS bundle <input type="file" accept=".84b2" id="os"></label></section>
 </fieldset>

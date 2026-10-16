@@ -7,6 +7,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  usb-adapter:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node --test tools/usb-connect/*.test.mjs
+
   fmt:
     runs-on: ubuntu-latest
     steps:

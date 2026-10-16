@@ -135,7 +135,12 @@ export class EmulatedSerialPort extends EventTarget {
       // TI releases reader locks without cancelling pending reads. Drain the old
       // session before a new enumeration can give those reads fresh packets.
       await Promise.allSettled([session?.pull, session?.write]);
-      try { await this.host.request({ op: 'attach', attached: false }); }
+      try {
+        await this.host.request({ op: 'attach', attached: false });
+        // Deliver the detach IRQ and let the guest tear down its CDC session.
+        // Reattaching before any guest time passes can merge both CC edges.
+        await this.host.advance(CPU_HZ / 4);
+      }
       finally { this.readable = this.writable = null; this.session = null; }
     })();
     try { await this.closing; }

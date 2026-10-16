@@ -1,5 +1,6 @@
 import { UsbHost, EmulatedSerialPort, EmulatedSerial } from './usb-host.mjs';
 import { initializeClientEnvironment } from './client-environment.mjs';
+import { exitExamMode } from './client-operations.mjs';
 initializeClientEnvironment();
 const $ = id => document.getElementById(id);
 const port = new EmulatedSerialPort(new UsbHost(async request => {
@@ -14,11 +15,12 @@ let ti, busy = false, connected = false;
 const status = text => { $('status').textContent = text; };
 async function action(label, fn) {
   if (busy) return;
-  busy = true; $('actions').disabled = true; status(label);
+  busy = true; $('actions').disabled = true; $('cancel').disabled = !connected; status(label);
   try { await fn(); status('Ready.'); }
   catch (error) { console.error(error); status(`Failed: ${typeof error === 'number' && ti ? ti.getErrorMessage(error) : error.message || error}`); }
-  finally { busy = false; $('actions').disabled = !connected; }
+  finally { busy = false; $('actions').disabled = !connected; $('cancel').disabled = true; }
 }
+$('cancel').onclick = () => { if (busy && ti) { ti.cancelOperation(); status('Cancelling…'); } };
 $('connect').onclick = () => action('Connecting…', async () => {
   $('connect').disabled = true;
   try {
@@ -66,11 +68,32 @@ $('directory').onclick = () => action('Reading files…', async () => {
 });
 $('upload').onchange = () => action('Sending variable…', async () => {
   const file = $('upload').files[0]; if (!file) return;
-  await ti.putFileWithBufferAndName(new Uint8Array(await file.arrayBuffer()), file.name, false);
+  let contents = new Uint8Array(await file.arrayBuffer()), name = file.name;
+  if (/\.py$/i.test(name)) {
+    const python = { contents };
+    const result = ti.convertPyToPyVar(python, name);
+    if (result !== 0) throw new Error(ti.getErrorMessage(result));
+    contents = Uint8Array.from(python.contents); name = name.replace(/\.py$/i, '.8xv2');
+  }
+  await ti.putFileWithBufferAndName(contents, name, false);
   $('upload').value = '';
 });
+$('image-upload').onchange = () => action('Sending image…', async () => {
+  const file = $('image-upload').files[0]; if (!file) return;
+  const bitmap = await createImageBitmap(file);
+  const canvas = document.createElement('canvas'); canvas.width = bitmap.width; canvas.height = bitmap.height;
+  canvas.getContext('2d').drawImage(bitmap, 0, 0); bitmap.close();
+  const slot = Number($('image-slot').value);
+  const contents = await ti.convertPNGtoImageVar(canvas.toDataURL('image/png'), 1);
+  const image = new window.TIFile({ dispName: `Image${slot}`,
+    tokName: `E8${(0xb0 + (slot === 0 ? 9 : slot - 1)).toString(16).toUpperCase()}`,
+    type: window.TIFile.fileTypeFromExtension('.8ca2'), size: contents.length,
+    memory: 'Archive', contents: Uint8Array.from(contents) });
+  await ti.sendFile(image, true);
+  $('image-upload').value = '';
+});
 $('exit-ptt').onclick = () => action('Exiting exam mode…', async () => {
-  const result = await ti.sendExitPTT(); if (result !== 0) throw new Error(`TI Connect returned ${result}`);
+  await exitExamMode(ti, port.host);
 });
 $('os').onchange = () => action('Installing OS…', async () => {
   const file = $('os').files[0]; if (!file) return;

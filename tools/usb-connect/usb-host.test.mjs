@@ -52,6 +52,25 @@ function serialHost(overrides = {}) {
 }
 const serialOptions = { baudRate: 115200, dataBits: 8, parity: 'none', stopBits: 1 };
 
+test('reopening waits for guest detach processing', async () => {
+  const calls = [], detached = deferred(), processed = deferred();
+  const host = serialHost({
+    request: async request => { calls.push(request.op); detached.resolve(); return {}; },
+    advance: async cycles => { calls.push(cycles); await processed.promise; },
+  });
+  const enumerate = host.enumerate;
+  host.enumerate = async () => { calls.push('enumerate'); return enumerate(); };
+  const port = new EmulatedSerialPort(host);
+  await port.open(serialOptions);
+  const close = port.close(); await detached.promise;
+  const open = port.open(serialOptions);
+  await Promise.resolve();
+  assert.deepEqual(calls, ['enumerate', 'attach', 39_000_000]);
+  processed.resolve(); await close; await open;
+  assert.equal(calls.at(-1), 'enumerate');
+  await port.close();
+});
+
 test('released old reader cannot consume packets after reconnect', async () => {
   const advancing = deferred(), resume = deferred();
   let reads = 0, enumerations = 0;

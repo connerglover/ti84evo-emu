@@ -12,7 +12,7 @@ const { values } = parseArgs({ options: {
 if (!values.cli || !values.bundle) throw new Error('--cli and --bundle are required');
 const port = Number(values.port);
 if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('--port must be an integer from 0 to 65535');
-const assets = new Map(await Promise.all(['index.html', 'client.mjs', 'usb-host.mjs', 'client-environment.mjs'].map(async name =>
+const assets = new Map(await Promise.all(['index.html', 'client.mjs', 'usb-host.mjs', 'client-environment.mjs', 'client-operations.mjs'].map(async name =>
   ['/' + name, await readFile(new URL(name, import.meta.url))])));
 // Fetch into memory at launch or use the user's local copy. Never vendor TI code.
 for (const name of ['ticonnect.min.js', 'ticonnect.js', 'ticonnect.worker.js']) {

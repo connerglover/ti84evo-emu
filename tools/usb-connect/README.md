@@ -17,7 +17,8 @@ node tools/usb-connect/serve.mjs `
 ```
 
 Open the printed loopback URL in Chrome or Edge. The page supports connection,
-screenshots with auto-refresh, variable download/upload, exam exit and OS bundle
+screenshots with auto-refresh, variable download/upload, Python and image import,
+exam exit and OS bundle
 transfer. It loads the official communications library into a local host page;
 the emulator is not a Windows USB device selectable on TI's public website.
 The server downloads the three public TI scripts into memory at startup, or
@@ -25,8 +26,8 @@ accepts `--library path/to/client-library` for an existing local copy.
 Ctrl-C saves flash and stops the emulator. Do not use the same flash file in two
 running emulators.
 
-Connection, attributes, screenshots and directory listing were exercised in
-stock Chromium. Helium repeatedly reloaded during the TI library's worker
+Connection, attributes, screenshots, directory listing, Python/image transfers
+and disconnect/reconnect were exercised in stock Chromium. Helium repeatedly reloaded during the TI library's worker
 initialization in testing; use stock Chrome or Edge if that occurs.
 
 ## Protocol verification
@@ -52,9 +53,40 @@ captures two 320×240 screenshots over USB. `--output screen.rgba` saves the fir
 capture as raw RGBA. `--roundtrip` additionally receives the standard L1 variable,
 sends the same contents back with overwrite enabled, receives it again, and
 requires byte-for-byte equality. Use a disposable flash copy for verification.
-`--trace` logs bus payloads. `--exit-ptt` invokes the official exam-exit command and
-requires a successful response; it is not proof of an active-to-inactive exam
-transition unless the calculator was first placed in exam mode.
+`--python-roundtrip` converts a small Python source file with the official
+library, transfers it, receives identical source text, then deletes the test
+variable. `--install-bundle path/to/OS.84b2` transfers an OS package. These options
+modify the guest's flash; use a disposable copy for verification.
+`--recovery-checks` sends malformed L1 data, requires the guest's rejection and
+unchanged readback, then cancels a screenshot after data begins arriving and
+requires a successful directory read and full screenshot afterward. The observed
+rejection is client code 11 (guest disconnect); cancellation is code 9.
+`--trace` logs bus payloads. `--exit-ptt` verifies an active-to-inactive exam-mode
+transition using the official dynamic device-info API. The firmware deliberately
+disconnects before completing that operation; the adapter lets it finish and
+checks the resulting state. `--skip-screenshots` isolates that workflow from
+screen-capture restrictions in exam mode.
+
+### Exam-mode verification
+
+Create a disposable baseline through the real Left+Right boot combo and ZOOM
+(START/OK) setup buttons. Run each exit path on a separate copy:
+
+```powershell
+cargo run --release -p evo-core --example usb_exam_fixture -- path/to/OS.84b2 ptt-baseline.evoflash
+Copy-Item ptt-baseline.evoflash ptt-explicit.evoflash
+node tools/usb-connect/client-smoke.mjs --cli target/release/evo-cli.exe --bundle path/to/OS.84b2 --library path/to/client-library --flash ptt-explicit.evoflash --keys enter --skip-screenshots --exit-ptt
+Copy-Item ptt-baseline.evoflash ptt-variable.evoflash
+node tools/usb-connect/client-smoke.mjs --cli target/release/evo-cli.exe --bundle path/to/OS.84b2 --library path/to/client-library --flash ptt-variable.evoflash --keys enter --skip-screenshots --receive-ptt
+```
+
+Both tests require official `getDeviceInfo().p2t` to change from `"true"` to
+`"false"`. Explicit exit acknowledges the upload, sends Kermit `DI`, and returns
+client code 11 (disconnect) while the guest finishes asynchronously. The shared
+`exitExamMode` operation advances five guest seconds and checks the reported
+state; a disconnect alone is never considered success. The variable scenario
+sends the received L1 list back and verifies the transition and byte-identical
+readback. `--keys "enter"` taps the real keypad before connecting.
 
 ## Transport details
 
@@ -65,9 +97,11 @@ emulated DMA/FIFO/IRQ path. The current firmware exposes CDC OUT1/IN2; later ven
 bulk endpoints are deliberately not mistaken for the serial port.
 
 `evo-cli usb-bridge` provides newline-delimited JSON on stdin/stdout. Operations
-are `attach`, `reset`, `setup`, `out`, `in`, `run`, and `quit`; responses are
+are `attach`, `reset`, `setup`, `out`, `in`, `run`, `key`, and `quit`; responses are
 `{"ok":true,"data":...}` or `{"ok":false,"error":...}`. `Nak` is retryable;
 `Stall` and other device errors propagate to the caller. Diagnostics go to stderr.
+`{"op":"key","name":"enter","pressed":true}` presses a named keypad key;
+send `pressed:false` to release it and `run` to allow guest processing.
 
 The official app initializes four globals before loading its library. Their
 observed values are reproduced in `client-environment.mjs`; without that host
@@ -80,7 +114,7 @@ updates its site.
 Focused adapter tests:
 
 ```powershell
-node --test tools/usb-connect/usb-host.test.mjs tools/usb-connect/bridge.test.mjs
+node --test tools/usb-connect/*.test.mjs
 cargo test -p evo-cli usb_bridge
 ```
 
