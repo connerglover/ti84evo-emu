@@ -187,6 +187,15 @@ pub enum StopReason {
 /// battery). `Machine::set_gpio_input` changes them.
 pub const BOARD_INPUTS_HIGH: [u8; 2] = [9, 11];
 
+/// A persisted flash cannot boot directly into its stored secure image.
+#[derive(Debug, thiserror::Error)]
+pub enum NvBootError {
+    #[error("invalid persisted boot image: {0}")]
+    Image(&'static str),
+    #[error("invalid persisted boot vectors: {0}")]
+    Vectors(&'static str),
+}
+
 /// The whole emulated calculator.
 #[derive(Serialize, Deserialize)]
 pub struct Machine {
@@ -277,6 +286,88 @@ impl Machine {
             nv.as_ref().map(NvState::secregs),
             vtor,
             bundle_id,
+        ))
+    }
+
+    /// Boot the images already in `nv`, preserving every flash byte and NOR security
+    /// register. Unlike [`from_bundle_nv`](Self::from_bundle_nv), this never installs a
+    /// bundle, so an OS update received over USB survives the next process start.
+    ///
+    /// The secure slot must contain an MCUboot header, an aligned vector table, a mapped
+    /// SRAM stack pointer and a Thumb reset vector within its image body. This checks boot
+    /// bounds, not firmware signatures or BL1/BL2 recovery/swap state. An invalid image is
+    /// an error; callers must not silently replace it with an older bundle.
+    ///
+    /// Save-state identity comes from the stored secure header/payload and layout, rather
+    /// than a bundle package. The separate NV fingerprint still checks *all* flash and
+    /// security-register bytes. States from bundle boot and persisted boot need not share
+    /// an identity; ordinary data writes do not change the persisted boot identity.
+    pub fn from_nv(nv: NvState, layout: &Layout) -> Result<Self, NvBootError> {
+        let flash = nv.flash();
+        let start = layout.secure_slot_base as usize;
+        if layout.secure_slot_base >= FLASH_SIZE
+            || layout.ns_slot_base >= FLASH_SIZE
+            || layout.secure_slot_base == layout.ns_slot_base
+        {
+            return Err(NvBootError::Image(
+                "slot addresses must be distinct flash offsets",
+            ));
+        }
+        let header = flash
+            .get(start..start + 32)
+            .ok_or(NvBootError::Image("secure header lies outside flash"))?;
+        let word = |bytes: &[u8]| u32::from_le_bytes(bytes.try_into().unwrap());
+        if word(&header[..4]) != 0x96f3_b83d {
+            return Err(NvBootError::Image("secure slot has no MCUboot header"));
+        }
+        let header_size = usize::from(u16::from_le_bytes([header[8], header[9]]));
+        let image_size = word(&header[12..16]) as usize;
+        if header_size < 32 || image_size < 8 {
+            return Err(NvBootError::Image("header or vector table is too short"));
+        }
+        let body = start + header_size;
+        let end = body
+            .checked_add(image_size)
+            .filter(|&end| end <= flash.len())
+            .ok_or(NvBootError::Image("secure image extends outside flash"))?;
+        if start < layout.ns_slot_base as usize && end > layout.ns_slot_base as usize {
+            return Err(NvBootError::Image(
+                "secure image overlaps the non-secure slot",
+            ));
+        }
+        if body & 0x7f != 0 {
+            return Err(NvBootError::Vectors("vector table is not 128-byte aligned"));
+        }
+        let sp = word(&flash[body..body + 4]);
+        let reset = word(&flash[body + 4..body + 8]);
+        let mapped_stack = [SRAM_S, SRAM_NS]
+            .into_iter()
+            .any(|base| sp > base && sp <= base + SRAM_SIZE);
+        if sp & 3 != 0 || !mapped_stack {
+            return Err(NvBootError::Vectors(
+                "initial MSP is outside mapped SRAM or unaligned",
+            ));
+        }
+        let target = reset & !1;
+        let vtor = FLASH_S | body as u32;
+        if reset & 1 == 0
+            || target < vtor
+            || u64::from(target) + 2 > u64::from(FLASH_S) + end as u64
+        {
+            return Err(NvBootError::Vectors(
+                "reset vector is not Thumb code within the secure image",
+            ));
+        }
+        let identity = state::bundle_id(
+            &flash[start..end],
+            layout.secure_slot_base,
+            layout.ns_slot_base,
+        );
+        Ok(Self::power_on(
+            flash.to_vec(),
+            Some(nv.secregs()),
+            vtor,
+            identity,
         ))
     }
 

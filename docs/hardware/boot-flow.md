@@ -8,6 +8,25 @@ the NS alias of image 0 from slot+0x50000 on. The same bytes appear at the S ali
 0x101x_xxxx, and some evidence addresses (from a disassembly of image 0 at its S alias) are
 written that way: 0x1015_2716 and 0x0015_2716 name the same instruction.
 
+### Booting persisted flash
+
+`Machine::from_nv(nv, layout)` boots the secure image already stored in an `NvState`.
+It preserves all flash and NOR security-register bytes and derives `VTOR_S` from the
+stored MCUboot header. Use this when reopening flash after a guest USB OS update.
+`Machine::from_bundle_nv` retains its original installation behavior: bundle images
+overwrite their saved slots, while other data survives.
+
+Persisted boot rejects a missing or out-of-bounds secure header/body, an unaligned
+vector table, an initial stack pointer outside mapped SRAM, or a reset vector outside
+the secure image's Thumb code. It does not perform MCUboot signature verification or
+BL1/BL2 recovery, swap, or rollback. A rejected saved image stays unchanged.
+
+Its save-state identity hashes the stored secure header and payload plus slot addresses;
+the existing NV fingerprint separately covers all flash and security registers. User-data
+writes therefore preserve boot identity, but loading a state still requires exactly its
+saved NV contents. Bundle-created and persisted-image-created machines can have different
+boot identities even when their flash bytes match.
+
 ## 0. Result in one paragraph
 
 With the four MPCs, TIMER0, the SPI, the UART, a working **SPIF** with flash security

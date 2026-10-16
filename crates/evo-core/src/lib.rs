@@ -18,7 +18,7 @@ pub use evo_hw::{AccessDir, BUS_RING_CAP, BusRecord, WatchError, WatchKinds, Wat
 pub use evo_hw::{DeviceInspect, RegView, StateError};
 pub use host::{UartPort, UsbError};
 pub use keys::{Key, KeyAction, KeyScriptError, parse_key_script};
-pub use machine::{CPU_HZ, Machine, StopReason};
+pub use machine::{CPU_HZ, Machine, NvBootError, StopReason};
 pub use provision::{ProvisionError, ProvisionReport, provision};
 pub use ram::{RAM_HEADER_LEN, RAM_MAGIC, RAM_VERSION, RamError};
 pub use scheduler::{EventKind, Scheduler};
