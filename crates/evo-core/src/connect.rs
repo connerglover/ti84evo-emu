@@ -2,11 +2,60 @@
 //! Packet framing follows https://www.kermitproject.org/kpackets.html; Evo's URI
 //! upload/download convention is observed in the unchanged official client.
 use crate::{CPU_HZ, Machine, StopReason, UsbError};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::{collections::VecDeque, ops::ControlFlow};
 
 const INIT: &[u8] = b"~% @-#Y1~.!5M";
 const MAX_RESOURCE: usize = 64 * 1024 * 1024;
 const QUANTUM: u64 = CPU_HZ / 1000;
+/// Bits on the wire per CDC byte (8N1).
+const CDC_BITS_PER_BYTE: u64 = 10;
+/// The CDC line coding the guest is configured with (115200 8N1).
+const CDC_BAUD: u64 = 115_200;
+
+/// Host token cadence, in emulated time (never wall-clock sleeps).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pacing {
+    /// Match the physical host: one full-speed frame per bare token, and the
+    /// 115200 8N1 wire time for OUT payload bytes (the CDC line coding).
+    #[default]
+    Realtime,
+    /// Compatibility mode: advance only when the device NAKs.
+    Batched,
+}
+
+/// Deterministic inter-request jitter, seeded once per connection.
+pub struct Jitter {
+    rng: StdRng,
+    /// 0..=max_ms emulated milliseconds before each request's first packet.
+    max_ms: u64,
+}
+
+impl Jitter {
+    /// Every request waits `rng.gen_range(0..=max_ms)` emulated milliseconds.
+    pub fn new(seed: u64, max_ms: u64) -> Self {
+        Jitter {
+            rng: StdRng::seed_from_u64(seed),
+            max_ms,
+        }
+    }
+    /// The configured bound in emulated milliseconds.
+    pub fn max_ms(&self) -> u64 {
+        self.max_ms
+    }
+    fn delay_ms(&mut self) -> u64 {
+        if self.max_ms == 0 {
+            0
+        } else {
+            self.rng.gen_range(0..=self.max_ms)
+        }
+    }
+    /// The first draw for this seed and bound, without side effects: tests pin
+    /// the exact schedule the request path will follow.
+    pub fn draw_ms_for_test(&mut self) -> u64 {
+        self.delay_ms()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -53,6 +102,8 @@ pub struct Connect<'a> {
     transferred: usize,
     total: Option<usize>,
     closed: bool,
+    pacing: Pacing,
+    jitter: Jitter,
 }
 impl Drop for Connect<'_> {
     fn drop(&mut self) {
@@ -69,6 +120,25 @@ impl<'a> Connect<'a> {
         machine: &'a mut Machine,
         progress: &'a mut dyn FnMut(Progress) -> ControlFlow<()>,
     ) -> Result<Self> {
+        Self::with_pacing(machine, progress, Pacing::default())
+    }
+
+    /// Select token pacing before enumeration begins.
+    pub fn with_pacing(
+        machine: &'a mut Machine,
+        progress: &'a mut dyn FnMut(Progress) -> ControlFlow<()>,
+        pacing: Pacing,
+    ) -> Result<Self> {
+        Self::with_options(machine, progress, pacing, Jitter::new(0, 0))
+    }
+
+    /// Select token pacing and inter-request jitter before enumeration begins.
+    pub fn with_options(
+        machine: &'a mut Machine,
+        progress: &'a mut dyn FnMut(Progress) -> ControlFlow<()>,
+        pacing: Pacing,
+        jitter: Jitter,
+    ) -> Result<Self> {
         let mut this = Self {
             machine,
             progress,
@@ -80,6 +150,8 @@ impl<'a> Connect<'a> {
             transferred: 0,
             total: None,
             closed: false,
+            pacing,
+            jitter,
         };
         this.machine.usb_attach(true);
         this.run(CPU_HZ / 4)?;
@@ -165,9 +237,11 @@ impl<'a> Connect<'a> {
     }
     fn usb_in(&mut self, ep: u8) -> Result<Vec<u8>> {
         for _ in 0..5000 {
-            match self.machine.usb_in(ep) {
+            let result = self.machine.usb_in(ep);
+            self.after_token(&result)?;
+            match result {
                 Ok(b) => return Ok(b),
-                Err(UsbError::Nak) => self.run(QUANTUM)?,
+                Err(UsbError::Nak) => {}
                 Err(e) => return Err(e.into()),
             }
         }
@@ -175,13 +249,31 @@ impl<'a> Connect<'a> {
     }
     fn usb_out(&mut self, ep: u8, b: &[u8]) -> Result<()> {
         for _ in 0..5000 {
-            match self.machine.usb_out(ep, b) {
+            let result = self.machine.usb_out(ep, b);
+            if self.pacing == Pacing::Realtime
+                && !b.is_empty()
+                && !matches!(result, Err(UsbError::Nak))
+            {
+                // The guest's CDC port runs 115200 8N1: a payload OUT token
+                // occupies the line for its wire time on the physical host.
+                let cycles = (b.len() as u64) * CPU_HZ * CDC_BITS_PER_BYTE / CDC_BAUD;
+                self.run(cycles)?;
+            } else {
+                self.after_token(&result)?;
+            }
+            match result {
                 Ok(()) => return Ok(()),
-                Err(UsbError::Nak) => self.run(QUANTUM)?,
+                Err(UsbError::Nak) => {}
                 Err(e) => return Err(e.into()),
             }
         }
         Err(ConnectError::Timeout)
+    }
+    fn after_token<T>(&mut self, result: &std::result::Result<T, UsbError>) -> Result<()> {
+        if self.pacing == Pacing::Realtime || matches!(result, Err(UsbError::Nak)) {
+            self.run(QUANTUM)?;
+        }
+        Ok(())
     }
     fn control(&mut self, setup: [u8; 8], bytes: &[u8]) -> Result<Vec<u8>> {
         self.machine.usb_setup(setup)?;
@@ -237,17 +329,20 @@ impl<'a> Connect<'a> {
             if elapsed >= CPU_HZ * 5 {
                 return Err(ConnectError::Timeout);
             }
-            match self.machine.usb_in(self.input) {
+            let result = self.machine.usb_in(self.input);
+            self.after_token(&result)?;
+            if self.pacing == Pacing::Realtime || matches!(result, Err(UsbError::Nak)) {
+                elapsed += QUANTUM;
+            }
+            match result {
                 Ok(p) => self.rx.extend(p),
-                Err(UsbError::Nak) => {
-                    self.run(QUANTUM)?;
-                    elapsed += QUANTUM;
-                }
+                Err(UsbError::Nak) => {}
                 Err(e) => return Err(e.into()),
             }
         }
     }
     fn trace(&mut self, detail: String) -> Result<()> {
+        log::debug!(target: "evo_core::connect", "cycles={} {detail}", self.machine.sched.now);
         if (self.progress)(Progress {
             phase: self.phase,
             transferred: self.transferred,
@@ -297,6 +392,11 @@ impl<'a> Connect<'a> {
             return Err(protocol(
                 "quoted resource URI exceeds negotiated packet size",
             ));
+        }
+        // A physical host does not issue back-to-back requests at zero gap.
+        let delay_ms = self.jitter.delay_ms();
+        if delay_ms > 0 {
+            self.advance(delay_ms * CPU_HZ / 1000)?;
         }
         self.phase = Phase::Sending;
         self.transferred = 0;
@@ -522,6 +622,107 @@ fn attribute_size(bytes: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_pacing_advances_success_nak_and_error() {
+        let mut payload = vec![0u8; 0x204];
+        payload[..4].copy_from_slice(&0x3000_0800u32.to_le_bytes());
+        payload[4..8].copy_from_slice(&0x100B_0601u32.to_le_bytes());
+        payload[0x200..].copy_from_slice(&[0x01, 0x30, 0xFD, 0xE7]);
+        let bundle =
+            evo_image::Bundle::from_bytes(&evo_image::testutil::secure_image_bundle(payload))
+                .unwrap();
+        let mut m = Machine::from_bundle(&bundle, &evo_image::Layout::EVO_7_1).unwrap();
+        let mut progress = |_| ControlFlow::Continue(());
+        let mut c = Connect {
+            machine: &mut m,
+            progress: &mut progress,
+            input: 2,
+            output: 1,
+            packet_size: 64,
+            rx: VecDeque::new(),
+            phase: Phase::Connecting,
+            transferred: 0,
+            total: None,
+            closed: true,
+            pacing: Pacing::Realtime,
+            jitter: Jitter::new(0, 0),
+        };
+        for pacing in [Pacing::Realtime, Pacing::Batched] {
+            c.pacing = pacing;
+            for token in [Ok(()), Err(UsbError::Nak), Err(UsbError::Stall)] {
+                let before = c.machine.sched.now;
+                c.after_token(&token).unwrap();
+                let elapsed = c.machine.sched.now - before;
+                if pacing == Pacing::Realtime || token == Err(UsbError::Nak) {
+                    assert!((QUANTUM..QUANTUM + 10).contains(&elapsed), "{elapsed}");
+                } else {
+                    assert_eq!(elapsed, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cdc_payload_out_pacing_matches_line_rate() {
+        let mut payload = vec![0u8; 0x204];
+        payload[..4].copy_from_slice(&0x3000_0800u32.to_le_bytes());
+        payload[4..8].copy_from_slice(&0x100B_0601u32.to_le_bytes());
+        payload[0x200..].copy_from_slice(&[0x01, 0x30, 0xFD, 0xE7]);
+        let bundle =
+            evo_image::Bundle::from_bytes(&evo_image::testutil::secure_image_bundle(payload))
+                .unwrap();
+        let mut m = Machine::from_bundle(&bundle, &evo_image::Layout::EVO_7_1).unwrap();
+        m.usb_attach(true);
+        let mut progress = |_| ControlFlow::Continue(());
+        let mut c = Connect {
+            machine: &mut m,
+            progress: &mut progress,
+            input: 2,
+            output: 1,
+            packet_size: 64,
+            rx: VecDeque::new(),
+            phase: Phase::Connecting,
+            transferred: 0,
+            total: None,
+            closed: true,
+            pacing: Pacing::Realtime,
+            jitter: Jitter::new(0, 0),
+        };
+        // No guest services the endpoint, so every OUT NAKs: the retry loop must
+        // advance one frame per attempt in both pacings, then time out.
+        for pacing in [Pacing::Realtime, Pacing::Batched] {
+            c.pacing = pacing;
+            let before = c.machine.sched.now;
+            assert!(matches!(
+                c.usb_out(1, &[0u8; 64]),
+                Err(ConnectError::Timeout)
+            ));
+            let per_try = (c.machine.sched.now - before) / 5000;
+            assert!((QUANTUM..QUANTUM + 10).contains(&per_try), "{per_try}");
+        }
+        // A full 64-byte payload at 115200 8N1 occupies the wire for 64*10 bit
+        // times: the formula the Realtime success path runs must match that.
+        let wire = 64 * CPU_HZ * CDC_BITS_PER_BYTE / CDC_BAUD;
+        assert_eq!(wire, 64 * 10 * CPU_HZ / 115_200);
+        // ~5.56 ms of guest time, not the 1 ms of a bare token.
+        assert!(wire > 5 * QUANTUM && wire < 6 * QUANTUM, "{wire}");
+    }
+
+    #[test]
+    fn jitter_is_deterministic_and_bounded() {
+        let mut a = Jitter::new(42, 5);
+        let mut b = Jitter::new(42, 5);
+        let mut c = Jitter::new(43, 5);
+        for _ in 0..32 {
+            let (x, y, z) = (a.delay_ms(), b.delay_ms(), c.delay_ms());
+            assert_eq!(x, y, "same seed must repeat");
+            assert!(x <= 5 && z <= 5, "{x} {z}");
+        }
+        let mut zero = Jitter::new(7, 0);
+        assert_eq!(zero.delay_ms(), 0);
+        assert_eq!(Jitter::new(1, 9).max_ms(), 9);
+    }
 
     #[test]
     fn standard_send_init_checksum_matches_observed_wire_packet() {

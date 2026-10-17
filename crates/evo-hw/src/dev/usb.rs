@@ -138,6 +138,12 @@ impl Usb {
     }
 
     fn irq(&self, ctx: &mut DevCtx<'_>) {
+        log::trace!(target: "evo_hw::usb", "cycles={} irq16={} dmcr={:08x} gmir={:08x} groups={:08x} masks={:08x}/{:08x}/{:08x}/{:08x} sources={:08x}/{:08x}/{:08x} vdma={:08x}/{:08x}",
+            ctx.now,
+            self.regs.word(0x100) & 4 != 0 && self.regs.word(0xC4) & 1 == 0 && self.groups() & !self.regs.word(0x130) != 0,
+            self.regs.word(0x100), self.regs.word(0xC4), self.groups(),
+            self.regs.word(0x130), self.regs.word(0x134), self.regs.word(0x138), self.regs.word(0x13C),
+            self.status(0x144), self.status(0x148), self.status(0x14C), self.regs.word(0x328), self.regs.word(0x32C));
         ctx.set_irq(
             16,
             self.regs.word(0x100) & 4 != 0
@@ -182,6 +188,7 @@ impl Usb {
 
     /// Send a SETUP packet. A new SETUP aborts the preceding control transfer and clears stall.
     pub fn host_setup(&mut self, setup: [u8; 8], ctx: &mut DevCtx<'_>) -> Result<(), UsbError> {
+        log::trace!(target: "evo_hw::usb", "cycles={} SETUP {setup:02x?}", ctx.now);
         if !self.attached {
             return Err(UsbError::Disconnected);
         }
@@ -443,6 +450,7 @@ impl Usb {
 
 impl Device for Usb {
     fn read(&mut self, off: u32, width: u8, ctx: &mut DevCtx<'_>) -> u32 {
+        log::trace!(target: "evo_hw::usb", "cycles={} read +{off:03x}/{width} word={:08x}", ctx.now, self.status(off & !3));
         if self.regs.get(off, width).is_none() {
             ctx.unhandled(off, width, None);
             return 0;
@@ -464,6 +472,7 @@ impl Device for Usb {
     }
 
     fn write(&mut self, off: u32, width: u8, v: u32, ctx: &mut DevCtx<'_>) {
+        log::trace!(target: "evo_hw::usb", "cycles={} write +{off:03x}/{width} value={v:08x}", ctx.now);
         let Some(old) = self.regs.get(off, width) else {
             ctx.unhandled(off, width, Some(v));
             return;
@@ -611,6 +620,7 @@ impl UsbTypeC {
     pub fn refresh_irq(&self, ctx: &mut DevCtx<'_>) {
         let pending = self.regs.get(0x10, 2).unwrap_or(0);
         let mask = self.regs.get(0x12, 2).unwrap_or(0);
+        log::trace!(target: "evo_hw::usb", "cycles={} irq28={} alert={pending:04x} mask={mask:04x}", ctx.now, pending & mask != 0);
         ctx.set_irq(28, pending & mask != 0);
     }
 
