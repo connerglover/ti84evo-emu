@@ -16,6 +16,7 @@ use evo_core::{
 use evo_image::{Bundle, Layout};
 
 /// What `evo-cli run` was asked to do.
+#[derive(Clone)]
 pub struct RunArgs {
     pub bundle: PathBuf,
     pub max_cycles: u64,
@@ -40,6 +41,14 @@ pub struct RunArgs {
     pub after: Option<u64>,
     /// Key presses and releases, in script order (times never decrease).
     pub keys: Vec<KeyAction>,
+    /// `--usb-get URI`: connect over USB and download this resource instead of running.
+    pub usb_get: Option<String>,
+    /// `--usb-out FILE`: where the download is written (default stdout).
+    pub usb_out: Option<PathBuf>,
+    /// `--usb-jitter N`: 0..N emulated ms before each USB request (default 0).
+    pub usb_jitter: Option<u64>,
+    /// `--usb-batched`: NAK-only token pacing for the USB request path.
+    pub usb_batched: bool,
 }
 
 /// A parsed `--keys` script (a newtype: clap would read a bare `Vec` as repeated values).
@@ -161,6 +170,65 @@ pub fn main(args: RunArgs) -> ExitCode {
     run(args, &INTERRUPT)
 }
 
+/// Run `--usb-get URI`: boot to the OS, connect over USB, download the resource,
+/// and write it out (default stdout). Returns the exit status.
+fn usb_get(machine: &mut Machine, args: &RunArgs) -> ExitCode {
+    use evo_core::connect::{Connect, Jitter, Pacing};
+    use std::ops::ControlFlow;
+    // Let the OS reach its idle loop before the cable appears.
+    match machine.run(evo_core::CPU_HZ * 10) {
+        StopReason::CycleLimit | StopReason::Idle => {}
+        s => {
+            eprintln!("evo-cli: boot stopped: {s:?}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let pacing = if args.usb_batched {
+        Pacing::Batched
+    } else {
+        Pacing::Realtime
+    };
+    let jitter = Jitter::new(0x5EED, args.usb_jitter.unwrap_or(0));
+    let mut progress = |_p: evo_core::connect::Progress| ControlFlow::Continue(());
+    let uri = args.usb_get.clone().unwrap();
+    let result = (|| -> Result<Vec<u8>, evo_core::connect::ConnectError> {
+        let mut c = Connect::with_options(machine, &mut progress, pacing, jitter)?;
+        let bytes = c.get(&uri)?;
+        c.finish()?;
+        Ok(bytes)
+    })();
+    match result {
+        Ok(bytes) => {
+            let written = match &args.usb_out {
+                Some(path) => fs::write(path, &bytes)
+                    .map_err(|e| {
+                        eprintln!("evo-cli: {}: {e}", path.display());
+                        ExitCode::FAILURE
+                    })
+                    .map(|()| bytes.len()),
+                None => io::stdout()
+                    .write_all(&bytes)
+                    .map(|()| bytes.len())
+                    .map_err(|e| {
+                        eprintln!("evo-cli: {e}");
+                        ExitCode::FAILURE
+                    }),
+            };
+            match written {
+                Ok(n) => {
+                    eprintln!("usb: {uri} ({n} bytes)");
+                    ExitCode::SUCCESS
+                }
+                Err(code) => code,
+            }
+        }
+        Err(e) => {
+            eprintln!("evo-cli: usb: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `main` with the stop request `interrupt` (set by Ctrl-C; checked after every slice).
 fn run(args: RunArgs, interrupt: &AtomicBool) -> ExitCode {
     // Every input is read before the machine exists: an input error never touches the flash
@@ -228,6 +296,9 @@ fn run(args: RunArgs, interrupt: &AtomicBool) -> ExitCode {
     if let Some(bytes) = &uart_in {
         machine.inject_uart_rx(UartPort::Uart0, bytes);
     }
+    if let Some(uri) = args.usb_get.clone() {
+        return usb_get(&mut machine, &args.clone_for_usb(uri));
+    }
     let code = run_machine(&mut machine, &args, interrupt);
     if machine.take_power_off() {
         eprintln!("power: off (GPIO pin 1 released)");
@@ -264,6 +335,16 @@ fn run(args: RunArgs, interrupt: &AtomicBool) -> ExitCode {
             }
         },
         None => code,
+    }
+}
+
+impl RunArgs {
+    /// The same run, narrowed to a single USB request (`--usb-get`).
+    fn clone_for_usb(&self, uri: String) -> RunArgs {
+        RunArgs {
+            usb_get: Some(uri),
+            ..self.clone()
+        }
     }
 }
 
@@ -671,6 +752,10 @@ mod tests {
             screenshot: None,
             after: None,
             keys: Vec::new(),
+            usb_get: None,
+            usb_out: None,
+            usb_jitter: None,
+            usb_batched: false,
         };
         let code = run(args, &AtomicBool::new(true));
         assert_eq!(code, ExitCode::from(EXIT_INTERRUPTED));

@@ -138,6 +138,26 @@ enum Command {
             value_parser = run::parse_keys
         )]
         keys: Option<run::KeyScript>,
+        /// Instead of running to a stop condition, connect over USB and download
+        /// the resource at URI (e.g. `hh01/inf/res?name=directory`), then write the raw
+        /// bytes to --usb-out and exit. Boots the guest to the OS first.
+        #[arg(
+            long,
+            value_name = "URI",
+            conflicts_with_all = ["gdb", "max_cycles", "trace", "trace_range"]
+        )]
+        usb_get: Option<String>,
+        /// Where --usb-get writes the downloaded bytes; default: stdout.
+        #[arg(long, value_name = "FILE", requires = "usb_get")]
+        usb_out: Option<PathBuf>,
+        /// Jitter before each USB request: 0..N emulated milliseconds, seeded
+        /// deterministically (default 0: no jitter). Needs --usb-get.
+        #[arg(long, value_name = "N", requires = "usb_get")]
+        usb_jitter: Option<u64>,
+        /// Use batched (NAK-only) USB token pacing for --usb-get instead of
+        /// the default real-time pacing.
+        #[arg(long, requires = "usb_get")]
+        usb_batched: bool,
     },
     /// Provision a unit to boot straight to the OS, as the factory does: power on with
     /// ALPHA + SIN + ENTER held, set Engineering > Boot Select to Calc OS, exit, then check
@@ -198,6 +218,10 @@ fn main() -> ExitCode {
             screenshot,
             after,
             keys,
+            usb_get,
+            usb_out,
+            usb_jitter,
+            usb_batched,
         } => run::main(run::RunArgs {
             bundle,
             max_cycles,
@@ -214,6 +238,10 @@ fn main() -> ExitCode {
             screenshot,
             after,
             keys: keys.map(|k| k.0).unwrap_or_default(),
+            usb_get,
+            usb_out,
+            usb_jitter,
+            usb_batched,
         }),
         Command::Provision { bundle, flash_file } => provision(&bundle, &flash_file),
         Command::Inspect {
@@ -351,6 +379,10 @@ mod tests {
             screenshot,
             after,
             keys,
+            usb_get,
+            usb_out,
+            usb_jitter,
+            usb_batched,
         } = cli.command
         else {
             panic!("not run");
@@ -360,6 +392,10 @@ mod tests {
         assert_eq!(save_state, None);
         assert_eq!(after, None);
         assert_eq!(keys, None);
+        assert_eq!(usb_get, None);
+        assert_eq!(usb_out, None);
+        assert_eq!(usb_jitter, None);
+        assert!(!usb_batched);
         assert_eq!(bundle, PathBuf::from("os.84b2"));
         assert_eq!(max_cycles, 1_000_000_000);
         assert!(!trace);
@@ -462,6 +498,50 @@ mod tests {
         assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--break", "zz"]).is_err());
         assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--max-cycles", "-5"]).is_err());
         assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--trace-range", "9..1"]).is_err());
+    }
+
+    #[test]
+    fn run_parses_usb_request_options() {
+        let cli = Cli::try_parse_from([
+            "evo-cli",
+            "run",
+            "os.84b2",
+            "--usb-get",
+            "hh01/inf/res?name=directory",
+            "--usb-out",
+            "dir.bin",
+            "--usb-jitter",
+            "5",
+            "--usb-batched",
+        ])
+        .expect("parse");
+        let Command::Run {
+            usb_get,
+            usb_out,
+            usb_jitter,
+            usb_batched,
+            ..
+        } = cli.command
+        else {
+            panic!("not run");
+        };
+        assert_eq!(usb_get.as_deref(), Some("hh01/inf/res?name=directory"));
+        assert_eq!(usb_out, Some(PathBuf::from("dir.bin")));
+        assert_eq!(usb_jitter, Some(5));
+        assert!(usb_batched);
+
+        // Jitter and output need --usb-get; the request excludes the budget and trace.
+        assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--usb-jitter", "5"]).is_err());
+        assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--usb-out", "o.bin"]).is_err());
+        assert!(Cli::try_parse_from(["evo-cli", "run", "x", "--usb-batched"]).is_err());
+        assert!(
+            Cli::try_parse_from(["evo-cli", "run", "x", "--usb-get", "u", "--gdb", "3333"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["evo-cli", "run", "x", "--usb-get", "u", "--max-cycles", "5"])
+                .is_err()
+        );
     }
 
     #[test]
