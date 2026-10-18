@@ -167,8 +167,8 @@ fn hardware_inter_request_jitter_delays_answers() {
 /// guest acknowledges an F packet by echoing its URI; past roughly 300 echo
 /// bytes the staged frame is truncated and its header corrupted (observed:
 /// MARK=0x31, SEQ=0x51, declared length 256), so the host can never parse the
-/// acknowledgment. This is guest firmware behavior, identical on hardware, and
-/// bounds which isolated requests can possibly survive.
+/// acknowledgment in this emulator. This observation does not establish a
+/// firmware buffer limit or identical behavior on physical hardware.
 #[test]
 fn hardware_ack_echo_boundary() {
     let Some(mut m) = boot() else { return };
@@ -195,11 +195,10 @@ fn hardware_ack_echo_boundary() {
 }
 
 /// The isolated long transfer request on a FRESH boot each time (not a restored
-/// snapshot): hardware reportedly survives this. The emulator's guest hits its
-/// acknowledgment-echo staging limit (see `hardware_ack_echo_boundary`) and
-/// never answers, so this documents the remaining fidelity gap.
+/// snapshot): hardware reportedly survives this. The emulator does not return
+/// a valid acknowledgment; the cause remains under investigation.
 #[test]
-#[ignore = "known fidelity gap: guest ack-echo staging caps near 300 bytes; hardware reportedly survives"]
+#[ignore = "unresolved fidelity gap: isolated long request fails in emulator but reportedly survives on hardware"]
 fn hardware_isolated_long_xfr_fresh_boot() {
     let Some(path) = std::env::var_os("EVO_OS_IMAGE") else {
         eprintln!("skipping: EVO_OS_IMAGE not set");
@@ -226,11 +225,8 @@ fn hardware_isolated_long_xfr_fresh_boot() {
     assert!(healthy, "fresh-boot isolated long xfr failed: {result:?}");
 }
 
-/// Hardware controls the emulator is known to reproduce: either long request
-/// ALONE below the guest's acknowledgment-echo limit (see
-/// `hardware_ack_echo_boundary`), and the short-tail sequence in both pacings.
-/// The long transfer request alone exceeds that limit, so it is covered by
-/// `hardware_isolated_long_xfr_fresh_boot` instead (the remaining gap).
+/// Long directory request alone and short-tail sequence in both pacings.
+/// The isolated long transfer request is a separate, unresolved fidelity test.
 #[test]
 fn individual_long_requests_and_short_sequence_survive() {
     let Some(mut m) = boot() else { return };

@@ -8,16 +8,12 @@ use std::{collections::VecDeque, ops::ControlFlow};
 const INIT: &[u8] = b"~% @-#Y1~.!5M";
 const MAX_RESOURCE: usize = 64 * 1024 * 1024;
 const QUANTUM: u64 = CPU_HZ / 1000;
-/// Bits on the wire per CDC byte (8N1).
-const CDC_BITS_PER_BYTE: u64 = 10;
-/// The CDC line coding the guest is configured with (115200 8N1).
-const CDC_BAUD: u64 = 115_200;
 
 /// Host token cadence, in emulated time (never wall-clock sleeps).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Pacing {
-    /// Match the physical host: one full-speed frame per bare token, and the
-    /// 115200 8N1 wire time for OUT payload bytes (the CDC line coding).
+    /// Advance one millisecond after every IN/OUT attempt. This is a host
+    /// scheduling policy, not a simulation of USB packet transmission time.
     #[default]
     Realtime,
     /// Compatibility mode: advance only when the device NAKs.
@@ -250,17 +246,7 @@ impl<'a> Connect<'a> {
     fn usb_out(&mut self, ep: u8, b: &[u8]) -> Result<()> {
         for _ in 0..5000 {
             let result = self.machine.usb_out(ep, b);
-            if self.pacing == Pacing::Realtime
-                && !b.is_empty()
-                && !matches!(result, Err(UsbError::Nak))
-            {
-                // The guest's CDC port runs 115200 8N1: a payload OUT token
-                // occupies the line for its wire time on the physical host.
-                let cycles = (b.len() as u64) * CPU_HZ * CDC_BITS_PER_BYTE / CDC_BAUD;
-                self.run(cycles)?;
-            } else {
-                self.after_token(&result)?;
-            }
+            self.after_token(&result)?;
             match result {
                 Ok(()) => return Ok(()),
                 Err(UsbError::Nak) => {}
@@ -664,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn cdc_payload_out_pacing_matches_line_rate() {
+    fn successful_out_tokens_advance_one_frame_regardless_of_payload_length() {
         let mut payload = vec![0u8; 0x204];
         payload[..4].copy_from_slice(&0x3000_0800u32.to_le_bytes());
         payload[4..8].copy_from_slice(&0x100B_0601u32.to_le_bytes());
@@ -689,24 +675,29 @@ mod tests {
             pacing: Pacing::Realtime,
             jitter: Jitter::new(0, 0),
         };
-        // No guest services the endpoint, so every OUT NAKs: the retry loop must
-        // advance one frame per attempt in both pacings, then time out.
         for pacing in [Pacing::Realtime, Pacing::Batched] {
             c.pacing = pacing;
-            let before = c.machine.sched.now;
-            assert!(matches!(
-                c.usb_out(1, &[0u8; 64]),
-                Err(ConnectError::Timeout)
-            ));
-            let per_try = (c.machine.sched.now - before) / 5000;
-            assert!((QUANTUM..QUANTUM + 10).contains(&per_try), "{per_try}");
+            for len in [0, 1, 7, 64, 65] {
+                // A new SETUP clears EP0's FIFO without running guest code.
+                c.machine.usb_setup([0; 8]).unwrap();
+                let before = c.machine.sched.now;
+                let result = c.usb_out(0, &vec![0; len]);
+                if len <= 64 {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(ConnectError::Usb(UsbError::PacketTooLarge))
+                    ));
+                }
+                let elapsed = c.machine.sched.now - before;
+                if pacing == Pacing::Realtime {
+                    assert!((QUANTUM..QUANTUM + 10).contains(&elapsed), "{elapsed}");
+                } else {
+                    assert_eq!(elapsed, 0);
+                }
+            }
         }
-        // A full 64-byte payload at 115200 8N1 occupies the wire for 64*10 bit
-        // times: the formula the Realtime success path runs must match that.
-        let wire = 64 * CPU_HZ * CDC_BITS_PER_BYTE / CDC_BAUD;
-        assert_eq!(wire, 64 * 10 * CPU_HZ / 115_200);
-        // ~5.56 ms of guest time, not the 1 ms of a bare token.
-        assert!(wire > 5 * QUANTUM && wire < 6 * QUANTUM, "{wire}");
     }
 
     #[test]
