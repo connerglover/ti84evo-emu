@@ -231,6 +231,21 @@ impl<'a> Connect<'a> {
             stop => Err(ConnectError::GuestStopped(stop)),
         }
     }
+    /// Test-only: (pc, r0..r4, r12) snapshot of the guest CPU.
+    pub fn __test_regs(&self) -> (u32, u32, u32, u32, u32, u32) {
+        (
+            self.machine.cpu.regs.pc,
+            self.machine.cpu.regs.r[0],
+            self.machine.cpu.regs.r[1],
+            self.machine.cpu.regs.r[2],
+            self.machine.cpu.regs.r[4],
+            self.machine.cpu.regs.r[12],
+        )
+    }
+    /// Test-only: the recent guest instruction trace.
+    pub fn __test_recent_trace(&self) -> Vec<String> {
+        self.machine.recent_trace()
+    }
     fn usb_in(&mut self, ep: u8) -> Result<Vec<u8>> {
         for _ in 0..5000 {
             let result = self.machine.usb_in(ep);
