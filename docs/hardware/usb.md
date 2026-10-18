@@ -68,6 +68,52 @@ NAK, stall, disconnected, endpoint and packet-size errors. The host negotiates
 full speed; CDC bulk maximum packet size is 64. Bus reset and detach discard
 pending transfers; new SETUP aborts old control data and clears control stall.
 
+### Long-request wedge and ACK corruption (7.1 firmware)
+
+Hardware report: a long directory GET (`hh01/inf/res?name=directory&x=` +
+200 `A`s, answered with remote error `UN`) followed by a long transfer GET
+(`hh01/xfr/var?name=%EE%A0%B0&type=1&x=` + 100 `%41`s) leaves USB
+unresponsive; later directory GETs stay unanswered and replug restores
+service. Either request alone, or the same sequence with short tails,
+reportedly survives on hardware.
+
+Confirmed emulator behavior (real firmware, `crates/evo-core/tests/usb_timing.rs`):
+
+- The two-request sequence wedges exactly as reported and a replug revives
+  USB, in both token pacings (`hardware_two_request_wedge`).
+- The guest acknowledges a Kermit F packet by echoing its URI in the Y-1
+  ACK. For the long transfer request the staged ACK frame is malformed:
+  `MARK=0x31`, `SEQ=0x51`, declared length 256, with a **self-consistent
+  checksum** — the guest firmware built it that way
+  (`hardware_ack_staging_corruption_signature`).
+- The corruption is a guest SRAM buffer overlap, not a USB-model fault: the
+  Kermit frame builder (entry `0x0016_6194`, called from `0x0016_3a04`)
+  loads MARK from `[r0+26]` of the session struct at `0x2003_bdbc`, and the
+  Kermit decode loop (`strb` at `0x0015_46c8`) writes decoded URI bytes over
+  that struct — exactly one write puts `0x31` (`'1'` of the URI) into the
+  MARK field, which the builder then reads back
+  (`hardware_ack_mark_field_corruption_chain`). The builder entry contract,
+  staging buffer (`0x2003_ce84`) and struct base are pinned by
+  `hardware_ack_builder_entry_contract`. VDMA, FIFO and host parsing carry
+  the staged bytes unchanged.
+- The overlap is length- and history-dependent: for the directory request
+  the guest stays healthy through a 299-byte echo and breaks by a 309-byte
+  echo (`hardware_ack_echo_boundary`); short-tail sequences pass in both
+  pacings (`individual_long_requests_and_short_sequence_survive`).
+
+Unresolved hardware difference: the **isolated** long transfer request
+reportedly survives on hardware but fails in the emulator (fresh boot, both
+pacings; `hardware_isolated_long_xfr_fresh_boot`, kept `#[ignore]`d).
+Since the guest firmware and its buffer placement are the emulator's own, the
+divergence needs a hardware capture of the isolated request (host F packet
+and guest ACK bytes) to settle — candidate explanations are a different
+client-side F composition or a different guest heap layout after a different
+session history. No USB-model change fixes this without that evidence.
+
+The OTG interrupt-enable `+0x088 = 0x40` observed in traces is
+B-session-end per the FOTG210 definitions, not SOF; no verified SOF bit was
+found and none is modeled.
+
 ### Verified guest behavior
 
 `crates/evo-core/tests/real_os_usb.rs`, with a user's `EVO_OS_IMAGE` in release,
